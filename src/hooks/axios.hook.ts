@@ -4,7 +4,7 @@ import axios from "axios";
 
 export const useAuthAxios = () => {
   const axiosInstance = axios.create({
-    baseURL: API_URL,
+    baseURL: API_URL + "/api/v1",
     timeout: 120000,
   });
 
@@ -17,21 +17,21 @@ export const useAuthAxios = () => {
       }
 
       return Promise.reject(error);
-    }
+    },
   );
 
   axiosInstance.interceptors.request.use(
     async (config) => {
       config.headers.Accept = "application/json";
       config.headers.authorization = `Bearer ${localStorage.getItem(
-        "accessToken"
+        "accessToken",
       )}`;
       config.timeout = 120000;
       return config;
     },
     (error) => {
       Promise.reject(error);
-    }
+    },
   );
 
   return getApis(axiosInstance);
@@ -53,7 +53,7 @@ export const useAxios = () => {
     },
     (error) => {
       Promise.reject(error);
-    }
+    },
   );
 
   return getApis(axiosInstance);

@@ -20,3 +20,14 @@ export function useGoogleSignIn() {
     },
   });
 }
+
+export function useLogout() {
+  const { clearUser } = useUserStore();
+  const { setCurrentView } = useViewStore();
+  const logout = () => {
+    localStorage.removeItem("accessToken");
+    clearUser();
+    setCurrentView("sign-in");
+  };
+  return logout;
+}

@@ -6,6 +6,6 @@ interface ViewStore {
 }
 
 export const useViewStore = create<ViewStore>((set) => ({
-  currentView: "",
+  currentView: "home",
   setCurrentView: (view: string) => set({ currentView: view }),
 }));

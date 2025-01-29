@@ -5,7 +5,7 @@
     "manifest_version": 3,
     "action": {
         "default_popup": "index.html",
-        "default_icon": "copyt.png"
+        "default_icon": "copyyt.png"
     },
     "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAySfZEmOHzNDW7Lo/jMhPAFvKAcoJjY9PsxQYjtdIxzPiAz/gtWtaG3wNgnlRUYFvijWkGMdoOHRn7vMGesh0BmhQhUoCCFFLu95oyJkCgGsTf7GoGvkvuun5TncuMVUe4ku4EKiK4L+1UsiGw6cyV1dSL30hoXTjKFg26BMjIlgYUaZLn6rriYmKLIYsHzDFJS8H7lUy2gxWOXgL+BWmU/XuX8aJCOtV2PAzDQ68q3m460cp6v4IHGIa9lp4INWL1fnVlQJ5exnhLCq+TDR8VrBPoUP01iM0PnrMhhHRhZBOoOMO9CKrtP5S0HIDpbAsyVkBL4F791eDS14svHG5pwIDAQAB",
     "oauth2": {
@@ -17,6 +17,8 @@
         ]
     },
     "permissions": [
-        "identity"
+        "identity",
+        "clipboardRead",
+        "clipboardWrite"
     ]
 }
