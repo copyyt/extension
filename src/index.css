@@ -1,0 +1,9 @@
+@import url("https://fonts.googleapis.com/css2?family=Sora:wght@100..800&family=Work+Sans:ital,wght@0,100..900;1,100..900&display=swap");
+@import "tailwindcss";
+@theme {
+  --font-work: "Work Sans", serif;
+  --font-sora: "Sora", serif;
+
+  --color-primary: #2d9cdb;
+  --shadow-copyt: 0px 4px 20px 0px #0000001a;
+}

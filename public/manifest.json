@@ -1,0 +1,22 @@
+{
+    "name": "Copyt",
+    "description": "App for copying stuff",
+    "version": "1.0",
+    "manifest_version": 3,
+    "action": {
+        "default_popup": "index.html",
+        "default_icon": "copyt.png"
+    },
+    "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAySfZEmOHzNDW7Lo/jMhPAFvKAcoJjY9PsxQYjtdIxzPiAz/gtWtaG3wNgnlRUYFvijWkGMdoOHRn7vMGesh0BmhQhUoCCFFLu95oyJkCgGsTf7GoGvkvuun5TncuMVUe4ku4EKiK4L+1UsiGw6cyV1dSL30hoXTjKFg26BMjIlgYUaZLn6rriYmKLIYsHzDFJS8H7lUy2gxWOXgL+BWmU/XuX8aJCOtV2PAzDQ68q3m460cp6v4IHGIa9lp4INWL1fnVlQJ5exnhLCq+TDR8VrBPoUP01iM0PnrMhhHRhZBOoOMO9CKrtP5S0HIDpbAsyVkBL4F791eDS14svHG5pwIDAQAB",
+    "oauth2": {
+        "client_id": "367598261435-81eadc06f97is9l3aogrncpa1183ke9f.apps.googleusercontent.com",
+        "scopes": [
+            "openid",
+            "email",
+            "profile"
+        ]
+    },
+    "permissions": [
+        "identity"
+    ]
+}
