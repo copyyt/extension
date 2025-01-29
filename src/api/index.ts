@@ -10,6 +10,10 @@ export const getApis = (axiosInstance: AxiosInstance) => ({
     signIn: async (data: ILoginIn) => axiosInstance.post("/auth/sign-in", data),
     signUp: async (data: ISignUp) => axiosInstance.post("/auth/sign-up", data),
     googleSign: async (token: string) =>
-      axiosInstance.post<GoogleSignInResponse>("/auth/google-auth", { token }),
+      axiosInstance.post<GoogleSignInResponse>(
+        "/auth/google-auth",
+        { token },
+        { withCredentials: true },
+      ),
   },
 });
