@@ -7,11 +7,13 @@ const socket = io(SOCKET_URL, {
     Authorization: `Bearer ${localStorage.getItem("accessToken")}`,
   },
   withCredentials: true,
+  autoConnect: false,
 });
 
 export function useSocket(onMessage: (value: string) => void) {
   const [isConnected, setIsConnected] = useState(socket.connected);
   useEffect(() => {
+    socket.connect();
     function onConnect() {
       setIsConnected(true);
       console.log("connected");
@@ -29,6 +31,7 @@ export function useSocket(onMessage: (value: string) => void) {
       socket.off("connect", onConnect);
       socket.off("disconnect", onDisconnect);
       socket.off("message", onMessage);
+      socket.disconnect();
     };
   }, [onMessage]);
 

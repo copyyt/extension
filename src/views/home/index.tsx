@@ -1,11 +1,16 @@
-// import withAuth from "@/hocs/with-auth.hoc";
+import withAuth from "@/hocs/with-auth.hoc";
 import Button from "@/components/button";
 import { useLogout } from "@/hooks/auth.hook";
 import { useUserStore } from "@/hooks/user-store.hook";
 import Logo from "@/vectors/logo";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useSocket } from "@/hooks/socket.hook";
 import useDebounce from "@/hooks/debounce.hook";
+import { useGetLastMessage } from "@/hooks/user.hook";
+import { useViewLoader } from "@/hooks/loader.hook";
+import LogoutIcon from "@/vectors/logout";
+import PasteIcon from "@/vectors/paste";
+import CopyIcon from "@/vectors/copy-icon";
 
 const Home = () => {
   const { user } = useUserStore();
@@ -13,12 +18,20 @@ const Home = () => {
 
   const [text, setText] = useState("");
 
+  const lastMessageQuery = useGetLastMessage();
+  const lastMessage = lastMessageQuery.data?.data?.data;
+
   const onMessage = (value: string) => {
-    console.log(value);
     if (value !== text) {
       setText(value);
     }
   };
+
+  useEffect(() => {
+    if (lastMessage) {
+      setText(lastMessage);
+    }
+  }, [lastMessage]);
 
   const { socket, isConnected } = useSocket(onMessage);
 
@@ -49,6 +62,7 @@ const Home = () => {
     [text],
   );
 
+  useViewLoader([lastMessageQuery.isLoading]);
   return (
     <section>
       <div className="flex items-center justify-between">
@@ -58,9 +72,10 @@ const Home = () => {
         <div className="flex items-center gap-5">
           <Button
             variant="outlined"
-            className="!border-[#FF2635] !text-[#FF2635]"
+            className="flex items-center gap-2 !border-[#FF2635] !text-[#FF2635]"
             onClick={logout}
           >
+            <LogoutIcon />
             Logout
           </Button>
           <div className="relative flex h-10 w-10 items-center justify-center rounded-full bg-[#1E6892] font-semibold text-white uppercase">
@@ -81,10 +96,20 @@ const Home = () => {
       />
 
       <div className="mt-2 flex justify-end gap-2">
-        <Button variant="outlined" onClick={pasteClipboard}>
+        <Button
+          variant="outlined"
+          className="flex items-center gap-2"
+          onClick={pasteClipboard}
+        >
+          <PasteIcon />
           Paste
         </Button>
-        <Button variant="primary" onClick={writeClipboardText}>
+        <Button
+          variant="primary"
+          className="flex items-center gap-2"
+          onClick={writeClipboardText}
+        >
+          <CopyIcon />
           Copy
         </Button>
       </div>
@@ -92,8 +117,6 @@ const Home = () => {
   );
 };
 
-// const HomeWithAuth = withAuth(Home);
+const HomeWithAuth = withAuth(Home);
 
-// export default HomeWithAuth;
-
-export default Home;
+export default HomeWithAuth;

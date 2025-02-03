@@ -13,7 +13,7 @@ const Button = (
   return (
     <button
       {...props}
-      className={`cursor-pointer rounded-xl border px-4 py-1 leading-6 font-bold transition-all duration-300 hover:opacity-45 ${
+      className={`cursor-pointer rounded-xl border px-4 py-1 leading-6 font-bold transition-all duration-300 hover:opacity-45 disabled:bg-[#E5E7EB] disabled:text-[#9CA3AF] ${
         variantStyles[props.variant ?? "primary"]
       } ${props.className}`}
     />

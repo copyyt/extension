@@ -7,12 +7,22 @@ export interface ISignUp {
 
 export interface ILoginIn {
   email: string;
-  password: string;
 }
 
-export interface GoogleSignInResponse {
+export interface IVerifyEmail {
+  email: string;
+  name?: string;
+  code: number;
+}
+
+export interface SignInResponse {
   message: string;
   accessToken: string;
   refreshToken: string;
   user: IUser;
+}
+
+export interface ILoginResponse {
+  message: string;
+  data: { isNew: boolean };
 }

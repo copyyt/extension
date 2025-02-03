@@ -18,3 +18,25 @@ export const useUserStore = create<UserStore>()(
     { name: "user-storage" },
   ),
 );
+
+interface EmailStore {
+  email: string;
+  setEmail: (email: string) => void;
+}
+
+export const useEmailStore = create<EmailStore>((set) => ({
+  email: "",
+  setEmail: (email: string) => set({ email }),
+}));
+
+interface IsNewStore {
+  isNew: boolean;
+  setIsNew: (isNew: boolean) => void;
+  clearState: () => void;
+}
+
+export const useIsNewStore = create<IsNewStore>((set) => ({
+  isNew: false,
+  setIsNew: (isNew: boolean) => set({ isNew }),
+  clearState: () => set({ isNew: false }),
+}));

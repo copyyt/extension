@@ -8,9 +8,9 @@ const queryClient = new QueryClient();
 function App() {
   return (
     <>
-      <section className="shadow-copyt relative max-h-[600px] w-[400px] p-4 pt-6">
+      <section className="shadow-copyt relative max-h-[600px] w-[430px] p-6 pt-10">
         <CloseIcon
-          className="absolute top-1 right-1"
+          className="absolute top-2 right-2 cursor-pointer hover:opacity-60"
           onClick={() => window.close()}
         />
         <QueryClientProvider client={queryClient}>
