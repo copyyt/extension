@@ -7,3 +7,7 @@
   --color-primary: #2d9cdb;
   --shadow-copyt: 0px 4px 20px 0px #0000001a;
 }
+
+body {
+  font-size: 100%;
+}

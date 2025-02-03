@@ -58,7 +58,7 @@ const Home = () => {
         socket.emit("message", text);
       }
     },
-    500,
+    1000,
     [text],
   );
 

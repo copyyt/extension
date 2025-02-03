@@ -33,7 +33,7 @@ export function useSocket(onMessage: (value: string) => void) {
       socket.off("message", onMessage);
       socket.disconnect();
     };
-  }, [onMessage]);
+  }, []); // eslint-disable-line
 
   return { socket, isConnected };
 }
