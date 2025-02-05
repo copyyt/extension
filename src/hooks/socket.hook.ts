@@ -1,16 +1,18 @@
 import { SOCKET_URL } from "@/utils/constants";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { io } from "socket.io-client";
 
-const socket = io(SOCKET_URL, {
-  extraHeaders: {
-    Authorization: `Bearer ${localStorage.getItem("accessToken")}`,
-  },
-  withCredentials: true,
-  autoConnect: false,
-});
-
 export function useSocket(onMessage: (value: string) => void) {
+  const socket = useMemo(() => {
+    return io(SOCKET_URL, {
+      extraHeaders: {
+        Authorization: `Bearer ${localStorage.getItem("accessToken")}`,
+      },
+      withCredentials: true,
+      autoConnect: false,
+    });
+  }, []);
+
   const [isConnected, setIsConnected] = useState(socket.connected);
   useEffect(() => {
     socket.connect();
@@ -20,6 +22,7 @@ export function useSocket(onMessage: (value: string) => void) {
     }
 
     function onDisconnect() {
+      console.log("disconnected");
       setIsConnected(false);
     }
 

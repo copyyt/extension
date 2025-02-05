@@ -18,6 +18,10 @@ export const getApis = (axiosInstance: AxiosInstance) => ({
       ),
     verifyEmail: async (data: IVerifyEmail) =>
       axiosInstance.post<SignInResponse>("/auth/verify-email", data),
+    refreshTokens: async () =>
+      axiosInstance.post<SignInResponse>("/auth/refresh-tokens", null, {
+        withCredentials: true,
+      }),
   },
   user: {
     lastMessage: async () => axiosInstance.get("/user/last-message"),

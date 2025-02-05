@@ -24,6 +24,22 @@ export function useGoogleSignIn() {
   });
 }
 
+export function useRefreshTokens() {
+  const Api = useAxios();
+  const { setUser } = useUserStore();
+
+  return useMutation({
+    mutationFn: () => Api.auth.refreshTokens(),
+    onSuccess: (data) => {
+      localStorage.setItem("accessToken", data.data.accessToken);
+      setUser(data.data.user);
+    },
+    onError: (error) => {
+      console.error(error);
+    },
+  });
+}
+
 export function useSignInPasswordless() {
   const Api = useAxios();
   const { setToast } = useToastStore();
