@@ -22,6 +22,12 @@ export const getApis = (axiosInstance: AxiosInstance) => ({
       axiosInstance.post<SignInResponse>("/auth/refresh-tokens", null, {
         withCredentials: true,
       }),
+    logout: async () =>
+      axiosInstance.post("/auth/logout", null, {
+        withCredentials: true,
+      }),
+    resendEmailOtp: async (email: string) =>
+      axiosInstance.post("/auth/resend-email-otp", { email }),
   },
   user: {
     lastMessage: async () => axiosInstance.get("/user/last-message"),

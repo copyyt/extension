@@ -1,6 +1,6 @@
 import Button from "@/components/button";
 import { InputField } from "@/components/input";
-import { useVerifyEmail } from "@/hooks/auth.hook";
+import { useResendEmaiOtp, useVerifyEmail } from "@/hooks/auth.hook";
 import { useViewLoader } from "@/hooks/loader.hook";
 import { useEmailStore, useIsNewStore } from "@/hooks/user-store.hook";
 import { useViewStore } from "@/hooks/view-store.hook";
@@ -19,6 +19,8 @@ const VerifyEmail = () => {
 
   const verifyEmail = useVerifyEmail();
 
+  const resendEmailOtp = useResendEmaiOtp();
+
   const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     verifyEmail.mutate(
@@ -32,7 +34,7 @@ const VerifyEmail = () => {
     );
   };
 
-  useViewLoader([verifyEmail.isPending]);
+  useViewLoader([verifyEmail.isPending, resendEmailOtp.isPending]);
 
   return (
     <div className="w-full items-center justify-center bg-white">
@@ -45,7 +47,7 @@ const VerifyEmail = () => {
       </p>
 
       <p className="font-work mt-3 text-center text-[#4B5563]">
-        We’ve sent a 6-digit OTP to {email}. The code expires after 10mins.{" "}
+        We've sent a 6-digit OTP to {email}. The code expires after 10mins.{" "}
       </p>
 
       <form onSubmit={handleSubmit} className="space-y-3 pt-3">
@@ -56,10 +58,9 @@ const VerifyEmail = () => {
           renderSeparator={<span></span>}
           containerStyle={{
             display: "flex",
-            justifyContent: "flex-start",
-            gap: "8px",
+            justifyContent: "space-between",
           }}
-          inputStyle={{ width: "56px", height: "51px" }}
+          inputStyle={{ width: "54px", height: "51px" }}
           renderInput={(props) => (
             <div className="font-inter relative overflow-hidden rounded-lg border border-[#D0D5DD] font-medium text-black">
               <input
@@ -87,11 +88,24 @@ const VerifyEmail = () => {
         ) : null}
 
         <Button
-          className="mt-3 w-full rounded-xl !py-4 !text-lg !font-medium"
+          className="mt-3 mb-0 w-full rounded-xl !py-4 !text-lg !font-medium"
           disabled={!data.code || (isNew && !data.name)}
         >
           Continue
         </Button>
+
+        <p className="font-work mt-6 text-center">
+          Didn't get code?{" "}
+          <button
+            type="button"
+            onClick={() => {
+              resendEmailOtp.mutate(email);
+            }}
+            className="text-primary cursor-pointer font-semibold underline hover:opacity-70"
+          >
+            Resend
+          </button>{" "}
+        </p>
       </form>
     </div>
   );

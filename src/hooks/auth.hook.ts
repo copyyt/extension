@@ -73,12 +73,40 @@ export function useVerifyEmail() {
   });
 }
 
+export function useResendEmaiOtp() {
+  const Api = useAxios();
+  const { setToast } = useToastStore();
+  return useMutation({
+    mutationFn: (email: string) => Api.auth.resendEmailOtp(email),
+    onSuccess: () => {
+      setToast({ open: true, text: "OTP sent successfully" });
+    },
+    onError: (error) => {
+      if (isAxiosError(error)) {
+        setToast({ open: true, text: error?.response?.data.message });
+      }
+      console.error(error);
+    },
+  });
+}
+
 export function useLogout() {
+  const Api = useAxios();
   const { clearUser } = useUserStore();
   const { setCurrentView } = useViewStore();
+
+  const { mutate } = useMutation({
+    mutationFn: () => Api.auth.logout(),
+    onError: (error) => {
+      console.error(error);
+    },
+  });
   const logout = () => {
     localStorage.removeItem("accessToken");
+    document.cookie =
+      "refreshToken=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
     clearUser();
+    mutate();
     setCurrentView("sign-in");
   };
   return logout;
