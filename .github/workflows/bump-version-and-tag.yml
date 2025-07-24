@@ -72,4 +72,4 @@ jobs:
 
       - name: Output new version
         run: |
-          echo "🎉 Successfully created and pushed tag: ${{ steps.version.outputs.new_version }}"
+          echo "🎉 Successfully created and pushed tag: v.${{ steps.version.outputs.new_version }}"
