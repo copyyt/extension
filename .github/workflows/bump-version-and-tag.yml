@@ -2,6 +2,8 @@ name: Version Bump and Tag
 
 on:
   workflow_dispatch:
+    branches:
+      - main
     inputs:
       version_type:
         description: "Version bump type"
