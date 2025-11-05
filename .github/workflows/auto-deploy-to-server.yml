@@ -1,0 +1,47 @@
+name: Deploy to Server
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: self-hosted
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate .env file
+        uses: SpicyPizza/create-envfile@v2.0
+        with:
+          envkey_VITE_API_URL: ${{ secrets.VITE_API_URL }}
+          envkey_VITE_SOCKET_URL: ${{ secrets.VITE_SOCKET_URL }}
+          envkey_VITE_APP_TYPE: ${{ secrets.VITE_APP_TYPE }}
+          envkey_VITE_GOOGLE_CLIENT_ID_WEB: ${{ secrets.VITE_GOOGLE_CLIENT_ID_WEB }}
+
+          file_name: .env
+          fail_on_empty: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install yarn
+        run: npm install -g yarn
+
+      - name: Install dependencies
+        run: |
+          yarn install
+
+      - name: Build the application
+        run: |
+          yarn build
+
+      - name: Extract build files
+        run: |
+          sudo rm -rf /var/www/html/app-build
+          sudo mkdir /var/www/html/app-build
+          sudo cp -r ./dist/* /var/www/html/app-build
