@@ -27,7 +27,7 @@ function App() {
   const extensionClassName =
     "shadow-copyt relative max-h-[600px] w-[430px] p-6 pt-10";
   const webClassName =
-    "shadow-copyt relative mx-auto sm:mt-[calc(50vh-300px)] h-[100vh] sm:h-max sm:max-h-[600px] w-full p-6 pt-10 sm:w-[430px]";
+    "shadow-copyt relative mx-auto sm:mt-[calc(50vh-300px)] mt-[5vh] h-[90vh] sm:h-max sm:max-h-[600px] w-full p-6 pt-10 sm:w-[430px]";
 
   return (
     <>

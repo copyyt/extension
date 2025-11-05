@@ -28,7 +28,7 @@ export default function OTPInput({ otp, setOtp }: OTPInputProps) {
 
   const handlePaste = (e: ClipboardEvent<HTMLInputElement>) => {
     e.preventDefault();
-    const pastedData = e.clipboardData.getData("text/plain").slice(0, 6);
+    const pastedData = e.clipboardData.getData("text/plain").trim().slice(0, 6);
 
     if (!/^\d+$/.test(pastedData)) return;
 
@@ -55,7 +55,7 @@ export default function OTPInput({ otp, setOtp }: OTPInputProps) {
           onChange={(e) => handleChange(index, e.target.value)}
           onKeyDown={(e) => handleKeyDown(index, e)}
           onPaste={handlePaste}
-          className="focus:border-primary h-[51px] w-[54px] rounded-lg border-2 border-gray-300 text-center text-2xl font-semibold transition-all focus:ring-2 focus:ring-[#cfdef9] focus:outline-none"
+          className="focus:border-primary h-[51px] w-full max-w-[54px] rounded-lg border-2 border-gray-300 text-center text-2xl font-semibold transition-all focus:ring-2 focus:ring-[#cfdef9] focus:outline-none sm:w-[54px]"
         />
       ))}
     </div>
