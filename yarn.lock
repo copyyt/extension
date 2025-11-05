@@ -3011,7 +3011,6 @@ __metadata:
     react: "npm:^18.3.1"
     react-dom: "npm:^18.3.1"
     react-loader-spinner: "npm:^6.1.6"
-    react-otp-input: "npm:^3.1.1"
     socket.io-client: "npm:^4.8.1"
     tailwindcss: "npm:^4.0.0"
     typescript: "npm:~5.6.2"
@@ -5511,16 +5510,6 @@ __metadata:
     react: ^16.0.0 || ^17.0.0 || ^18.0.0
     react-dom: ^16.0.0 || ^17.0.0 || ^18.0.0
   checksum: 10c0/20d9d31b4cbd0720d8d9c818babbb9aaa430fe0adbbf85a90d585f7ac6bd1a338df9beb6c63f970de4d41c95ccd2cf2751e0842486e392fa7b0796c945535e43
-  languageName: node
-  linkType: hard
-
-"react-otp-input@npm:^3.1.1":
-  version: 3.1.1
-  resolution: "react-otp-input@npm:3.1.1"
-  peerDependencies:
-    react: ">=16.8.6 || ^17.0.0 || ^18.0.0"
-    react-dom: ">=16.8.6 || ^17.0.0 || ^18.0.0"
-  checksum: 10c0/0b8c7a1a9c49225c75ed3a91be71512c39761bcd1a6d1e6fdd3afadecade1e3b75dac53717dc72b513fcf4881686e6d498d4b6c1412472f8741c46da01d5a804
   languageName: node
   linkType: hard
 

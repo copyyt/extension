@@ -1,19 +1,19 @@
 import Button from "@/components/button";
 import { InputField } from "@/components/input";
+import OTPInput from "@/components/otp-input";
 import { useResendEmaiOtp, useVerifyEmail } from "@/hooks/auth.hook";
 import { useViewLoader } from "@/hooks/loader.hook";
 import { useEmailStore, useIsNewStore } from "@/hooks/user-store.hook";
 import { useViewStore } from "@/hooks/view-store.hook";
 import Logo from "@/vectors/logo";
 import { useState } from "react";
-import OTPInput from "react-otp-input";
 
 const VerifyEmail = () => {
   const { email } = useEmailStore();
   const { isNew, clearState } = useIsNewStore();
   const { setCurrentView } = useViewStore();
   const [data, setData] = useState({
-    code: "",
+    code: new Array(6).fill(""),
     name: "",
   });
 
@@ -23,8 +23,9 @@ const VerifyEmail = () => {
 
   const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
+    if (data.code.includes("")) return;
     verifyEmail.mutate(
-      { email, code: Number(data.code), name: data.name },
+      { email, code: Number(data.code.join("")), name: data.name },
       {
         onSuccess: () => {
           setCurrentView("home");
@@ -52,28 +53,8 @@ const VerifyEmail = () => {
 
       <form onSubmit={handleSubmit} className="space-y-3 pt-3">
         <OTPInput
-          value={data.code}
-          onChange={(code) => setData((prev) => ({ ...prev, code }))}
-          numInputs={6}
-          renderSeparator={<span></span>}
-          containerStyle={{
-            display: "flex",
-            justifyContent: "space-between",
-          }}
-          inputStyle={{ width: "54px", height: "51px" }}
-          renderInput={(props) => (
-            <div className="font-inter relative overflow-hidden rounded-lg border border-[#D0D5DD] font-medium text-black">
-              <input
-                {...props}
-                className="flex items-center justify-center outline-none"
-              />
-              {props.value === "" ? (
-                <p className="pointer-events-none absolute top-0 right-0 flex h-full w-full items-center justify-center bg-white">
-                  -
-                </p>
-              ) : null}
-            </div>
-          )}
+          otp={data.code}
+          setOtp={(code: string[]) => setData((prev) => ({ ...prev, code }))}
         />
         {isNew ? (
           <InputField
@@ -89,7 +70,7 @@ const VerifyEmail = () => {
 
         <Button
           className="mt-3 mb-0 w-full rounded-xl !py-4 !text-lg !font-medium"
-          disabled={!data.code || (isNew && !data.name)}
+          disabled={data.code.includes("") || (isNew && !data.name)}
         >
           Continue
         </Button>

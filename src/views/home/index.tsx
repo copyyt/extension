@@ -64,7 +64,7 @@ const Home = () => {
 
   useViewLoader([lastMessageQuery.isLoading]);
   return (
-    <section>
+    <section className="flex h-full flex-col sm:block">
       <div className="flex items-center justify-between">
         <div className="font-sora flex items-center gap-2 font-bold">
           <Logo /> Copyyt
@@ -92,7 +92,7 @@ const Home = () => {
       <textarea
         value={text}
         onChange={(e) => setText(e.target.value)}
-        className="mt-7 h-[200px] w-full resize-none rounded-lg border border-[#D1D5DB] p-2 text-xs outline-none"
+        className="mt-7 h-[200px] w-full flex-1 resize-none rounded-lg border border-[#D1D5DB] p-2 text-xs outline-none"
       />
 
       <div className="mt-2 flex justify-end gap-2">
