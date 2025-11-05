@@ -44,4 +44,4 @@ jobs:
         run: |
           sudo rm -rf /var/www/html/app-build
           sudo mkdir /var/www/html/app-build
-          sudo cp -r ./dist/* /var/www/html/app-build
+          sudo cp -r ./build/* /var/www/html/app-build
