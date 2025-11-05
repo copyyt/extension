@@ -18,11 +18,9 @@ export function useSocket(onMessage: (value: string) => void) {
     socket.connect();
     function onConnect() {
       setIsConnected(true);
-      console.log("connected");
     }
 
     function onDisconnect() {
-      console.log("disconnected");
       setIsConnected(false);
     }
 

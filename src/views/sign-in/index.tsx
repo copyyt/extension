@@ -1,9 +1,11 @@
 import Button from "@/components/button";
 import { InputField } from "@/components/input";
 import { useGoogleSignIn, useSignInPasswordless } from "@/hooks/auth.hook";
+import useGoogleAuthWeb from "@/hooks/google-auth-web.hook";
 import { useViewLoader } from "@/hooks/loader.hook";
 import { useEmailStore, useIsNewStore } from "@/hooks/user-store.hook";
 import { useViewStore } from "@/hooks/view-store.hook";
+import { APP_TYPE } from "@/utils/constants";
 import GoogleIcon from "@/vectors/google";
 import Logo from "@/vectors/logo";
 import { useState } from "react";
@@ -14,8 +16,24 @@ const SignIn = () => {
   const { email, setEmail } = useEmailStore();
   const { setIsNew } = useIsNewStore();
   const { setCurrentView } = useViewStore();
+
+  const { getToken } = useGoogleAuthWeb();
   const handleGoogleAuth = () => {
     setLoading(true);
+    if (APP_TYPE === "web") {
+      getToken()
+        .then((token) => {
+          signInGoogle.mutate(token);
+        })
+        .catch((error) => {
+          console.error("Error obtaining Google token:", error);
+        })
+        .finally(() => {
+          setLoading(false);
+        });
+
+      return;
+    }
     chrome.identity.getAuthToken({ interactive: true }, function (token) {
       setLoading(false);
       if (token) {

@@ -13,8 +13,6 @@ export default function withAuth<T>(Component: React.FC<T>) {
     const { setCurrentView } = useViewStore();
     const refreshTokens = useRefreshTokens();
 
-    console.log("isAuthenticated", isAuthenticated);
-
     useEffect(() => {
       const auth = checkJwtExpiry(localStorage.getItem("accessToken")!);
       if (!auth) {
