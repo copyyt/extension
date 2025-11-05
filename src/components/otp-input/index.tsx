@@ -47,7 +47,6 @@ export default function OTPInput({ otp, setOtp }: OTPInputProps) {
       {otp.map((digit, index) => (
         <input
           key={index}
-          // @ts-expect-error TS2322
           ref={(el) => (inputRefs.current[index] = el)}
           type="text"
           inputMode="numeric"
