@@ -1,4 +1,28 @@
-# React + TypeScript + Vite
+# Copyyt Chrome extension
+
+The extension’s Phase 1D crypto core is framework-independent and uses Chrome
+137+ WebCrypto primitives: Ed25519 device signatures, X25519 key agreement,
+HKDF-SHA-256, and AES-256-GCM. Plaintext clipboard contents and private keys
+are not sent to the backend.
+
+Device private keys are generated once and persisted as non-extractable
+`CryptoKey` objects in IndexedDB. Only raw 32-byte public keys, encoded as
+canonical padded standard Base64, are used in device registration and protocol
+messages. The crypto core also enforces the local trust-store state before a
+device can receive a wrapped content key.
+
+Phase 1D deliberately does not add clipboard monitoring, an offscreen
+document, or a persistent Socket.IO lifecycle. Those belong to the next phase.
+
+## Development
+
+```bash
+yarn build
+yarn lint
+yarn test:crypto
+```
+
+## Template notes
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 

@@ -3,6 +3,7 @@
     "description": "App for copying stuff",
     "version": "1.2",
     "manifest_version": 3,
+    "minimum_chrome_version": "137",
     "action": {
         "default_popup": "index.html",
         "default_icon": "copyyt.png"

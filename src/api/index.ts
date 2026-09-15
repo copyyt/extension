@@ -5,6 +5,10 @@ import {
   IVerifyEmail,
   ILoginResponse,
 } from "../interfaces/auth.interface";
+import type {
+  DeviceRegistrationRequest,
+  RegisteredDeviceResponse,
+} from "../crypto/device-registration";
 
 export const getApis = (axiosInstance: AxiosInstance) => ({
   auth: {
@@ -31,5 +35,9 @@ export const getApis = (axiosInstance: AxiosInstance) => ({
   },
   user: {
     lastMessage: async () => axiosInstance.get("/user/last-message"),
+  },
+  devices: {
+    registerDevice: async (data: DeviceRegistrationRequest) =>
+      axiosInstance.post<RegisteredDeviceResponse>("/devices", data),
   },
 });
