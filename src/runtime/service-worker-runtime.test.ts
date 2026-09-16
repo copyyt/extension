@@ -12,6 +12,7 @@ import { InMemoryItemMetadataStore } from "./runtime-db.ts";
 import type { RuntimeSession, SessionStore, StatusStore } from "./session-store.ts";
 import {
   CopyytServiceWorkerRuntime,
+  findUniqueAccountRootCandidate,
   type RuntimeDependencies,
   type RuntimeApi,
   type SocketLike,
@@ -617,6 +618,296 @@ test("the runtime approver displays the full-key fingerprint and applies the sig
   assert.deepEqual(approvalRequestKeys, ["approvalSignature", "approvingDeviceId", "pendingDeviceId"]);
   assert.equal(pairing.records.get(`${user.id}:${pendingDevice.deviceId}`)?.trustState, "verified");
   assert.equal(pairing.applied?.approvalSignature, "approval-signature");
+});
+
+test("account-root selection is independent of server array order and fails closed", () => {
+  const approvedChild: RegisteredDeviceResponse = {
+    ...pendingDevice,
+    trustState: "trusted",
+    approvedByDeviceId: registeredDevice.deviceId,
+    approvalSignature: "approval-signature",
+  };
+  assert.equal(
+    findUniqueAccountRootCandidate([approvedChild, registeredDevice]).deviceId,
+    registeredDevice.deviceId,
+  );
+  assert.equal(
+    findUniqueAccountRootCandidate([registeredDevice, approvedChild]).deviceId,
+    registeredDevice.deviceId,
+  );
+  assert.throws(
+    () => findUniqueAccountRootCandidate([approvedChild]),
+    /could not identify the account root/i,
+  );
+  assert.throws(
+    () => findUniqueAccountRootCandidate([
+      registeredDevice,
+      { ...pendingDevice, trustState: "trusted" },
+    ]),
+    /multiple account root devices/i,
+  );
+});
+
+test("a verified secondary device cannot approve a pending device", async () => {
+  const secondaryIdentity = {
+    ...identity,
+    deviceId: pendingDevice.deviceId,
+    signingPublicKey: new Uint8Array(32).fill(2),
+    signingPublicKeyBase64: pendingDevice.signingPublicKey,
+    encryptionPublicKey: new Uint8Array(32).fill(1),
+    encryptionPublicKeyBase64: pendingDevice.encryptionPublicKey,
+    registration: { keyVersion: 1, name: pendingDevice.name, platform: "chrome", capabilities: [] },
+  } as unknown as DeviceIdentity;
+  const secondaryDevice: RegisteredDeviceResponse = {
+    ...pendingDevice,
+    trustState: "trusted",
+    approvedByDeviceId: registeredDevice.deviceId,
+    approvalSignature: "approval-signature",
+  };
+  const thirdDevice: RegisteredDeviceResponse = {
+    ...registeredDevice,
+    deviceId: "00000000-0000-4000-8000-000000000003",
+    name: "Third Chrome",
+    trustState: "pending",
+  };
+  let signCalls = 0;
+  let approvalCalls = 0;
+  const setup = makeRuntime({
+    identity: secondaryIdentity,
+    registeredDevice: secondaryDevice,
+    localTrustState: "verified",
+    listDevices: async () => response([secondaryDevice, registeredDevice]),
+    listPendingDevices: async () => response([thirdDevice]),
+    signApproval: async () => {
+      signCalls += 1;
+      return "should-not-sign";
+    },
+    approveDevice: async () => {
+      approvalCalls += 1;
+      return response(thirdDevice);
+    },
+  });
+  await setup.runtime.start();
+  const result = await setup.runtime.handleMessage(runtimeMessage({
+    type: "runtime:approve-pending-device",
+    pendingDeviceId: thirdDevice.deviceId,
+    confirmedFingerprint: "0000-0000-0000-0000-0000-0000",
+  }));
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "DEVICE_NOT_LOCALLY_TRUSTED");
+  assert.equal(signCalls, 0);
+  assert.equal(approvalCalls, 0);
+});
+
+test("certificate reconciliation promotes a device from any locally trusted approver", async () => {
+  const bIdentity = {
+    ...identity,
+    deviceId: pendingDevice.deviceId,
+    signingPublicKey: new Uint8Array(32).fill(2),
+    signingPublicKeyBase64: pendingDevice.signingPublicKey,
+    encryptionPublicKey: new Uint8Array(32).fill(1),
+    encryptionPublicKeyBase64: pendingDevice.encryptionPublicKey,
+    registration: { keyVersion: 1, name: pendingDevice.name, platform: "chrome", capabilities: [] },
+  } as unknown as DeviceIdentity;
+  const bServer: RegisteredDeviceResponse = {
+    ...pendingDevice,
+    trustState: "trusted",
+    approvedByDeviceId: registeredDevice.deviceId,
+    approvalSignature: "a-to-b",
+  };
+  const cServer: RegisteredDeviceResponse = {
+    ...registeredDevice,
+    deviceId: "00000000-0000-4000-8000-000000000003",
+    name: "Third Chrome",
+    trustState: "trusted",
+    approvedByDeviceId: registeredDevice.deviceId,
+    approvalSignature: "a-to-c",
+  };
+  const pairing = makePairingTrustStore();
+  pairing.records.set(`${user.id}:${bServer.deviceId}`, {
+    userId: user.id,
+    deviceId: bServer.deviceId,
+    keyVersion: bServer.keyVersion,
+    encryptionPublicKey: bServer.encryptionPublicKey,
+    signingPublicKey: bServer.signingPublicKey,
+    trustState: "verified",
+  });
+  pairing.records.set(`${user.id}:${cServer.deviceId}`, {
+    userId: user.id,
+    deviceId: cServer.deviceId,
+    keyVersion: cServer.keyVersion,
+    encryptionPublicKey: cServer.encryptionPublicKey,
+    signingPublicKey: cServer.signingPublicKey,
+    trustState: "unverified",
+  });
+  const setup = makeRuntime({
+    identity: bIdentity,
+    registeredDevice: bServer,
+    trustStore: pairing.trustStore,
+    listDevices: async () => response([cServer, bServer, registeredDevice]),
+    listPendingDevices: async () => response([]),
+  });
+  await setup.runtime.start();
+  assert.equal(setup.runtime.getStatus().onboarding.state, "complete");
+  assert.equal(pairing.records.get(`${user.id}:${cServer.deviceId}`)?.trustState, "verified");
+  assert.equal(pairing.applied?.approvingDeviceId, registeredDevice.deviceId);
+  assert.equal(pairing.applied?.pendingDeviceId, cServer.deviceId);
+});
+
+test("three devices converge on the original account root regardless of refresh order", async () => {
+  const bIdentity = {
+    ...identity,
+    deviceId: pendingDevice.deviceId,
+    signingPublicKey: new Uint8Array(32).fill(2),
+    signingPublicKeyBase64: pendingDevice.signingPublicKey,
+    encryptionPublicKey: new Uint8Array(32).fill(1),
+    encryptionPublicKeyBase64: pendingDevice.encryptionPublicKey,
+    registration: { keyVersion: 1, name: pendingDevice.name, platform: "chrome", capabilities: [] },
+  } as unknown as DeviceIdentity;
+  const cDevice: RegisteredDeviceResponse = {
+    ...registeredDevice,
+    deviceId: "00000000-0000-4000-8000-000000000003",
+    name: "Third Chrome",
+    trustState: "pending",
+  };
+  const cIdentity = {
+    ...identity,
+    deviceId: cDevice.deviceId,
+    registration: { keyVersion: 1, name: cDevice.name, platform: "chrome", capabilities: [] },
+  } as unknown as DeviceIdentity;
+  const devices = new Map<string, RegisteredDeviceResponse>([
+    [registeredDevice.deviceId, registeredDevice],
+    [pendingDevice.deviceId, pendingDevice],
+  ]);
+  let listOrder = 0;
+  let approvalCalls = 0;
+  const listTrusted = async () => {
+    const active = [...devices.values()].filter((device) => device.trustState === "trusted");
+    const ordered = listOrder++ % 2 === 0 ? active.reverse() : active;
+    return response(ordered);
+  };
+  const listPending = async () => response(
+    [...devices.values()].filter((device) => device.trustState === "pending").reverse(),
+  );
+  const approve = async (request: unknown) => {
+    approvalCalls += 1;
+    const dto = request as { approvingDeviceId: string; pendingDeviceId: string; approvalSignature: string };
+    assert.equal(dto.approvingDeviceId, registeredDevice.deviceId);
+    const current = devices.get(dto.pendingDeviceId)!;
+    const approved = {
+      ...current,
+      trustState: "trusted" as const,
+      approvedByDeviceId: dto.approvingDeviceId,
+      approvalSignature: dto.approvalSignature,
+    };
+    devices.set(dto.pendingDeviceId, approved);
+    return response(approved);
+  };
+  const apiOverrides = {
+    listDevices: listTrusted,
+    listPendingDevices: listPending,
+    approveDevice: approve,
+  };
+
+  const aStore = makePairingTrustStore();
+  const a = makeRuntime({
+    trustStore: aStore.trustStore,
+    localTrustState: "root",
+    ...apiOverrides,
+    signApproval: async ({ pendingDevice: pending }) =>
+      pending.pendingDeviceId === pendingDevice.deviceId ? "a-to-b" : "a-to-c",
+  });
+  const bStore = makePairingTrustStore(bIdentity, pendingDevice, {
+    identity: bIdentity,
+    device: pendingDevice,
+  });
+  const b = makeRuntime({
+    identity: bIdentity,
+    registeredDevice: {
+      ...pendingDevice,
+      trustState: "trusted",
+      approvedByDeviceId: registeredDevice.deviceId,
+      approvalSignature: "a-to-b",
+    },
+    trustStore: bStore.trustStore,
+    ...apiOverrides,
+  });
+
+  await a.runtime.start();
+  await b.runtime.start();
+  const bPairing = b.runtime.getStatus().onboarding.pairing!;
+  assert.equal(bPairing.approverDeviceId, registeredDevice.deviceId);
+  await b.runtime.handleMessage(runtimeMessage({
+    type: "runtime:confirm-paired-approver",
+    approverDeviceId: bPairing.approverDeviceId,
+    confirmedFingerprint: bPairing.fingerprint,
+  }));
+  const aPairingForB = a.runtime.getStatus().onboarding.pairing!;
+  await a.runtime.handleMessage(runtimeMessage({
+    type: "runtime:approve-pending-device",
+    pendingDeviceId: pendingDevice.deviceId,
+    confirmedFingerprint: aPairingForB.fingerprint,
+  }));
+  await b.runtime.handleMessage(runtimeMessage({ type: "runtime:refresh-onboarding" }));
+  assert.equal(bStore.records.get(`${user.id}:${pendingDevice.deviceId}`)?.trustState, "verified");
+
+  devices.set(cDevice.deviceId, cDevice);
+  await a.runtime.handleMessage(runtimeMessage({ type: "runtime:refresh-onboarding" }));
+  await b.runtime.handleMessage(runtimeMessage({ type: "runtime:refresh-onboarding" }));
+  const cStore = makePairingTrustStore(cIdentity, cDevice, {
+    identity: cIdentity,
+    device: cDevice,
+  });
+  const c = makeRuntime({
+    identity: cIdentity,
+    registeredDevice: cDevice,
+    trustStore: cStore.trustStore,
+    ...apiOverrides,
+  });
+  await c.runtime.start();
+  const cPairing = c.runtime.getStatus().onboarding.pairing!;
+  assert.equal(cPairing.role, "pending");
+  assert.equal(cPairing.approverDeviceId, registeredDevice.deviceId);
+  assert.equal(cPairing.fingerprint, a.runtime.getStatus().onboarding.pairing?.fingerprint);
+
+  await a.runtime.handleMessage(runtimeMessage({ type: "runtime:refresh-onboarding" }));
+  await b.runtime.handleMessage(runtimeMessage({ type: "runtime:refresh-onboarding" }));
+  assert.equal(b.runtime.getStatus().onboarding.pairing, undefined);
+  const blocked = await b.runtime.handleMessage(runtimeMessage({
+    type: "runtime:approve-pending-device",
+    pendingDeviceId: cDevice.deviceId,
+    confirmedFingerprint: cPairing.fingerprint,
+  }));
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.error?.code, "DEVICE_NOT_LOCALLY_TRUSTED");
+
+  await c.runtime.handleMessage(runtimeMessage({
+    type: "runtime:confirm-paired-approver",
+    approverDeviceId: cPairing.approverDeviceId,
+    confirmedFingerprint: cPairing.fingerprint,
+  }));
+  const aPairingForC = a.runtime.getStatus().onboarding.pairing!;
+  await a.runtime.handleMessage(runtimeMessage({
+    type: "runtime:approve-pending-device",
+    pendingDeviceId: cDevice.deviceId,
+    confirmedFingerprint: aPairingForC.fingerprint,
+  }));
+  assert.equal(approvalCalls, 2);
+
+  await Promise.all([
+    a.runtime.handleMessage(runtimeMessage({ type: "runtime:refresh-onboarding" })),
+    b.runtime.handleMessage(runtimeMessage({ type: "runtime:refresh-onboarding" })),
+    c.runtime.handleMessage(runtimeMessage({ type: "runtime:refresh-onboarding" })),
+  ]);
+  for (const store of [aStore, bStore, cStore]) {
+    assert.deepEqual(
+      [...store.records.values()]
+        .filter((device) => device.trustState === "root" || device.trustState === "verified")
+        .map((device) => device.deviceId)
+        .sort(),
+      [registeredDevice.deviceId, pendingDevice.deviceId, cDevice.deviceId].sort(),
+    );
+  }
 });
 
 test("trusted and pending collections drive the complete restart-safe pairing ceremony", async () => {

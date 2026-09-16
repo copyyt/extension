@@ -63,6 +63,10 @@ export interface RuntimeStatus {
     state: OnboardingState;
     bootstrapEligible: boolean;
     pairing?: PairingStatus;
+    error?: {
+      code: RuntimeErrorCode;
+      message: string;
+    };
   };
   lastSyncError?: {
     code: RuntimeErrorCode;

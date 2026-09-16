@@ -175,6 +175,12 @@ function Home() {
       {status?.onboarding?.state === "pairing-required" ? (
         <div className="mt-3 rounded-lg border border-[#D1D5DB] p-3 text-xs">
           <p className="font-semibold">Pair this device with an existing Copyyt device.</p>
+          <p className="mt-2 text-[#4B5563]">
+            {status.onboarding.error?.message ??
+              (status.device.trustState === "verified"
+                ? "New device approval is waiting on your account root device."
+                : "Confirm the account root fingerprint on this device to continue.")}
+          </p>
           <Button variant="outlined" className="mt-3 w-full" onClick={refreshOnboarding} disabled={pairingBusy}>
             {pairingBusy ? "Refreshing…" : "Refresh pairing"}
           </Button>
