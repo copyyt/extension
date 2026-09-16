@@ -543,6 +543,23 @@ function makePairingTrustStore(
   return { trustStore, records, get applied() { return applied; } };
 }
 
+function putLocalRecord(
+  records: Map<string, LocalDeviceRecord>,
+  device: RegisteredDeviceResponse,
+  trustState: LocalDeviceRecord["trustState"],
+  extra: Partial<LocalDeviceRecord> = {},
+): void {
+  records.set(`${user.id}:${device.deviceId}`, {
+    userId: user.id,
+    deviceId: device.deviceId,
+    keyVersion: device.keyVersion,
+    encryptionPublicKey: device.encryptionPublicKey,
+    signingPublicKey: device.signingPublicKey,
+    trustState,
+    ...extra,
+  });
+}
+
 test("bootstrap is backend-gated and the approver requires an exact pairing fingerprint", async () => {
   const pendingIdentity = {
     ...identity,
@@ -908,6 +925,314 @@ test("three devices converge on the original account root regardless of refresh 
       [registeredDevice.deviceId, pendingDevice.deviceId, cDevice.deviceId].sort(),
     );
   }
+});
+
+test("root revocation preserves verified B/C sync while blocking new trust", async () => {
+  const bIdentity = {
+    ...identity,
+    deviceId: pendingDevice.deviceId,
+    signingPublicKey: new Uint8Array(32).fill(2),
+    signingPublicKeyBase64: pendingDevice.signingPublicKey,
+    encryptionPublicKey: new Uint8Array(32).fill(1),
+    encryptionPublicKeyBase64: pendingDevice.encryptionPublicKey,
+    registration: { keyVersion: 1, name: pendingDevice.name, platform: "chrome", capabilities: [] },
+  } as unknown as DeviceIdentity;
+  const cDevice: RegisteredDeviceResponse = {
+    ...registeredDevice,
+    deviceId: "00000000-0000-4000-8000-000000000003",
+    name: "Third Chrome",
+    encryptionPublicKey: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw=",
+    signingPublicKey: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+    trustState: "trusted",
+  };
+  const cIdentity = {
+    ...identity,
+    deviceId: cDevice.deviceId,
+    signingPublicKey: new Uint8Array(32).fill(4),
+    signingPublicKeyBase64: cDevice.signingPublicKey,
+    encryptionPublicKey: new Uint8Array(32).fill(3),
+    encryptionPublicKeyBase64: cDevice.encryptionPublicKey,
+    registration: { keyVersion: 1, name: cDevice.name, platform: "chrome", capabilities: [] },
+  } as unknown as DeviceIdentity;
+  const bServer: RegisteredDeviceResponse = {
+    ...pendingDevice,
+    trustState: "trusted",
+    approvedByDeviceId: registeredDevice.deviceId,
+    approvalSignature: "a-to-b",
+  };
+  const cServer: RegisteredDeviceResponse = {
+    ...cDevice,
+    approvedByDeviceId: registeredDevice.deviceId,
+    approvalSignature: "a-to-c",
+  };
+  const dDevice: RegisteredDeviceResponse = {
+    ...registeredDevice,
+    deviceId: "00000000-0000-4000-8000-000000000004",
+    name: "Fourth Chrome",
+    trustState: "pending",
+  };
+  const dIdentity = {
+    ...identity,
+    deviceId: dDevice.deviceId,
+    registration: { keyVersion: 1, name: dDevice.name, platform: "chrome", capabilities: [] },
+  } as unknown as DeviceIdentity;
+  const listDevices = async () => response([bServer, cServer]);
+  const listPendingDevices = async () => response<RegisteredDeviceResponse[]>([dDevice]);
+
+  const makeVerifiedSecondary = (
+    secondaryIdentity: DeviceIdentity,
+    secondaryDevice: RegisteredDeviceResponse,
+  ) => {
+    const pairing = makePairingTrustStore(identity, registeredDevice, {
+      identity: secondaryIdentity,
+      device: secondaryDevice,
+    });
+    putLocalRecord(pairing.records, registeredDevice, "root", { trustOrigin: "initial-tofu" });
+    putLocalRecord(pairing.records, bServer, "verified");
+    putLocalRecord(pairing.records, cServer, "verified");
+    return pairing;
+  };
+  const bStore = makeVerifiedSecondary(bIdentity, bServer);
+  const cStore = makeVerifiedSecondary(cIdentity, cServer);
+  const dStore = makePairingTrustStore(identity, registeredDevice, {
+    identity: dIdentity,
+    device: dDevice,
+  });
+  const bRecipientIds: string[] = [];
+  const cRecipientIds: string[] = [];
+  const captureRecipients = (target: string[]) => async (input: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0]) => {
+    target.push(...input.recipients.map((recipient) => recipient.deviceId));
+    return {
+      itemId: "22222222-2222-4222-8222-222222222222",
+      sourceDeviceId: input.identity.deviceId,
+      sourceKeyVersion: 1,
+      sourceSignature: "signature",
+      protocolVersion: 1 as const,
+      contentType: "text/plain",
+      ciphertext: "ciphertext",
+      nonce: "nonce",
+      recipients: [],
+      expiresAt: new Date().toISOString(),
+    };
+  };
+  const b = makeRuntime({
+    identity: bIdentity,
+    registeredDevice: bServer,
+    trustStore: bStore.trustStore,
+    listDevices,
+    listPendingDevices,
+    encrypt: captureRecipients(bRecipientIds),
+  });
+  const c = makeRuntime({
+    identity: cIdentity,
+    registeredDevice: cServer,
+    trustStore: cStore.trustStore,
+    listDevices,
+    listPendingDevices,
+    encrypt: captureRecipients(cRecipientIds),
+  });
+  const d = makeRuntime({
+    identity: dIdentity,
+    registeredDevice: dDevice,
+    trustStore: dStore.trustStore,
+    listDevices,
+    listPendingDevices,
+  });
+
+  await Promise.all([b.runtime.start(), c.runtime.start(), d.runtime.start()]);
+  b.socket.trigger("auth:ready");
+  c.socket.trigger("auth:ready");
+  await Promise.all([
+    b.runtime.handleMessage(runtimeMessage({ type: "runtime:refresh-onboarding" })),
+    c.runtime.handleMessage(runtimeMessage({ type: "runtime:refresh-onboarding" })),
+  ]);
+
+  for (const setup of [b, c]) {
+    assert.equal(setup.runtime.getStatus().device.trustState, "verified");
+    assert.equal(setup.runtime.getStatus().socket.connected, true);
+    assert.equal(setup.runtime.getStatus().syncReady, true);
+    assert.equal(setup.runtime.getStatus().onboarding.state, "pairing-required");
+    assert.match(setup.runtime.getStatus().onboarding.error?.message ?? "", /root device is unavailable/i);
+  }
+  assert.equal(d.runtime.getStatus().socket.connected, false);
+  assert.match(d.runtime.getStatus().onboarding.error?.message ?? "", /root device is unavailable/i);
+  for (const setup of [b, c]) {
+    const approval = await setup.runtime.handleMessage(runtimeMessage({
+      type: "runtime:approve-pending-device",
+      pendingDeviceId: dDevice.deviceId,
+      confirmedFingerprint: "not-used",
+    }));
+    assert.equal(approval.ok, false);
+    assert.equal(approval.error?.code, "DEVICE_NOT_LOCALLY_TRUSTED");
+  }
+  for (const approverDeviceId of [bServer.deviceId, cServer.deviceId]) {
+    const confirmation = await d.runtime.handleMessage(runtimeMessage({
+      type: "runtime:confirm-paired-approver",
+      approverDeviceId,
+      confirmedFingerprint: "not-used",
+    }));
+    assert.equal(confirmation.ok, false);
+    assert.equal(confirmation.error?.code, "PAIRING_FAILED");
+  }
+  assert.equal(bStore.records.get(`${user.id}:${bServer.deviceId}`)?.trustState, "verified");
+  assert.equal(cStore.records.get(`${user.id}:${cServer.deviceId}`)?.trustState, "verified");
+  await Promise.all([
+    b.runtime.publishClipboardText("root-revoked-b"),
+    c.runtime.publishClipboardText("root-revoked-c"),
+  ]);
+  assert.deepEqual(bRecipientIds.sort(), [bServer.deviceId, cServer.deviceId].sort());
+  assert.deepEqual(cRecipientIds.sort(), [bServer.deviceId, cServer.deviceId].sort());
+  assert.equal(bRecipientIds.includes(registeredDevice.deviceId), false);
+  assert.equal(cRecipientIds.includes(registeredDevice.deviceId), false);
+});
+
+test("ambiguous roots preserve existing sync but block approval and pending-device root choice", async () => {
+  const bIdentity = {
+    ...identity,
+    deviceId: pendingDevice.deviceId,
+    signingPublicKey: new Uint8Array(32).fill(2),
+    signingPublicKeyBase64: pendingDevice.signingPublicKey,
+    encryptionPublicKey: new Uint8Array(32).fill(1),
+    encryptionPublicKeyBase64: pendingDevice.encryptionPublicKey,
+    registration: { keyVersion: 1, name: pendingDevice.name, platform: "chrome", capabilities: [] },
+  } as unknown as DeviceIdentity;
+  const cDevice: RegisteredDeviceResponse = {
+    ...registeredDevice,
+    deviceId: "00000000-0000-4000-8000-000000000003",
+    name: "Third Chrome",
+    trustState: "trusted",
+  };
+  const dDevice: RegisteredDeviceResponse = {
+    ...registeredDevice,
+    deviceId: "00000000-0000-4000-8000-000000000004",
+    name: "Fourth Chrome",
+    encryptionPublicKey: "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=",
+    signingPublicKey: "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY=",
+    trustState: "pending",
+  };
+  const dIdentity = {
+    ...identity,
+    deviceId: dDevice.deviceId,
+    signingPublicKey: new Uint8Array(32).fill(6),
+    signingPublicKeyBase64: dDevice.signingPublicKey,
+    encryptionPublicKey: new Uint8Array(32).fill(5),
+    encryptionPublicKeyBase64: dDevice.encryptionPublicKey,
+    registration: { keyVersion: 1, name: dDevice.name, platform: "chrome", capabilities: [] },
+  } as unknown as DeviceIdentity;
+  const bServer: RegisteredDeviceResponse = { ...pendingDevice, trustState: "trusted" };
+  const listDevices = async () => response<RegisteredDeviceResponse[]>([bServer, cDevice]);
+  const listPendingDevices = async () => response<RegisteredDeviceResponse[]>([dDevice]);
+  const bStore = makePairingTrustStore(bIdentity, bServer);
+  putLocalRecord(bStore.records, cDevice, "verified");
+  const cIdentity = {
+    ...identity,
+    deviceId: cDevice.deviceId,
+    registration: { keyVersion: 1, name: cDevice.name, platform: "chrome", capabilities: [] },
+  } as unknown as DeviceIdentity;
+  const cStore = makePairingTrustStore(cIdentity, cDevice);
+  putLocalRecord(cStore.records, pendingDevice, "verified");
+  const b = makeRuntime({
+    identity: bIdentity,
+    registeredDevice: bServer,
+    trustStore: bStore.trustStore,
+    listDevices,
+    listPendingDevices,
+    signApproval: async () => {
+      throw new Error("must not sign with an ambiguous root");
+    },
+  });
+  const c = makeRuntime({
+    identity: cIdentity,
+    registeredDevice: cDevice,
+    trustStore: cStore.trustStore,
+    listDevices,
+    listPendingDevices,
+  });
+  const dStore = makePairingTrustStore(bIdentity, pendingDevice, {
+    identity: dIdentity,
+    device: dDevice,
+  });
+  const d = makeRuntime({
+    identity: dIdentity,
+    registeredDevice: dDevice,
+    trustStore: dStore.trustStore,
+    listDevices,
+    listPendingDevices,
+  });
+
+  await Promise.all([b.runtime.start(), c.runtime.start(), d.runtime.start()]);
+  b.socket.trigger("auth:ready");
+  c.socket.trigger("auth:ready");
+  assert.equal(b.runtime.getStatus().syncReady, true);
+  assert.equal(c.runtime.getStatus().syncReady, true);
+  assert.match(b.runtime.getStatus().onboarding.error?.message ?? "", /root is ambiguous/i);
+  assert.match(c.runtime.getStatus().onboarding.error?.message ?? "", /root is ambiguous/i);
+  assert.match(d.runtime.getStatus().onboarding.error?.message ?? "", /root is ambiguous/i);
+  assert.equal(d.runtime.getStatus().socket.connected, false);
+
+  const approval = await b.runtime.handleMessage(runtimeMessage({
+    type: "runtime:approve-pending-device",
+    pendingDeviceId: dDevice.deviceId,
+    confirmedFingerprint: "not-used",
+  }));
+  assert.equal(approval.ok, false);
+  assert.equal(approval.error?.code, "PAIRING_FAILED");
+  const confirmation = await d.runtime.handleMessage(runtimeMessage({
+    type: "runtime:confirm-paired-approver",
+    approverDeviceId: pendingDevice.deviceId,
+    confirmedFingerprint: "not-used",
+  }));
+  assert.equal(confirmation.ok, false);
+  assert.equal(confirmation.error?.code, "PAIRING_FAILED");
+});
+
+test("publishing intersects local recipients with active server-trusted devices", async () => {
+  const bIdentity = {
+    ...identity,
+    deviceId: pendingDevice.deviceId,
+    signingPublicKey: new Uint8Array(32).fill(2),
+    signingPublicKeyBase64: pendingDevice.signingPublicKey,
+    encryptionPublicKey: new Uint8Array(32).fill(1),
+    encryptionPublicKeyBase64: pendingDevice.encryptionPublicKey,
+    registration: { keyVersion: 1, name: pendingDevice.name, platform: "chrome", capabilities: [] },
+  } as unknown as DeviceIdentity;
+  const cDevice: RegisteredDeviceResponse = {
+    ...registeredDevice,
+    deviceId: "00000000-0000-4000-8000-000000000003",
+    name: "Revoked Chrome",
+    trustState: "trusted",
+  };
+  const bServer: RegisteredDeviceResponse = { ...pendingDevice, trustState: "trusted" };
+  const bStore = makePairingTrustStore(bIdentity, bServer);
+  putLocalRecord(bStore.records, cDevice, "verified");
+  let recipientIds: string[] = [];
+  const setup = makeRuntime({
+    identity: bIdentity,
+    registeredDevice: bServer,
+    trustStore: bStore.trustStore,
+    localTrustState: "root",
+    listDevices: async () => response<RegisteredDeviceResponse[]>([bServer]),
+    listPendingDevices: async () => response<RegisteredDeviceResponse[]>([]),
+    encrypt: async (input) => {
+      recipientIds = input.recipients.map((recipient) => recipient.deviceId);
+      return {
+        itemId: "22222222-2222-4222-8222-222222222222",
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: new Date().toISOString(),
+      };
+    },
+  });
+  await setup.runtime.start();
+  setup.socket.trigger("auth:ready");
+  await setup.runtime.publishClipboardText("server-filtered");
+  assert.deepEqual(recipientIds, [pendingDevice.deviceId]);
 });
 
 test("trusted and pending collections drive the complete restart-safe pairing ceremony", async () => {

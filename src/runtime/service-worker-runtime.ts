@@ -145,8 +145,13 @@ function serverDevices(response: RegisteredDeviceListResponse): RegisteredDevice
 interface DeviceSnapshot {
   trustedDevices: RegisteredDeviceResponse[];
   pendingDevices: RegisteredDeviceResponse[];
-  accountRoot: RegisteredDeviceResponse;
+  accountRoot: AccountRootResolution;
 }
+
+type AccountRootResolution =
+  | { state: "available"; device: RegisteredDeviceResponse }
+  | { state: "missing" }
+  | { state: "ambiguous" };
 
 type ServerDeviceState = "unknown" | "trusted" | "pending" | "revoked";
 
@@ -194,9 +199,7 @@ function isActiveServerDevice(device: RegisteredDeviceResponse): boolean {
  * The v1 account root is the one active trusted device without an approval
  * parent or certificate. Never infer it from collection ordering.
  */
-export function findUniqueAccountRootCandidate(
-  trustedDevices: RegisteredDeviceResponse[],
-): RegisteredDeviceResponse {
+function resolveAccountRoot(trustedDevices: RegisteredDeviceResponse[]): AccountRootResolution {
   const candidates = trustedDevices.filter(
     (device) =>
       isActiveServerDevice(device) &&
@@ -204,10 +207,32 @@ export function findUniqueAccountRootCandidate(
       device.approvedByDeviceId == null &&
       device.approvalSignature == null,
   );
-  if (candidates.length === 1) return candidates[0];
+  if (candidates.length === 1) return { state: "available", device: candidates[0] };
+  return { state: candidates.length === 0 ? "missing" : "ambiguous" };
+}
+
+function accountRootError(root: AccountRootResolution): RuntimeError {
+  return new RuntimeError(
+    "PAIRING_FAILED",
+    root.state === "missing"
+      ? "The account root device is unavailable. Existing trusted devices can continue syncing, but new devices cannot be paired."
+      : "The account root is ambiguous. Existing trusted devices can continue syncing, but new devices cannot be paired.",
+  );
+}
+
+function requireAccountRoot(root: AccountRootResolution): RegisteredDeviceResponse {
+  if (root.state === "available") return root.device;
+  throw accountRootError(root);
+}
+
+export function findUniqueAccountRootCandidate(
+  trustedDevices: RegisteredDeviceResponse[],
+): RegisteredDeviceResponse {
+  const root = resolveAccountRoot(trustedDevices);
+  if (root.state === "available") return root.device;
   throw new RuntimeError(
     "PAIRING_FAILED",
-    candidates.length === 0
+    root.state === "missing"
       ? "Copyyt could not identify the account root device"
       : "Copyyt found multiple account root devices; pairing is blocked",
   );
@@ -425,12 +450,32 @@ export class CopyytServiceWorkerRuntime {
     if (!identity || identity.keyVersion === null) {
       throw new RuntimeError("DEVICE_NOT_REGISTERED", "The device must be registered before publishing");
     }
-    await this.refreshServerDevices(session);
-    const recipients = await this.dependencies.trustStore.listEncryptionRecipients(session.user.id);
+    const activeServerDevices = await this.refreshServerDevices(session);
+    const localRecipients = await this.dependencies.trustStore.listEncryptionRecipients(session.user.id);
     const localDevice = await this.dependencies.trustStore.getDevice(
       session.user.id,
       identity.deviceId,
     );
+    const activeServerDevice = activeServerDevices.find(
+      (device) => device.deviceId === identity.deviceId,
+    );
+    if (!activeServerDevice || !identityMatchesServerDevice(identity, activeServerDevice)) {
+      throw new RuntimeError(
+        "DEVICE_NOT_LOCALLY_TRUSTED",
+        "This device is no longer an active trusted device",
+      );
+    }
+    const recipients = localRecipients.filter((localRecipient) => {
+      const serverDevice = activeServerDevices.find(
+        (device) => device.deviceId === localRecipient.deviceId,
+      );
+      return Boolean(
+        serverDevice &&
+          localRecipient.keyVersion === serverDevice.keyVersion &&
+          localRecipient.signingPublicKey === serverDevice.signingPublicKey &&
+          localRecipient.encryptionPublicKey === serverDevice.encryptionPublicKey,
+      );
+    });
     // Keep the transport authenticated for onboarding, but do not let a
     // pending device publish even when another trusted recipient exists.
     if (!isLocallyVerified(localDevice) && recipients.length > 0) {
@@ -689,8 +734,15 @@ export class CopyytServiceWorkerRuntime {
     let eligibility: boolean;
     try {
       eligibility = await this.getBootstrapEligibility(session, identity);
-    } catch {
-      this.setOnboarding({ state: "unknown", bootstrapEligible: false });
+    } catch (error) {
+      if (error instanceof RuntimeError && error.code === "PAIRING_FAILED") {
+        this.setOnboarding({
+          state: "pairing-required",
+          bootstrapEligible: false,
+          error: { code: error.code, message: error.message },
+        });
+        throw error;
+      }
       throw new RuntimeError(
         "DEVICE_NOT_LOCALLY_TRUSTED",
         "Initial trust eligibility could not be verified",
@@ -718,16 +770,18 @@ export class CopyytServiceWorkerRuntime {
     session: RuntimeSession,
     identity: DeviceIdentity,
     trustedDevices?: RegisteredDeviceResponse[],
+    resolvedRoot?: AccountRootResolution,
   ): Promise<boolean> {
     const devices = trustedDevices ?? trustedServerDevices(
       (await this.dependencies.apiFactory(session.accessToken).devices.listDevices()).data,
     );
-    const accountRoot = findUniqueAccountRootCandidate(devices);
+    const accountRoot = resolvedRoot ?? resolveAccountRoot(devices);
+    const rootDevice = requireAccountRoot(accountRoot);
     const current = devices.find((device) => device.deviceId === identity.deviceId);
     if (
       !current ||
       current.trustState !== "trusted" ||
-      accountRoot.deviceId !== identity.deviceId ||
+      rootDevice.deviceId !== identity.deviceId ||
       !identityMatchesServerDevice(identity, current)
     ) {
       return false;
@@ -766,9 +820,19 @@ export class CopyytServiceWorkerRuntime {
       throw new RuntimeError("DEVICE_NOT_LOCALLY_TRUSTED", "Only the initial account root can approve pairing");
     }
     const snapshot = await this.fetchDeviceSnapshot(session);
+    if (snapshot.accountRoot.state !== "available") {
+      const error = accountRootError(snapshot.accountRoot);
+      this.setOnboarding({
+        state: "pairing-required",
+        bootstrapEligible: false,
+        error: { code: error.code, message: error.message },
+      });
+      throw error;
+    }
+    const accountRoot = snapshot.accountRoot.device;
     if (
-      snapshot.accountRoot.deviceId !== identity.deviceId ||
-      !identityMatchesServerDevice(identity, snapshot.accountRoot)
+      accountRoot.deviceId !== identity.deviceId ||
+      !identityMatchesServerDevice(identity, accountRoot)
     ) {
       throw new RuntimeError("DEVICE_NOT_LOCALLY_TRUSTED", "Only the account root device can approve pairing");
     }
@@ -847,7 +911,16 @@ export class CopyytServiceWorkerRuntime {
     }
     const snapshot = await this.fetchDeviceSnapshot(session);
     const current = snapshot.pendingDevices.find((device) => device.deviceId === identity.deviceId);
-    const serverApprover = snapshot.accountRoot;
+    if (snapshot.accountRoot.state !== "available") {
+      const error = accountRootError(snapshot.accountRoot);
+      this.setOnboarding({
+        state: "pairing-required",
+        bootstrapEligible: false,
+        error: { code: error.code, message: error.message },
+      });
+      throw error;
+    }
+    const serverApprover = snapshot.accountRoot.device;
     if (!current || !identityMatchesServerDevice(identity, current)) {
       throw new RuntimeError("PAIRING_FAILED", "The current device identity changed on the server");
     }
@@ -1026,23 +1099,7 @@ export class CopyytServiceWorkerRuntime {
       this.setOnboarding({ state: "unknown", bootstrapEligible: false });
       return;
     }
-    let snapshot: DeviceSnapshot;
-    try {
-      snapshot = await this.fetchDeviceSnapshot(session);
-    } catch (error) {
-      if (error instanceof RuntimeError && error.code === "PAIRING_FAILED") {
-        this.serverDeviceState = "unknown";
-        this.destroySocket(this.socket);
-        this.setAccountAuthenticatedWithoutSocket();
-        this.setOnboarding({
-          state: "pairing-required",
-          bootstrapEligible: false,
-          error: { code: error.code, message: error.message },
-        });
-        return;
-      }
-      throw error;
-    }
+    const snapshot = await this.fetchDeviceSnapshot(session);
     const { trustedDevices, pendingDevices, accountRoot } = snapshot;
     for (const device of [...trustedDevices, ...pendingDevices]) {
       await this.dependencies.trustStore.upsertServerReportedDevice({
@@ -1062,7 +1119,16 @@ export class CopyytServiceWorkerRuntime {
       if (!identityMatchesServerDevice(identity, currentPending)) {
         throw new RuntimeError("PAIRING_FAILED", "The current device identity changed on the server");
       }
-      const approver = accountRoot;
+      if (accountRoot.state !== "available") {
+        const error = accountRootError(accountRoot);
+        this.setOnboarding({
+          state: "pairing-required",
+          bootstrapEligible: false,
+          error: { code: error.code, message: error.message },
+        });
+        return;
+      }
+      const approver = accountRoot.device;
       if (approver.deviceId === identity.deviceId) {
         this.setOnboarding({ state: "pairing-required", bootstrapEligible: false });
         return;
@@ -1133,7 +1199,9 @@ export class CopyytServiceWorkerRuntime {
       identity.deviceId,
     );
 
-    const bootstrapEligible = await this.getBootstrapEligibility(session, identity, trustedDevices);
+    const bootstrapEligible = accountRoot.state === "available"
+      ? await this.getBootstrapEligibility(session, identity, trustedDevices, accountRoot)
+      : false;
     if (bootstrapEligible) {
       this.setOnboarding({ state: "bootstrap-eligible", bootstrapEligible: true });
       return;
@@ -1141,6 +1209,15 @@ export class CopyytServiceWorkerRuntime {
     if (isLocallyVerified(localCurrent)) {
       await this.updateDeviceStatus(identity);
       const pending = [...pendingDevices].sort((left, right) => left.deviceId.localeCompare(right.deviceId))[0];
+      if (accountRoot.state !== "available") {
+        const error = accountRootError(accountRoot);
+        this.setOnboarding({
+          state: "pairing-required",
+          bootstrapEligible: false,
+          error: { code: error.code, message: error.message },
+        });
+        return;
+      }
       if (!pending) {
         this.setOnboarding({ state: "complete", bootstrapEligible: false });
         return;
@@ -1148,7 +1225,7 @@ export class CopyytServiceWorkerRuntime {
       if (
         localCurrent.trustState !== "root" ||
         localCurrent.trustOrigin !== "initial-tofu" ||
-        accountRoot.deviceId !== identity.deviceId
+        accountRoot.device.deviceId !== identity.deviceId
       ) {
         this.setOnboarding({ state: "pairing-required", bootstrapEligible: false });
         return;
@@ -1174,7 +1251,16 @@ export class CopyytServiceWorkerRuntime {
       });
       return;
     }
-    const approver = accountRoot;
+    if (accountRoot.state !== "available") {
+      const error = accountRootError(accountRoot);
+      this.setOnboarding({
+        state: "pairing-required",
+        bootstrapEligible: false,
+        error: { code: error.code, message: error.message },
+      });
+      return;
+    }
+    const approver = accountRoot.device;
     if (approver.deviceId === identity.deviceId) {
       this.setOnboarding({ state: "pairing-required", bootstrapEligible: false });
       return;
@@ -1540,27 +1626,12 @@ export class CopyytServiceWorkerRuntime {
     return {
       trustedDevices,
       pendingDevices: pendingServerDevices(pendingResponse.data),
-      accountRoot: findUniqueAccountRootCandidate(trustedDevices),
+      accountRoot: resolveAccountRoot(trustedDevices),
     };
   }
 
   private async refreshServerDevices(session: RuntimeSession): Promise<RegisteredDeviceResponse[]> {
-    let snapshot: DeviceSnapshot;
-    try {
-      snapshot = await this.fetchDeviceSnapshot(session);
-    } catch (error) {
-      if (error instanceof RuntimeError && error.code === "PAIRING_FAILED") {
-        this.serverDeviceState = "unknown";
-        this.destroySocket(this.socket);
-        this.setAccountAuthenticatedWithoutSocket();
-        this.setOnboarding({
-          state: "pairing-required",
-          bootstrapEligible: false,
-          error: { code: error.code, message: error.message },
-        });
-      }
-      throw error;
-    }
+    const snapshot = await this.fetchDeviceSnapshot(session);
     const devices = [...snapshot.trustedDevices, ...snapshot.pendingDevices];
     for (const device of devices) {
       await this.dependencies.trustStore.upsertServerReportedDevice({
@@ -1583,6 +1654,17 @@ export class CopyytServiceWorkerRuntime {
       this.serverDeviceState = currentPending ? "pending" : currentTrusted ? "trusted" : "revoked";
       await this.reconcileBackendApprovals(session, snapshot.trustedDevices);
       await this.updateDeviceStatus(identity);
+      if (
+        (this.serverDeviceState === "trusted" || this.serverDeviceState === "pending") &&
+        snapshot.accountRoot.state !== "available"
+      ) {
+        const error = accountRootError(snapshot.accountRoot);
+        this.setOnboarding({
+          state: "pairing-required",
+          bootstrapEligible: false,
+          error: { code: error.code, message: error.message },
+        });
+      }
       if (this.serverDeviceState !== "trusted") {
         this.destroySocket(this.socket);
         this.setAccountAuthenticatedWithoutSocket();
