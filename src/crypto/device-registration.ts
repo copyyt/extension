@@ -45,19 +45,18 @@ export interface DeviceRegistrationApi {
   ): Promise<AxiosResponse<RegisteredDeviceResponse>>;
   listPendingDevices(): Promise<AxiosResponse<RegisteredDeviceListResponse>>;
   approveDevice(
-    request: DeviceApprovalRequest,
+    request: ApproveDeviceRequest,
   ): Promise<AxiosResponse<RegisteredDeviceResponse>>;
 }
 
-export interface DeviceApprovalRequest {
+export interface ApproveDeviceRequest {
   approvingDeviceId: string;
-  approvingKeyVersion: number;
   pendingDeviceId: string;
-  pendingKeyVersion: number;
-  pendingEncryptionPublicKey: string;
-  pendingSigningPublicKey: string;
   approvalSignature: string;
 }
+
+/** @deprecated Use ApproveDeviceRequest for the backend HTTP DTO. */
+export type DeviceApprovalRequest = ApproveDeviceRequest;
 
 export interface RegisterCurrentDeviceOptions {
   userId: string;

@@ -148,7 +148,7 @@ function makeRuntime(overrides: Partial<{
     },
     devices: {
       registerDevice: async () => response(runtimeRegisteredDevice),
-      listDevices: (overrides.listDevices ?? (async () => response([]))) as RuntimeApi["devices"]["listDevices"],
+      listDevices: (overrides.listDevices ?? (async () => response([runtimeRegisteredDevice]))) as RuntimeApi["devices"]["listDevices"],
       listPendingDevices: (overrides.listPendingDevices ?? (async () => response([]))) as RuntimeApi["devices"]["listPendingDevices"],
       approveDevice: (overrides.approveDevice ?? (async () => { throw new Error("not used"); })) as RuntimeApi["devices"]["approveDevice"],
     },
@@ -411,6 +411,23 @@ test("socket auth failure recreates the socket with a refreshed token", async ()
   assert.deepEqual(setup.getSocketOptions()?.auth, { token: newToken });
 });
 
+test("a post-challenge auth failure does not refresh the account token", async () => {
+  let refreshCalls = 0;
+  const setup = makeRuntime({
+    refreshTokens: async () => {
+      refreshCalls += 1;
+      return response(refreshedSession("unexpected-token"));
+    },
+  });
+  await setup.runtime.start();
+  setup.socket.trigger("auth:challenge", { socketId: "socket-1", challenge: "challenge" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  setup.socket.trigger("auth:failure");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(refreshCalls, 0);
+  assert.equal(setup.runtime.getStatus().lastConnectionError?.code, "DEVICE_AUTH_FAILED");
+});
+
 test("concurrent socket authentication failures perform one refresh", async () => {
   let refreshCalls = 0;
   let releaseRefresh!: () => void;
@@ -448,21 +465,37 @@ test("transient refresh failure retains the local session while definitive rejec
   assert.equal(await definitive.sessionStore.get(), null);
 });
 
-function makePairingTrustStore(): {
+function makePairingTrustStore(
+  rootIdentity: DeviceIdentity = identity,
+  rootDevice: RegisteredDeviceResponse = registeredDevice,
+  initialDevice?: { identity: DeviceIdentity; device: RegisteredDeviceResponse },
+): {
   trustStore: ClientTrustStore;
   records: Map<string, LocalDeviceRecord>;
   applied: LocalDeviceRecord["approvalCertificate"];
 } {
   const records = new Map<string, LocalDeviceRecord>();
-  records.set(`${user.id}:${identity.deviceId}`, {
+  const rootRecord: LocalDeviceRecord = {
     userId: user.id,
-    deviceId: identity.deviceId,
+    deviceId: rootIdentity.deviceId,
     keyVersion: 1,
-    encryptionPublicKey: registeredDevice.encryptionPublicKey,
-    signingPublicKey: registeredDevice.signingPublicKey,
+    encryptionPublicKey: rootDevice.encryptionPublicKey,
+    signingPublicKey: rootDevice.signingPublicKey,
     trustState: "root",
     trustOrigin: "initial-tofu",
-  });
+  };
+  if (initialDevice) {
+    records.set(`${user.id}:${initialDevice.identity.deviceId}`, {
+      userId: user.id,
+      deviceId: initialDevice.identity.deviceId,
+      keyVersion: initialDevice.device.keyVersion,
+      encryptionPublicKey: initialDevice.device.encryptionPublicKey,
+      signingPublicKey: initialDevice.device.signingPublicKey,
+      trustState: "unverified",
+    });
+  } else {
+    records.set(`${user.id}:${rootIdentity.deviceId}`, rootRecord);
+  }
   let applied: LocalDeviceRecord["approvalCertificate"];
   const key = (deviceId: string) => `${user.id}:${deviceId}`;
   const trustStore: ClientTrustStore = {
@@ -477,8 +510,21 @@ function makePairingTrustStore(): {
       records.set(key(device.deviceId), next);
       return next;
     },
-    bootstrapInitialTrustAnchor: async () => records.get(key(identity.deviceId))! as ClientVerifiedDevice,
-    pinPairedApprover: async () => { throw new Error("not used"); },
+    bootstrapInitialTrustAnchor: async () => records.get(key(rootIdentity.deviceId))! as ClientVerifiedDevice,
+    pinPairedApprover: async (_userId, localIdentity, approverDeviceId, confirmedFingerprint) => {
+      const approver = records.get(key(approverDeviceId));
+      if (!approver || approver.trustState !== "unverified") throw new Error("approver missing");
+      const paired: ClientVerifiedDevice = {
+        ...approver,
+        trustState: "root",
+        trustOrigin: "pairing",
+        pairedForDeviceId: localIdentity.deviceId,
+        pairingFingerprint: confirmedFingerprint,
+        pinnedAt: new Date().toISOString(),
+      };
+      records.set(key(approverDeviceId), paired);
+      return paired;
+    },
     pinInitialDevice: async () => { throw new Error("not used"); },
     applyApproval: async (_userId, certificate) => {
       const pending = records.get(key(certificate.pendingDeviceId));
@@ -526,6 +572,7 @@ test("bootstrap is backend-gated and the approver requires an exact pairing fing
 test("the runtime approver displays the full-key fingerprint and applies the signed approval locally", async () => {
   const pairing = makePairingTrustStore();
   let approvalRequests = 0;
+  let approvalRequestKeys: string[] = [];
   const setup = makeRuntime({
     trustStore: pairing.trustStore,
     localTrustState: "root",
@@ -534,9 +581,12 @@ test("the runtime approver displays the full-key fingerprint and applies the sig
     signApproval: async () => "approval-signature",
     approveDevice: async (request) => {
       approvalRequests += 1;
+      approvalRequestKeys = Object.keys(request as object).sort();
+      assert.deepEqual(approvalRequestKeys, ["approvalSignature", "approvingDeviceId", "pendingDeviceId"]);
       const certificate = request as { approvingDeviceId: string; approvalSignature: string };
       return response({
         ...pendingDevice,
+        trustState: "trusted",
         approvedByDeviceId: certificate.approvingDeviceId,
         approvalSignature: certificate.approvalSignature,
       });
@@ -564,6 +614,102 @@ test("the runtime approver displays the full-key fingerprint and applies the sig
   }));
   assert.equal(approved.ok, true);
   assert.equal(approvalRequests, 1);
+  assert.deepEqual(approvalRequestKeys, ["approvalSignature", "approvingDeviceId", "pendingDeviceId"]);
   assert.equal(pairing.records.get(`${user.id}:${pendingDevice.deviceId}`)?.trustState, "verified");
   assert.equal(pairing.applied?.approvalSignature, "approval-signature");
+});
+
+test("trusted and pending collections drive the complete restart-safe pairing ceremony", async () => {
+  const pendingIdentity = {
+    ...identity,
+    deviceId: pendingDevice.deviceId,
+    signingPublicKey: new Uint8Array(32).fill(2),
+    signingPublicKeyBase64: pendingDevice.signingPublicKey,
+    encryptionPublicKey: new Uint8Array(32).fill(1),
+    encryptionPublicKeyBase64: pendingDevice.encryptionPublicKey,
+    registration: { keyVersion: 1, name: pendingDevice.name, platform: "chrome", capabilities: ["clipboard"] },
+  } as unknown as DeviceIdentity;
+  let serverPending = true;
+  let serverApprovalSignature: string | undefined;
+  const listTrusted = async () => response<RegisteredDeviceResponse[]>([
+    registeredDevice,
+    ...(serverPending ? [] : [{
+      ...pendingDevice,
+      trustState: "trusted",
+      approvedByDeviceId: identity.deviceId,
+      approvalSignature: serverApprovalSignature,
+    }]),
+  ]);
+  const listPending = async () => response<RegisteredDeviceResponse[]>(serverPending ? [pendingDevice] : []);
+  const approve = async (request: unknown) => {
+    const keys = Object.keys(request as object).sort();
+    assert.deepEqual(keys, ["approvalSignature", "approvingDeviceId", "pendingDeviceId"]);
+    const dto = request as { approvingDeviceId: string; pendingDeviceId: string; approvalSignature: string };
+    assert.equal(dto.approvingDeviceId, identity.deviceId);
+    assert.equal(dto.pendingDeviceId, pendingDevice.deviceId);
+    serverApprovalSignature = dto.approvalSignature;
+    serverPending = false;
+    return response({
+      ...pendingDevice,
+      trustState: "trusted",
+      approvedByDeviceId: dto.approvingDeviceId,
+      approvalSignature: dto.approvalSignature,
+    });
+  };
+
+  const approverStore = makePairingTrustStore();
+  const approver = makeRuntime({
+    trustStore: approverStore.trustStore,
+    localTrustState: "root",
+    listDevices: listTrusted,
+    listPendingDevices: listPending,
+    signApproval: async () => "approval-signature",
+    approveDevice: approve,
+  });
+  const pendingStore = makePairingTrustStore(pendingIdentity, pendingDevice, {
+    identity: pendingIdentity,
+    device: pendingDevice,
+  });
+  const pending = makeRuntime({
+    identity: pendingIdentity,
+    registeredDevice: pendingDevice,
+    trustStore: pendingStore.trustStore,
+    listDevices: listTrusted,
+    listPendingDevices: listPending,
+  });
+
+  await approver.runtime.start();
+  await pending.runtime.start();
+  const approverPairing = approver.runtime.getStatus().onboarding.pairing;
+  const pendingPairing = pending.runtime.getStatus().onboarding.pairing;
+  assert.equal(approverPairing?.role, "approver");
+  assert.equal(pendingPairing?.role, "pending");
+  assert.equal(pendingPairing?.fingerprint, approverPairing?.fingerprint);
+  assert.equal(pending.runtime.getStatus().signedIn, true);
+  assert.equal(pending.runtime.getStatus().socket.connected, false);
+  assert.equal(pending.getSocketOptions(), undefined);
+
+  const confirmed = await pending.runtime.handleMessage(runtimeMessage({
+    type: "runtime:confirm-paired-approver",
+    approverDeviceId: identity.deviceId,
+    confirmedFingerprint: pendingPairing!.fingerprint,
+  }));
+  assert.equal(confirmed.ok, true);
+  assert.equal(pendingStore.records.get(`${user.id}:${identity.deviceId}`)?.trustState, "root");
+  assert.equal(pendingStore.records.get(`${user.id}:${pendingDevice.deviceId}`)?.trustState, "unverified");
+
+  const approved = await approver.runtime.handleMessage(runtimeMessage({
+    type: "runtime:approve-pending-device",
+    pendingDeviceId: pendingDevice.deviceId,
+    confirmedFingerprint: approverPairing!.fingerprint,
+  }));
+  assert.equal(approved.ok, true);
+  assert.equal(approverStore.records.get(`${user.id}:${pendingDevice.deviceId}`)?.trustState, "verified");
+
+  const refreshed = await pending.runtime.handleMessage(runtimeMessage({ type: "runtime:refresh-onboarding" }));
+  assert.equal(refreshed.ok, true);
+  assert.equal(pending.runtime.getStatus().onboarding.state, "complete");
+  assert.equal(pending.runtime.getStatus().device.trustState, "verified");
+  assert.equal(pendingStore.records.get(`${user.id}:${pendingDevice.deviceId}`)?.trustState, "verified");
+  assert.equal(pending.runtime.getStatus().socket.connected, true);
 });

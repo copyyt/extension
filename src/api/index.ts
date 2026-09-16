@@ -7,7 +7,7 @@ import {
 } from "../interfaces/auth.interface";
 import type {
   DeviceRegistrationRequest,
-  DeviceApprovalRequest,
+  ApproveDeviceRequest,
   RegisteredDeviceResponse,
   RegisteredDeviceListResponse,
 } from "../crypto/device-registration";
@@ -42,7 +42,7 @@ export const getApis = (axiosInstance: AxiosInstance) => ({
       axiosInstance.get<RegisteredDeviceListResponse>("/devices"),
     listPendingDevices: async () =>
       axiosInstance.get<RegisteredDeviceListResponse>("/devices/pending"),
-    approveDevice: async (data: DeviceApprovalRequest) =>
+    approveDevice: async (data: ApproveDeviceRequest) =>
       axiosInstance.post<RegisteredDeviceResponse>("/devices/approve", data),
   },
 });
