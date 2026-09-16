@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "test:crypto": "node --experimental-strip-types --test \"src/crypto/*.test.ts\"",
+    "test:chrome": "node tests/chrome/run-key-persistence.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

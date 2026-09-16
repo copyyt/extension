@@ -1,0 +1,184 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Copyyt Chrome cryptographic persistence harness</title>
+<pre id="output">RUNNING</pre>
+<script type="module">
+  const output = document.querySelector("#output");
+  const checks = [];
+  const assert = (condition, message) => {
+    if (!condition) throw new Error(message);
+    checks.push(message);
+  };
+  const uuid = () => crypto.randomUUID();
+
+  function readIdentityRecord(userId) {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open("copyyt-crypto-v2", 1);
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction("identity", "readonly");
+        const read = transaction.objectStore("identity").get(userId);
+        read.onerror = () => reject(read.error);
+        read.onsuccess = () => resolve(read.result);
+        transaction.oncomplete = () => database.close();
+      };
+    });
+  }
+
+  function createRealmCreator(userId) {
+    return new Promise((resolve, reject) => {
+      const frame = document.createElement("iframe");
+      const timeout = setTimeout(() => {
+        frame.remove();
+        reject(new Error("Timed out waiting for identity creator realm"));
+      }, 10000);
+      frame.src = `/tests/chrome/identity-creator.html?userId=${encodeURIComponent(userId)}`;
+      const onMessage = (event) => {
+        if (event.source !== frame.contentWindow || event.origin !== location.origin) return;
+        if (event.data?.type !== "identity-created") return;
+        clearTimeout(timeout);
+        window.removeEventListener("message", onMessage);
+        frame.remove();
+        if (event.data.error) reject(new Error(event.data.error));
+        else resolve(event.data);
+      };
+      window.addEventListener("message", onMessage);
+      document.body.append(frame);
+    });
+  }
+
+  async function keyPersistenceChecks() {
+    const { getDeviceIdentity, getOrCreateDeviceIdentity, clearDeviceIdentity, persistDeviceRegistrationMetadata, createDeviceIdentityForTesting } =
+      await import("/src/crypto/key-store.ts");
+    const { IndexedDBTrustStore } = await import("/src/crypto/trust-store.ts");
+    const { registerCurrentDevice } = await import("/src/crypto/device-registration.ts");
+    const { signDeviceApproval } = await import("/src/crypto/crypto-core.ts");
+
+    const userA = uuid();
+    const userB = uuid();
+    await Promise.all([clearDeviceIdentity(userA), clearDeviceIdentity(userB)]);
+
+    const [realmA, realmB] = await Promise.all([
+      createRealmCreator(userA),
+      createRealmCreator(userA),
+    ]);
+    assert(realmA.deviceId === realmB.deviceId, "concurrent creators observe one deviceId");
+    assert(realmA.signingPublicKey === realmB.signingPublicKey, "concurrent creators observe one signing public key");
+    assert(realmA.encryptionPublicKey === realmB.encryptionPublicKey, "concurrent creators observe one encryption public key");
+
+    const identityA = await getOrCreateDeviceIdentity(userA);
+    const identityB = await getOrCreateDeviceIdentity(userB);
+    assert(identityA.deviceId !== identityB.deviceId, "different accounts receive different device identities");
+    assert((await getOrCreateDeviceIdentity(userA)).deviceId === identityA.deviceId, "returning to account A restores account A identity");
+
+    const raw = await readIdentityRecord(userA);
+    assert(raw.signingPrivateKey.type === "private" && raw.signingPrivateKey.extractable === false, "Ed25519 private key is non-extractable");
+    assert(raw.encryptionPrivateKey.type === "private" && raw.encryptionPrivateKey.extractable === false, "X25519 private key is non-extractable");
+    const signingRaw = new Uint8Array(await crypto.subtle.exportKey("raw", raw.signingPublicKey));
+    const encryptionRaw = new Uint8Array(await crypto.subtle.exportKey("raw", raw.encryptionPublicKey));
+    assert(signingRaw.length === 32 && encryptionRaw.length === 32, "public keys export as raw 32-byte keys");
+    const signature = await crypto.subtle.sign({ name: "Ed25519" }, raw.signingPrivateKey, new TextEncoder().encode("reload"));
+    assert(signature.byteLength === 64, "reloaded Ed25519 private key signs successfully");
+    const peer = await crypto.subtle.generateKey({ name: "X25519" }, false, ["deriveBits"]);
+    const sharedOne = new Uint8Array(await crypto.subtle.deriveBits({ name: "X25519", public: peer.publicKey }, raw.encryptionPrivateKey, 256));
+    const sharedTwo = new Uint8Array(await crypto.subtle.deriveBits({ name: "X25519", public: raw.encryptionPublicKey }, peer.privateKey, 256));
+    assert(sharedOne.every((value, index) => value === sharedTwo[index]), "reloaded X25519 private key derives the same shared secret");
+    for (const key of [raw.signingPrivateKey, raw.encryptionPrivateKey]) {
+      await crypto.subtle.exportKey("pkcs8", key).then(
+        () => { throw new Error("private key export unexpectedly succeeded"); },
+        () => undefined,
+      );
+    }
+    assert(true, "exportKey fails for both private keys");
+
+    const rootUser = uuid();
+    let root = await getOrCreateDeviceIdentity(rootUser);
+    root = await persistDeviceRegistrationMetadata(root, {
+      keyVersion: 1,
+      name: "Chrome root",
+      platform: "chrome",
+      capabilities: ["clipboard"],
+      appVersion: "harness",
+    });
+    const pendingSigningPair = await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign", "verify"]);
+    const pendingEncryptionPair = await crypto.subtle.generateKey({ name: "X25519" }, false, ["deriveBits"]);
+    const pendingIdentity = await createDeviceIdentityForTesting({
+      userId: rootUser,
+      deviceId: uuid(),
+      keyVersion: 1,
+      signingPrivateKey: pendingSigningPair.privateKey,
+      signingPublicKey: pendingSigningPair.publicKey,
+      encryptionPrivateKey: pendingEncryptionPair.privateKey,
+      encryptionPublicKey: pendingEncryptionPair.publicKey,
+    });
+    const storeOne = new IndexedDBTrustStore();
+    await storeOne.bootstrapInitialTrustAnchor(rootUser, root, { name: "Chrome root", platform: "chrome" });
+    const pending = await storeOne.upsertServerReportedDevice({
+      userId: rootUser,
+      deviceId: pendingIdentity.deviceId,
+      keyVersion: pendingIdentity.keyVersion,
+      encryptionPublicKey: pendingIdentity.encryptionPublicKeyBase64,
+      signingPublicKey: pendingIdentity.signingPublicKeyBase64,
+      name: "Chrome pending",
+      platform: "chrome",
+      capabilities: ["clipboard"],
+      trustState: "trusted",
+    });
+    assert(pending.trustState === "unverified", "server trusted label stays locally unverified");
+    const approval = {
+      approvingDeviceId: root.deviceId,
+      approvingKeyVersion: root.keyVersion,
+      pendingDeviceId: pendingIdentity.deviceId,
+      pendingKeyVersion: pendingIdentity.keyVersion,
+      pendingEncryptionPublicKey: pendingIdentity.encryptionPublicKeyBase64,
+      pendingSigningPublicKey: pendingIdentity.signingPublicKeyBase64,
+      approvalSignature: await signDeviceApproval({
+        userId: rootUser,
+        approvingIdentity: root,
+        pendingDevice: {
+          pendingDeviceId: pendingIdentity.deviceId,
+          pendingKeyVersion: pendingIdentity.keyVersion,
+          pendingEncryptionPublicKey: pendingIdentity.encryptionPublicKeyBase64,
+          pendingSigningPublicKey: pendingIdentity.signingPublicKeyBase64,
+        },
+      }),
+    };
+    await storeOne.applyApproval(rootUser, approval);
+    const storeTwo = new IndexedDBTrustStore();
+    assert((await storeTwo.getDevice(rootUser, pendingIdentity.deviceId)).trustState === "verified", "approved device remains verified after trust-store reconstruction");
+    assert(Boolean((await storeTwo.getDevice(rootUser, pendingIdentity.deviceId)).approvalCertificate), "approval certificate survives trust-store reconstruction");
+    await storeTwo.revokeDevice(rootUser, pendingIdentity.deviceId);
+    const storeThree = new IndexedDBTrustStore();
+    assert((await storeThree.getDevice(rootUser, pendingIdentity.deviceId)).trustState === "revoked", "revoked device remains revoked after trust-store reconstruction");
+
+    const registrationUser = uuid();
+    const registrationStore = new IndexedDBTrustStore();
+    const registrationApi = {
+      registerDevice: async (request) => ({
+        data: {
+          ...request,
+          trustState: "trusted",
+          keyVersion: 1,
+          platform: "chrome",
+        },
+      }),
+    };
+    await registerCurrentDevice(registrationApi, {
+      userId: registrationUser,
+      name: "Registration test",
+      appVersion: "harness",
+      trustStore: registrationStore,
+    });
+    assert((await registrationStore.getDevice(registrationUser, (await getDeviceIdentity(registrationUser)).deviceId)).trustState === "unverified", "registration response cannot establish a local root");
+
+    output.textContent = `PASS\n${checks.map((check) => `✓ ${check}`).join("\n")}`;
+  }
+
+  try {
+    await keyPersistenceChecks();
+  } catch (error) {
+    output.textContent = `FAIL\n${error?.stack || error}`;
+    throw error;
+  }
+</script>

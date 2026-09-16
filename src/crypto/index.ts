@@ -22,6 +22,8 @@ export {
   type DeviceIdentity,
 } from "./key-store";
 export {
+  IndexedDBTrustStore,
+  DurableTrustStore,
   InMemoryTrustStore,
   type ClientTrustStore,
   type ClientVerifiedDevice,
@@ -29,6 +31,12 @@ export {
   type LocalTrustState,
 } from "./trust-store";
 export { registerCurrentDevice } from "./device-registration";
+export type {
+  DeviceRegistrationApi,
+  DeviceRegistrationRequest,
+  RegisteredDeviceResponse,
+  RegisterCurrentDeviceOptions,
+} from "./device-registration";
 export {
   buildClipboardEnvelopeSignatureMessage,
   buildDeviceApprovalMessage,

@@ -37,18 +37,18 @@ export interface DeviceRegistrationApi {
 }
 
 export interface RegisterCurrentDeviceOptions {
+  userId: string;
   name: string;
   capabilities?: string[];
   appVersion: string;
   trustStore?: ClientTrustStore;
-  userId?: string;
 }
 
 export async function registerCurrentDevice(
   api: DeviceRegistrationApi,
   options: RegisterCurrentDeviceOptions,
 ): Promise<{ identity: DeviceIdentity; device: RegisteredDeviceResponse }> {
-  const identity = await getOrCreateDeviceIdentity();
+  const identity = await getOrCreateDeviceIdentity(options.userId);
   const request: DeviceRegistrationRequest = {
     deviceId: identity.deviceId,
     name: options.name,
@@ -76,28 +76,21 @@ export async function registerCurrentDevice(
     capabilities: [...device.capabilities],
     appVersion: device.appVersion,
   });
-  if (options.trustStore && options.userId) {
-    const current = options.trustStore.getDevice(options.userId, identity.deviceId);
-    if (!current && device.trustState === "trusted") {
-      options.trustStore.pinInitialDevice(options.userId, updatedIdentity, {
-        name: device.name,
-        platform: device.platform,
-        capabilities: [...device.capabilities],
-        appVersion: device.appVersion,
-      });
-    } else if (!current || current.trustState === "unverified") {
-      options.trustStore.upsertServerReportedDevice({
-        userId: options.userId,
-        deviceId: identity.deviceId,
-        keyVersion: device.keyVersion,
-        encryptionPublicKey: device.encryptionPublicKey,
-        signingPublicKey: device.signingPublicKey,
-        name: device.name,
-        platform: device.platform,
-        capabilities: [...device.capabilities],
-        appVersion: device.appVersion,
-      });
-    }
+  if (options.trustStore) {
+    // Registration is only a server observation. In particular, a server
+    // "trusted" label never establishes a client-side cryptographic root.
+    await options.trustStore.upsertServerReportedDevice({
+      userId: options.userId,
+      deviceId: identity.deviceId,
+      keyVersion: device.keyVersion,
+      encryptionPublicKey: device.encryptionPublicKey,
+      signingPublicKey: device.signingPublicKey,
+      name: device.name,
+      platform: device.platform,
+      capabilities: [...device.capabilities],
+      appVersion: device.appVersion,
+      trustState: device.trustState,
+    });
   }
   return { identity: updatedIdentity, device };
 }

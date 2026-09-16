@@ -5,11 +5,15 @@ The extension’s Phase 1D crypto core is framework-independent and uses Chrome
 HKDF-SHA-256, and AES-256-GCM. Plaintext clipboard contents and private keys
 are not sent to the backend.
 
-Device private keys are generated once and persisted as non-extractable
-`CryptoKey` objects in IndexedDB. Only raw 32-byte public keys, encoded as
-canonical padded standard Base64, are used in device registration and protocol
-messages. The crypto core also enforces the local trust-store state before a
-device can receive a wrapped content key.
+Device private keys are generated once per Copyyt account and persisted as
+non-extractable `CryptoKey` objects in account-scoped IndexedDB records. Use
+`getDeviceIdentity(userId)`, `getOrCreateDeviceIdentity(userId)`, and
+`clearDeviceIdentity(userId)`; identities are never shared across accounts.
+Only raw 32-byte public keys, encoded as canonical padded standard Base64, are
+used in device registration and protocol messages. Production trust state is
+persisted by `IndexedDBTrustStore`; call `bootstrapInitialTrustAnchor(...)`
+explicitly for the first-device ceremony. Server registration labels never
+establish local cryptographic trust.
 
 Phase 1D deliberately does not add clipboard monitoring, an offscreen
 document, or a persistent Socket.IO lifecycle. Those belong to the next phase.
@@ -20,7 +24,12 @@ document, or a persistent Socket.IO lifecycle. Those belong to the next phase.
 yarn build
 yarn lint
 yarn test:crypto
+yarn test:chrome
 ```
+
+`yarn test:chrome` launches the local Vite harness in Chrome and verifies
+cross-realm identity creation plus real IndexedDB `CryptoKey` persistence.
+Set `CHROME_BIN` when Chrome is not installed in a standard location.
 
 ## Template notes
 

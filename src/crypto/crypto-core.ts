@@ -44,6 +44,7 @@ export class CryptoProtocolError extends Error {
 }
 
 export interface VerifiedRecipient {
+  userId: string;
   deviceId: string;
   deviceKeyVersion?: number;
   keyVersion?: number;
@@ -228,6 +229,12 @@ export async function wrapContentKeyForRecipient(input: {
   contentKey: Uint8Array;
   wrapNonce?: Uint8Array;
 }): Promise<{ wrapNonce: string; wrappedContentKey: string }> {
+  if (input.senderIdentity.userId !== input.userId) {
+    throw new CryptoProtocolError("The sender identity belongs to another account");
+  }
+  if (input.recipient.userId !== input.userId) {
+    throw new CryptoProtocolError("The recipient belongs to another account");
+  }
   assertLength(input.contentKey, KEY_LENGTH_BYTES, "Clipboard content key");
   assertPositiveInteger(input.sourceKeyVersion, "sourceKeyVersion");
   const recipientKeyVersionValue = recipientKeyVersion(input.recipient);
@@ -332,6 +339,9 @@ export async function signDeviceApproval(input: {
     "pendingDeviceId" | "pendingKeyVersion" | "pendingEncryptionPublicKey" | "pendingSigningPublicKey"
   >;
 }): Promise<string> {
+  if (input.approvingIdentity.userId !== input.userId) {
+    throw new CryptoProtocolError("The approving identity belongs to another account");
+  }
   const keyVersion = input.approvingIdentity.keyVersion;
   if (keyVersion === null) {
     throw new CryptoProtocolError("The device must be registered before signing approval");
@@ -348,10 +358,14 @@ export async function signDeviceApproval(input: {
 export async function verifyDeviceApproval(input: {
   userId: string;
   certificate: DeviceApprovalCertificate;
-  approverDevice: Pick<LocalDeviceRecord, "deviceId" | "keyVersion" | "signingPublicKey" | "trustState">;
+  approverDevice: Pick<
+    LocalDeviceRecord,
+    "userId" | "deviceId" | "keyVersion" | "signingPublicKey" | "trustState"
+  >;
 }): Promise<boolean> {
   const { certificate, approverDevice } = input;
   if (
+    approverDevice.userId !== input.userId ||
     (approverDevice.trustState !== "root" && approverDevice.trustState !== "verified") ||
     certificate.approvingDeviceId !== approverDevice.deviceId ||
     certificate.approvingKeyVersion !== approverDevice.keyVersion ||
@@ -386,6 +400,9 @@ export async function signSocketChallenge(input: {
   socketId: string;
   challenge: string;
 }): Promise<string> {
+  if (input.identity.userId !== input.userId) {
+    throw new CryptoProtocolError("The identity belongs to another account");
+  }
   const keyVersion = input.identity.keyVersion;
   if (keyVersion === null) {
     throw new CryptoProtocolError("The device must be registered before socket authentication");
@@ -440,6 +457,9 @@ export async function verifyClipboardEnvelopeSignature(input: {
 export async function encryptClipboardItem(
   input: EncryptClipboardItemInput,
 ): Promise<ClipboardItemEnvelope> {
+  if (input.identity.userId !== input.userId) {
+    throw new CryptoProtocolError("The source identity belongs to another account");
+  }
   if (input.recipients.length === 0) {
     throw new CryptoProtocolError("At least one locally verified recipient is required");
   }
@@ -449,6 +469,9 @@ export async function encryptClipboardItem(
   }
   const recipientIds = new Set<string>();
   for (const recipient of input.recipients) {
+    if (recipient.userId !== input.userId) {
+      throw new CryptoProtocolError("An encryption recipient belongs to another account");
+    }
     if (recipient.trustState !== "root" && recipient.trustState !== "verified") {
       throw new CryptoProtocolError("Server-reported unverified devices cannot be encryption recipients");
     }
@@ -539,14 +562,20 @@ export async function decryptClipboardItem(input: DecryptClipboardItemInput): Pr
   plaintextBytes: Uint8Array;
 }> {
   const { envelope, identity } = input;
+  if (identity.userId !== input.userId) {
+    throw new CryptoProtocolError("The recipient identity belongs to another account");
+  }
   if (envelope.protocolVersion !== CRYPTO_PROTOCOL_VERSION) {
     throw new CryptoProtocolError("Unsupported clipboard protocol version");
   }
   const sourceDevice = input.trustStore
-    ? input.trustStore.getDevice(input.userId, envelope.sourceDeviceId)
+    ? await input.trustStore.getDevice(input.userId, envelope.sourceDeviceId)
     : input.sourceDevice;
   if (!sourceDevice) {
     throw new CryptoProtocolError("The source device is not present in the local trust store");
+  }
+  if (sourceDevice.userId !== input.userId) {
+    throw new CryptoProtocolError("The source device belongs to another account");
   }
   if (sourceDevice.trustState !== "root" && sourceDevice.trustState !== "verified") {
     throw new CryptoProtocolError("The source device is not locally trusted");

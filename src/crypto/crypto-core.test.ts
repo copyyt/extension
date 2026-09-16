@@ -6,6 +6,7 @@ import {
   base64ToBytes,
   bytesToBase64,
   bytesToHex,
+  sha256,
   utf8Encode,
 } from "./bytes.ts";
 import {
@@ -152,6 +153,129 @@ test("golden canonical protocol vectors have exact UTF-8 bytes", async () => {
       "ciphertextSha256=S1Zw8jssnwWFLRm1b1jfOf86iofvgbHx+P2O0+/cYnA=\n" +
       `expiresAt=${expiresAt}\n`,
   );
+});
+
+test("cross-repository golden fixture has mirrored bytes and digests", async () => {
+  const goldenUserId = "507f1f77bcf86cd799439011";
+  const goldenKey = bytesToBase64(new Uint8Array(32).fill(3));
+  const goldenExpiry = "2030-01-01T00:00:00.000Z";
+  const vectors = [
+    {
+      name: "copyyt-device-approval-v1",
+      bytes: buildDeviceApprovalMessage({
+        userId: goldenUserId,
+        approvingDeviceId: deviceAId,
+        approvingKeyVersion: 4,
+        pendingDeviceId: deviceBId,
+        pendingKeyVersion: 9,
+        pendingEncryptionPublicKey: goldenKey,
+        pendingSigningPublicKey: goldenKey,
+      }),
+      expected:
+        "copyyt-device-approval-v1\n" +
+        `userId=${goldenUserId}\n` +
+        `approvingDeviceId=${deviceAId}\n` +
+        "approvingKeyVersion=4\n" +
+        `pendingDeviceId=${deviceBId}\n` +
+        "pendingKeyVersion=9\n" +
+        `pendingEncryptionPublicKey=${goldenKey}\n` +
+        `pendingSigningPublicKey=${goldenKey}\n`,
+      digest: "8pJ+tRlC30Qac2qY32Zigt4h3mqJhT/VuoctQpDuQH0=",
+    },
+    {
+      name: "copyyt-socket-auth-v1",
+      bytes: buildSocketAuthMessage({
+        userId: goldenUserId,
+        deviceId: deviceAId,
+        keyVersion: 4,
+        socketId: "socket-123",
+        challenge: "AQIDBA==",
+      }),
+      expected:
+        "copyyt-socket-auth-v1\n" +
+        `userId=${goldenUserId}\n` +
+        `deviceId=${deviceAId}\n` +
+        "keyVersion=4\n" +
+        "socketId=socket-123\n" +
+        "challenge=AQIDBA==\n",
+      digest: "n1MJZv3tC/9RCZeF+V30+95ihd7OgBUWkCTYnNtrttE=",
+    },
+    {
+      name: "copyyt-key-wrap-v1",
+      bytes: buildKeyWrapContext({
+        userId: goldenUserId,
+        protocolVersion: 1,
+        itemId,
+        sourceDeviceId: deviceAId,
+        sourceKeyVersion: 4,
+        recipientDeviceId: deviceBId,
+        recipientKeyVersion: 9,
+      }),
+      expected:
+        "copyyt-key-wrap-v1\n" +
+        `userId=${goldenUserId}\n` +
+        "protocolVersion=1\n" +
+        `itemId=${itemId}\n` +
+        `sourceDeviceId=${deviceAId}\n` +
+        "sourceKeyVersion=4\n" +
+        `recipientDeviceId=${deviceBId}\n` +
+        "recipientKeyVersion=9\n",
+      digest: "OD2uqdBgZy9v7OeyYPKlVJh4Y9g2/mOlongyfNIQtnw=",
+    },
+    {
+      name: "copyyt-payload-v1",
+      bytes: buildPayloadAad({
+        userId: goldenUserId,
+        protocolVersion: 1,
+        itemId,
+        sourceDeviceId: deviceAId,
+        sourceKeyVersion: 4,
+        contentType: "text/plain",
+        expiresAt: goldenExpiry,
+      }),
+      expected:
+        "copyyt-payload-v1\n" +
+        `userId=${goldenUserId}\n` +
+        "protocolVersion=1\n" +
+        `itemId=${itemId}\n` +
+        `sourceDeviceId=${deviceAId}\n` +
+        "sourceKeyVersion=4\n" +
+        "contentType=text/plain\n" +
+        `expiresAt=${goldenExpiry}\n`,
+      digest: "q9w8Hf7Y5+Q0P2qBm7bsq3ZKY5ry8Sew/TRB4BpGveM=",
+    },
+    {
+      name: "copyyt-clipboard-envelope-v1",
+      bytes: await buildClipboardEnvelopeSignatureMessage({
+        userId: goldenUserId,
+        protocolVersion: 1,
+        itemId,
+        sourceDeviceId: deviceAId,
+        sourceKeyVersion: 4,
+        contentType: "text/plain",
+        nonce: new Uint8Array(12).fill(7),
+        ciphertext: utf8Encode("ciphertext bytes"),
+        expiresAt: goldenExpiry,
+      }),
+      expected:
+        "copyyt-clipboard-envelope-v1\n" +
+        `userId=${goldenUserId}\n` +
+        "protocolVersion=1\n" +
+        `itemId=${itemId}\n` +
+        `sourceDeviceId=${deviceAId}\n` +
+        "sourceKeyVersion=4\n" +
+        "contentType=text/plain\n" +
+        "nonce=BwcHBwcHBwcHBwcH\n" +
+        "ciphertextSha256=S1Zw8jssnwWFLRm1b1jfOf86iofvgbHx+P2O0+/cYnA=\n" +
+        `expiresAt=${goldenExpiry}\n`,
+      digest: "Ze6JBo7rbpvg3LMFIf1dPm91HW4mJdAtzLB6bvR8ccU=",
+    },
+  ];
+
+  for (const vector of vectors) {
+    assert.deepEqual(vector.bytes, utf8Encode(vector.expected), vector.name);
+    assert.equal(bytesToBase64(await sha256(vector.bytes)), vector.digest, `${vector.name} digest`);
+  }
 });
 
 test("fixed identities encrypt, wrap, sign, verify, unwrap, and decrypt", async () => {
@@ -418,6 +542,84 @@ test("the local trust store does not promote server trust state", async () => {
   );
 });
 
+test("crypto inputs reject cross-account recipients, sources, and approvers", async () => {
+  const identityA = await makeFixedIdentity(deviceAId, 1);
+  const identityB = await makeFixedIdentity(deviceBId, 1, true);
+  const otherUserId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const otherAccountRecipient = {
+    ...verifiedDevice(identityB),
+    userId: otherUserId,
+  };
+
+  await assert.rejects(
+    encryptClipboardItem({
+      userId,
+      identity: identityA,
+      plaintext: "secret",
+      contentType: "text/plain",
+      expiresAt,
+      itemId,
+      recipients: [otherAccountRecipient],
+    }),
+  );
+
+  const envelope = await encryptClipboardItem({
+    userId,
+    identity: identityA,
+    plaintext: "secret",
+    contentType: "text/plain",
+    expiresAt,
+    itemId,
+    recipients: [verifiedDevice(identityB)],
+    randomBytes: (length) => new Uint8Array(length).fill(0x45),
+  });
+  await assert.rejects(
+    decryptClipboardItem({
+      userId,
+      identity: identityB,
+      sourceDevice: { ...verifiedDevice(identityA), userId: otherUserId },
+      envelope,
+    }),
+  );
+
+  const pending = {
+    pendingDeviceId: deviceBId,
+    pendingKeyVersion: 1,
+    pendingEncryptionPublicKey: identityB.encryptionPublicKeyBase64,
+    pendingSigningPublicKey: identityB.signingPublicKeyBase64,
+  };
+  const certificate = {
+    approvingDeviceId: deviceAId,
+    approvingKeyVersion: 1,
+    ...pending,
+    approvalSignature: await signDeviceApproval({
+      userId,
+      approvingIdentity: identityA,
+      pendingDevice: pending,
+    }),
+  };
+  assert.equal(
+    await verifyDeviceApproval({
+      userId,
+      certificate,
+      approverDevice: { ...verifiedDevice(identityA), userId: otherUserId },
+    }),
+    false,
+  );
+});
+
+test("local bootstrap is explicit and never inferred from a server label", async () => {
+  const identityA = await makeFixedIdentity(deviceAId, 1);
+  const store = new InMemoryTrustStore();
+  const reported = store.upsertServerReportedDevice({
+    ...verifiedDevice(identityA),
+    trustState: "trusted",
+  });
+  assert.equal(reported.trustState, "unverified");
+  assert.equal(store.listEncryptionRecipients(userId).length, 0);
+  assert.equal(store.bootstrapInitialTrustAnchor(userId, identityA).trustState, "root");
+});
+
 function hex(value: string): Uint8Array {
   return Uint8Array.from(value.match(/.{2}/g)!, (pair) => Number.parseInt(pair, 16));
 }
@@ -472,6 +674,7 @@ async function makeFixedIdentity(deviceId: string, keyVersion: number, variant =
     [],
   );
   return createDeviceIdentityForTesting({
+    userId,
     deviceId,
     keyVersion,
     signingPrivateKey,
