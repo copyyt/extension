@@ -1,19 +1,24 @@
 import type { AxiosResponse } from "axios";
+import { jwtDecode } from "jwt-decode";
 import {
+  computePairingFingerprint,
   decryptClipboardItem,
   encryptClipboardItem,
   getDeviceIdentity,
   getOrCreateDeviceIdentity,
+  signDeviceApproval,
   signSocketChallenge,
   type ClipboardItemEnvelope,
   type DeviceIdentity,
 } from "../crypto/index.ts";
 import {
   registerCurrentDevice,
+  type DeviceApprovalRequest,
   type DeviceRegistrationApi,
   type RegisteredDeviceListResponse,
   type RegisteredDeviceResponse,
 } from "../crypto/device-registration.ts";
+import type { DeviceApprovalCertificate } from "../crypto/crypto-core.ts";
 import type {
   ClientTrustStore,
   ClientVerifiedDevice,
@@ -92,6 +97,7 @@ export interface RuntimeDependencies {
   encrypt?: typeof encryptClipboardItem;
   decrypt?: typeof decryptClipboardItem;
   signChallenge?: typeof signSocketChallenge;
+  signApproval?: typeof signDeviceApproval;
   now?: () => Date;
   broadcastStatus?: (message: RuntimeStatusBroadcast) => Promise<void> | void;
 }
@@ -107,7 +113,14 @@ const DEFAULT_STATUS: RuntimeStatus = {
     connected: false,
     deviceAuthenticated: false,
   },
+  syncReady: false,
+  onboarding: {
+    state: "unknown",
+    bootstrapEligible: false,
+  },
 };
+
+const TOKEN_REFRESH_SKEW_MS = 60_000;
 
 function userFromSession(session: RuntimeSession): IUser {
   return { ...session.user };
@@ -117,11 +130,66 @@ function isLocallyVerified(device: LocalDeviceRecord | null): device is ClientVe
   return device?.trustState === "root" || device?.trustState === "verified";
 }
 
+function isLocallyVerifiedStatus(status: RuntimeStatus): boolean {
+  return status.device.trustState === "root" || status.device.trustState === "verified";
+}
+
 function serverDevices(response: RegisteredDeviceListResponse): RegisteredDeviceResponse[] {
   if (Array.isArray(response)) return response;
   if ("devices" in response && Array.isArray(response.devices)) return response.devices;
+  if ("pendingDevices" in response && Array.isArray(response.pendingDevices)) return response.pendingDevices;
   if ("data" in response && Array.isArray(response.data)) return response.data;
   throw new RuntimeError("SOCKET_PUBLISH_FAILED", "The device list response is invalid");
+}
+
+function identityMatchesServerDevice(
+  identity: DeviceIdentity,
+  device: RegisteredDeviceResponse,
+): boolean {
+  return (
+    identity.deviceId === device.deviceId &&
+    identity.keyVersion === device.keyVersion &&
+    identity.signingPublicKeyBase64 === device.signingPublicKey &&
+    identity.encryptionPublicKeyBase64 === device.encryptionPublicKey
+  );
+}
+
+function hasApproval(device: RegisteredDeviceResponse): boolean {
+  return device.approvedByDeviceId != null || device.approvalSignature != null;
+}
+
+function isActiveServerDevice(device: RegisteredDeviceResponse): boolean {
+  return device.revokedAt == null && device.trustState !== "revoked";
+}
+
+function tokenNeedsRefresh(token: string, now: Date): boolean {
+  try {
+    const claims = jwtDecode<{ exp?: number }>(token);
+    return typeof claims.exp === "number" && claims.exp * 1000 <= now.getTime() + TOKEN_REFRESH_SKEW_MS;
+  } catch {
+    // A token without a locally readable exp is still sent to the server. The
+    // claim is used only as a renewal hint, never as authorization.
+    return false;
+  }
+}
+
+function refreshFailureIsDefinitive(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const response = (error as { response?: unknown }).response;
+  if (!response || typeof response !== "object") return false;
+  const status = (response as { status?: unknown }).status;
+  return typeof status === "number" && status >= 400 && status < 500;
+}
+
+function isSocketAuthenticationFailure(error: unknown): boolean {
+  if (typeof error === "string") return /auth|unauthor|forbidden|token|jwt|credential|401|403|expired/i.test(error);
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { message?: unknown; code?: unknown; data?: unknown };
+  const text = [candidate.message, candidate.code, candidate.data]
+    .map((value) => typeof value === "string" ? value : typeof value === "object" ? JSON.stringify(value) : "")
+    .join(" ")
+    .toLowerCase();
+  return /auth|unauthor|forbidden|token|jwt|credential|401|403|expired/.test(text);
 }
 
 function authResult(response: SignInResponse): AuthenticatedRuntimeResult {
@@ -154,6 +222,22 @@ function challengeParts(payload: unknown, fallbackSocketId: string): { socketId:
   };
 }
 
+function commandFallbackErrorCode(command: RuntimeCommand): RuntimeErrorCode {
+  switch (command.type) {
+    case "runtime:send-current-clipboard":
+      return "SOCKET_PUBLISH_FAILED";
+    case "runtime:test-clipboard":
+      return "CLIPBOARD_WRITE_FAILED";
+    case "runtime:bootstrap-trust-anchor":
+    case "runtime:refresh-onboarding":
+    case "runtime:approve-pending-device":
+    case "runtime:confirm-paired-approver":
+      return "PAIRING_FAILED";
+    default:
+      return "AUTH_REQUIRED";
+  }
+}
+
 export class CopyytServiceWorkerRuntime {
   private readonly dependencies: RuntimeDependencies;
   private readonly identityLoader: (userId: string) => Promise<DeviceIdentity | null>;
@@ -162,6 +246,7 @@ export class CopyytServiceWorkerRuntime {
   private readonly encrypt: typeof encryptClipboardItem;
   private readonly decrypt: typeof decryptClipboardItem;
   private readonly signChallenge: typeof signSocketChallenge;
+  private readonly signApproval: typeof signDeviceApproval;
   private readonly now: () => Date;
   private status: RuntimeStatus = DEFAULT_STATUS;
   private session: RuntimeSession | null = null;
@@ -170,6 +255,9 @@ export class CopyytServiceWorkerRuntime {
   private socketReady = false;
   private challengeInFlight = false;
   private initialization: Promise<void> | null = null;
+  private refreshInFlight: Promise<RuntimeSession> | null = null;
+  private socketRecoveryInFlight: Promise<void> | null = null;
+  private socketRecoveryTarget: SocketLike | null = null;
   private readonly inboundInFlight = new Set<string>();
 
   constructor(dependencies: RuntimeDependencies) {
@@ -180,12 +268,21 @@ export class CopyytServiceWorkerRuntime {
     this.encrypt = dependencies.encrypt ?? encryptClipboardItem;
     this.decrypt = dependencies.decrypt ?? decryptClipboardItem;
     this.signChallenge = dependencies.signChallenge ?? signSocketChallenge;
+    this.signApproval = dependencies.signApproval ?? signDeviceApproval;
     this.now = dependencies.now ?? (() => new Date());
   }
 
   async start(): Promise<void> {
     const persistedStatus = await this.dependencies.statusStore.get().catch(() => null);
-    if (persistedStatus) this.status = persistedStatus;
+    if (persistedStatus) {
+      this.status = {
+        ...DEFAULT_STATUS,
+        ...persistedStatus,
+        device: { ...DEFAULT_STATUS.device, ...persistedStatus.device },
+        socket: { ...DEFAULT_STATUS.socket, ...persistedStatus.socket },
+        onboarding: { ...DEFAULT_STATUS.onboarding, ...persistedStatus.onboarding },
+      };
+    }
     this.session = await this.dependencies.sessionStore.get();
     if (!this.session) {
       this.setStatus({
@@ -201,10 +298,30 @@ export class CopyytServiceWorkerRuntime {
       user: userFromSession(this.session),
     });
     try {
+      if (tokenNeedsRefresh(this.session.accessToken, this.now())) {
+        try {
+          await this.refreshAccessToken();
+        } catch (error) {
+          if (refreshFailureIsDefinitive(error)) throw error;
+          // Keep the local session during a transient refresh outage. Socket
+          // connection/reconnection can recover when the service is back.
+        }
+      }
       await this.ensureAccountInitialized();
+      await this.refreshOnboarding().catch(() => {
+        // Onboarding is fail-closed when the backend cannot be queried.
+        this.setOnboarding({ state: "unknown", bootstrapEligible: false });
+      });
       this.connectSocket();
     } catch (error) {
-      this.report(error, "DEVICE_NOT_REGISTERED", "The Copyyt device is not ready");
+      if (
+        refreshFailureIsDefinitive(error) ||
+        (!this.session && error instanceof RuntimeError && error.code === "AUTH_REQUIRED")
+      ) {
+        await this.clearSession();
+      } else {
+        this.report(error, "DEVICE_NOT_REGISTERED", "The Copyyt device is not ready");
+      }
     }
   }
 
@@ -226,8 +343,12 @@ export class CopyytServiceWorkerRuntime {
         data,
       };
     } catch (error) {
-      const runtimeError = asRuntimeError(error, "AUTH_REQUIRED", "The runtime operation failed");
-      this.setError(runtimeError.code, runtimeError.message);
+      const runtimeError = asRuntimeError(
+        error,
+        commandFallbackErrorCode(message.command),
+        "The runtime operation failed",
+      );
+      this.recordOperationError(runtimeError.code, runtimeError.message);
       return {
         source: RUNTIME_SOURCE,
         target: POPUP_SOURCE,
@@ -255,6 +376,14 @@ export class CopyytServiceWorkerRuntime {
       session.user.id,
       identity.deviceId,
     );
+    // Keep the transport authenticated for onboarding, but do not let a
+    // pending device publish even when another trusted recipient exists.
+    if (!isLocallyVerified(localDevice) && recipients.length > 0) {
+      throw new RuntimeError(
+        "DEVICE_NOT_LOCALLY_TRUSTED",
+        "Complete device pairing before syncing clipboard data",
+      );
+    }
     if (isLocallyVerified(localDevice) && !recipients.some((item) => item.deviceId === identity.deviceId)) {
       recipients.push(localDevice);
     }
@@ -290,10 +419,10 @@ export class CopyytServiceWorkerRuntime {
   }
 
   async receiveClipboardItem(payload: unknown): Promise<void> {
-    if (!this.socketReady || !this.session) return;
+    if (!this.socketReady || !this.status.syncReady || !this.session) return;
     const envelope = envelopeFromSocketPayload(payload);
     if (!envelope) {
-      this.setError("DECRYPTION_FAILED", "The incoming clipboard envelope is invalid");
+      this.recordSyncError("DECRYPTION_FAILED", "The incoming clipboard envelope is invalid");
       return;
     }
     const session = this.session;
@@ -341,7 +470,7 @@ export class CopyytServiceWorkerRuntime {
       });
     } catch (error) {
       const runtimeError = asRuntimeError(error, "DECRYPTION_FAILED", "Clipboard delivery failed");
-      this.setError(runtimeError.code, runtimeError.message);
+      this.recordSyncError(runtimeError.code, runtimeError.message);
     } finally {
       this.inboundInFlight.delete(key);
     }
@@ -363,6 +492,13 @@ export class CopyytServiceWorkerRuntime {
       }
       case "runtime:bootstrap-trust-anchor":
         return this.bootstrapTrustAnchor();
+      case "runtime:refresh-onboarding":
+        await this.refreshOnboarding();
+        return this.getStatus();
+      case "runtime:approve-pending-device":
+        return this.approvePendingDevice(command.pendingDeviceId, command.confirmedFingerprint);
+      case "runtime:confirm-paired-approver":
+        return this.confirmPairedApprover(command.approverDeviceId, command.confirmedFingerprint);
       case "runtime:auth-google":
         return this.authenticate(() => this.dependencies.apiFactory("").auth.googleSign(command.googleToken));
       case "runtime:auth-passwordless":
@@ -402,27 +538,43 @@ export class CopyytServiceWorkerRuntime {
   }
 
   private async refreshSession(): Promise<AuthenticatedRuntimeResult> {
-    let response: AxiosResponse<SignInResponse>;
-    try {
-      response = await this.dependencies.apiFactory(this.session?.accessToken ?? "").auth.refreshTokens();
-    } catch {
-      await this.dependencies.sessionStore.clear();
-      this.socket?.disconnect();
-      this.socket = null;
-      this.socketReady = false;
-      this.session = null;
-      this.setStatus({ ...DEFAULT_STATUS, connectionState: "signed-out" });
-      throw new RuntimeError("AUTH_REQUIRED", "The Copyyt session is no longer valid");
-    }
-    const result = authResult(response.data);
-    await this.saveSession(response.data);
+    const session = await this.refreshAccessToken();
+    const result: AuthenticatedRuntimeResult = {
+      message: "Copyyt session refreshed",
+      user: session.user,
+    };
     try {
       await this.ensureAccountInitialized();
+      await this.refreshOnboarding().catch(() => {
+        this.setOnboarding({ state: "unknown", bootstrapEligible: false });
+      });
       this.connectSocket();
     } catch (error) {
       this.report(error, "DEVICE_NOT_REGISTERED", "Signed in, but the device is not ready");
     }
     return result;
+  }
+
+  private async refreshAccessToken(): Promise<RuntimeSession> {
+    if (this.refreshInFlight) return this.refreshInFlight;
+    const session = this.requireSession();
+    this.refreshInFlight = (async () => {
+      let response: AxiosResponse<SignInResponse>;
+      try {
+        response = await this.dependencies.apiFactory(session.accessToken).auth.refreshTokens();
+      } catch (error) {
+        if (refreshFailureIsDefinitive(error)) {
+          await this.clearSession();
+          throw new RuntimeError("AUTH_REQUIRED", "The Copyyt session is no longer valid");
+        }
+        throw error;
+      }
+      await this.saveSession(response.data);
+      return this.session!;
+    })().finally(() => {
+      this.refreshInFlight = null;
+    });
+    return this.refreshInFlight;
   }
 
   private async saveSession(response: SignInResponse): Promise<void> {
@@ -431,10 +583,7 @@ export class CopyytServiceWorkerRuntime {
       this.session.user.id === response.user.id &&
       this.session.accessToken !== response.accessToken
     ) {
-      this.socket?.disconnect();
-      this.socket = null;
-      this.socketAccountId = null;
-      this.socketReady = false;
+      this.destroySocket(this.socket);
     }
     const session: RuntimeSession = {
       schemaVersion: 1,
@@ -459,10 +608,11 @@ export class CopyytServiceWorkerRuntime {
         // Local logout still completes if the server is unavailable.
       }
     }
-    this.socket?.disconnect();
-    this.socket = null;
-    this.socketAccountId = null;
-    this.socketReady = false;
+    await this.clearSession();
+  }
+
+  private async clearSession(): Promise<void> {
+    this.destroySocket(this.socket);
     this.session = null;
     await this.dependencies.sessionStore.clear();
     this.setStatus({ ...DEFAULT_STATUS, connectionState: "signed-out" });
@@ -474,6 +624,22 @@ export class CopyytServiceWorkerRuntime {
     if (!identity || identity.keyVersion === null) {
       throw new RuntimeError("DEVICE_NOT_REGISTERED", "Register this device before trusting it");
     }
+    let eligibility: boolean;
+    try {
+      eligibility = await this.getBootstrapEligibility(session, identity);
+    } catch {
+      this.setOnboarding({ state: "unknown", bootstrapEligible: false });
+      throw new RuntimeError(
+        "DEVICE_NOT_LOCALLY_TRUSTED",
+        "Initial trust eligibility could not be verified",
+      );
+    }
+    if (!eligibility) {
+      throw new RuntimeError(
+        "DEVICE_NOT_LOCALLY_TRUSTED",
+        "This device is not eligible for initial trust bootstrap",
+      );
+    }
     const trustStore = this.dependencies.trustStore;
     await trustStore.bootstrapInitialTrustAnchor(session.user.id, identity, {
       name: identity.registration?.name,
@@ -482,7 +648,361 @@ export class CopyytServiceWorkerRuntime {
       appVersion: identity.registration?.appVersion,
     });
     await this.updateDeviceStatus(identity);
+    this.setOnboarding({ state: "complete", bootstrapEligible: false });
     return this.getStatus();
+  }
+
+  private async getBootstrapEligibility(
+    session: RuntimeSession,
+    identity: DeviceIdentity,
+  ): Promise<boolean> {
+    const response = await this.dependencies.apiFactory(session.accessToken).devices.listDevices();
+    const devices = serverDevices(response.data).filter(isActiveServerDevice);
+    const current = devices.find((device) => device.deviceId === identity.deviceId);
+    if (
+      !current ||
+      current.trustState !== "trusted" ||
+      hasApproval(current) ||
+      !identityMatchesServerDevice(identity, current)
+    ) {
+      return false;
+    }
+    const trustedDevices = devices.filter((device) => device.trustState === "trusted");
+    if (trustedDevices.length !== 1 || trustedDevices[0]?.deviceId !== identity.deviceId) {
+      return false;
+    }
+    const localDevice = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      identity.deviceId,
+    );
+    if (localDevice?.trustState === "root") return false;
+    const localRecipients = await this.dependencies.trustStore.listEncryptionRecipients(session.user.id);
+    if (localRecipients.some((device) => device.trustState === "root")) return false;
+    return true;
+  }
+
+  async approvePendingDevice(
+    pendingDeviceId: string,
+    confirmedFingerprint: string,
+  ): Promise<RuntimeStatus> {
+    const session = this.requireSession();
+    const identity = await this.identityLoader(session.user.id);
+    if (!identity || identity.keyVersion === null) {
+      throw new RuntimeError("DEVICE_NOT_REGISTERED", "Register this device before approving a device");
+    }
+    const localApprover = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      identity.deviceId,
+    );
+    if (!isLocallyVerified(localApprover)) {
+      throw new RuntimeError("DEVICE_NOT_LOCALLY_TRUSTED", "Only a locally trusted device can approve pairing");
+    }
+    const pendingResponse = await this.dependencies.apiFactory(session.accessToken).devices.listPendingDevices();
+    const pending = serverDevices(pendingResponse.data).find(
+      (device) => device.deviceId === pendingDeviceId,
+    );
+    if (!pending || !isActiveServerDevice(pending) || pending.deviceId === identity.deviceId) {
+      throw new RuntimeError("PAIRING_FAILED", "The pending device is no longer available");
+    }
+    const localPending = await this.dependencies.trustStore.upsertServerReportedDevice({
+      userId: session.user.id,
+      ...pending,
+      capabilities: [...pending.capabilities],
+      trustState: pending.trustState,
+    });
+    if (localPending.trustState !== "unverified") {
+      throw new RuntimeError("PAIRING_FAILED", "The pending device is already locally trusted or revoked");
+    }
+    const fingerprint = await this.pairingFingerprintFor(identity, pending);
+    if (fingerprint !== confirmedFingerprint) {
+      throw new RuntimeError("PAIRING_FAILED", "The confirmed pairing fingerprint does not match");
+    }
+    const approvalSignature = await this.signApproval({
+      userId: session.user.id,
+      approvingIdentity: identity,
+      pendingDevice: {
+        pendingDeviceId: pending.deviceId,
+        pendingKeyVersion: pending.keyVersion,
+        pendingEncryptionPublicKey: pending.encryptionPublicKey,
+        pendingSigningPublicKey: pending.signingPublicKey,
+      },
+    });
+    const certificate: DeviceApprovalCertificate = {
+      approvingDeviceId: identity.deviceId,
+      approvingKeyVersion: identity.keyVersion,
+      pendingDeviceId: pending.deviceId,
+      pendingKeyVersion: pending.keyVersion,
+      pendingEncryptionPublicKey: pending.encryptionPublicKey,
+      pendingSigningPublicKey: pending.signingPublicKey,
+      approvalSignature,
+    };
+    const request: DeviceApprovalRequest = { ...certificate };
+    const approvalResponse = await this.dependencies.apiFactory(session.accessToken).devices.approveDevice(request);
+    const approved = approvalResponse.data;
+    if (
+      !approved ||
+      typeof approved !== "object" ||
+      approved.deviceId !== pending.deviceId ||
+      approved.keyVersion !== pending.keyVersion ||
+      approved.signingPublicKey !== pending.signingPublicKey ||
+      approved.encryptionPublicKey !== pending.encryptionPublicKey ||
+      approved.approvedByDeviceId !== identity.deviceId ||
+      approved.approvalSignature !== approvalSignature
+    ) {
+      throw new RuntimeError("PAIRING_FAILED", "The device approval response does not match the signed device");
+    }
+    await this.dependencies.trustStore.applyApproval(session.user.id, certificate);
+    await this.updateDeviceStatus(identity);
+    this.setOnboarding({ state: "complete", bootstrapEligible: false });
+    return this.getStatus();
+  }
+
+  async confirmPairedApprover(
+    approverDeviceId: string,
+    confirmedFingerprint: string,
+  ): Promise<RuntimeStatus> {
+    const session = this.requireSession();
+    const identity = await this.identityLoader(session.user.id);
+    if (!identity || identity.keyVersion === null) {
+      throw new RuntimeError("DEVICE_NOT_REGISTERED", "Register this device before completing pairing");
+    }
+    const approver = await this.dependencies.trustStore.getDevice(session.user.id, approverDeviceId);
+    if (!approver || approver.trustState !== "unverified") {
+      throw new RuntimeError("PAIRING_FAILED", "The paired approver is not locally available");
+    }
+    const pendingServerResponse = await this.dependencies.apiFactory(session.accessToken).devices.listDevices();
+    const pendingServerDevices = serverDevices(pendingServerResponse.data);
+    const current = pendingServerDevices.find((device) => device.deviceId === identity.deviceId);
+    if (!current || !identityMatchesServerDevice(identity, current)) {
+      throw new RuntimeError("PAIRING_FAILED", "The current device identity changed on the server");
+    }
+    const fingerprint = await this.pairingFingerprintFor(identity, current, approver);
+    if (fingerprint !== confirmedFingerprint) {
+      throw new RuntimeError("PAIRING_FAILED", "The confirmed pairing fingerprint does not match");
+    }
+    await this.dependencies.trustStore.pinPairedApprover(
+      session.user.id,
+      identity,
+      approverDeviceId,
+      confirmedFingerprint,
+    );
+    const refreshedDevices = await this.refreshServerDevices(session);
+    const refreshedCurrent = refreshedDevices.find(
+      (device) => device.deviceId === identity.deviceId,
+    );
+    if (refreshedCurrent && await this.applyBackendApprovalIfAvailable(session, identity, refreshedCurrent)) {
+      this.setOnboarding({ state: "complete", bootstrapEligible: false });
+    } else {
+      await this.updateDeviceStatus(identity);
+      this.setOnboarding({
+        state: "waiting-for-approval",
+        bootstrapEligible: false,
+        pairing: {
+          role: "pending",
+          fingerprint: confirmedFingerprint,
+          approverDeviceId,
+          pendingDeviceId: identity.deviceId,
+          pendingDeviceName: current.name,
+          pendingPlatform: current.platform,
+        },
+      });
+    }
+    return this.getStatus();
+  }
+
+  private async applyBackendApprovalIfAvailable(
+    session: RuntimeSession,
+    identity: DeviceIdentity,
+    current: RegisteredDeviceResponse,
+  ): Promise<boolean> {
+    const localCurrent = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      identity.deviceId,
+    );
+    if (localCurrent?.trustState === "verified") return true;
+    if (
+      typeof current.approvedByDeviceId !== "string" ||
+      typeof current.approvalSignature !== "string"
+    ) {
+      return false;
+    }
+    const approver = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      current.approvedByDeviceId,
+    );
+    if (
+      !approver ||
+      !isLocallyVerified(approver) ||
+      approver.trustOrigin !== "pairing" ||
+      approver.pairedForDeviceId !== identity.deviceId
+    ) {
+      return false;
+    }
+    if (!identityMatchesServerDevice(identity, current)) {
+      throw new RuntimeError("PAIRING_FAILED", "The approved device identity changed on the server");
+    }
+    const certificate: DeviceApprovalCertificate = {
+      approvingDeviceId: approver.deviceId,
+      approvingKeyVersion: approver.keyVersion,
+      pendingDeviceId: identity.deviceId,
+      pendingKeyVersion: current.keyVersion,
+      pendingEncryptionPublicKey: current.encryptionPublicKey,
+      pendingSigningPublicKey: current.signingPublicKey,
+      approvalSignature: current.approvalSignature,
+    };
+    await this.dependencies.trustStore.applyApproval(session.user.id, certificate);
+    await this.updateDeviceStatus(identity);
+    return true;
+  }
+
+  private async pairingFingerprintFor(
+    identity: DeviceIdentity,
+    pending: RegisteredDeviceResponse,
+    approver?: LocalDeviceRecord,
+  ): Promise<string> {
+    const approvingDevice = approver ?? await this.dependencies.trustStore.getDevice(
+      identity.userId,
+      identity.deviceId,
+    );
+    const approvingSigningPublicKey = approver
+      ? approver.signingPublicKey
+      : identity.signingPublicKeyBase64;
+    const approvingEncryptionPublicKey = approver
+      ? approver.encryptionPublicKey
+      : identity.encryptionPublicKeyBase64;
+    const approvingDeviceId = approver?.deviceId ?? identity.deviceId;
+    const approvingKeyVersion = approver?.keyVersion ?? identity.keyVersion;
+    if (
+      !approvingDevice ||
+      approvingDeviceId === pending.deviceId ||
+      approvingKeyVersion === null ||
+      approvingKeyVersion === undefined
+    ) {
+      throw new RuntimeError("PAIRING_FAILED", "The pairing identities are incomplete");
+    }
+    return computePairingFingerprint({
+      userId: identity.userId,
+      approvingDeviceId,
+      approvingKeyVersion,
+      approvingSigningPublicKey,
+      approvingEncryptionPublicKey,
+      pendingDeviceId: pending.deviceId,
+      pendingKeyVersion: pending.keyVersion,
+      pendingSigningPublicKey: pending.signingPublicKey,
+      pendingEncryptionPublicKey: pending.encryptionPublicKey,
+    });
+  }
+
+  private async refreshOnboarding(): Promise<void> {
+    const session = this.requireSession();
+    const identity = await this.identityLoader(session.user.id);
+    if (!identity || identity.keyVersion === null) {
+      this.setOnboarding({ state: "unknown", bootstrapEligible: false });
+      return;
+    }
+    const response = await this.dependencies.apiFactory(session.accessToken).devices.listDevices();
+    const devices = serverDevices(response.data).filter(isActiveServerDevice);
+    for (const device of devices) {
+      await this.dependencies.trustStore.upsertServerReportedDevice({
+        userId: session.user.id,
+        ...device,
+        capabilities: [...device.capabilities],
+        trustState: device.trustState,
+      });
+    }
+    const currentServerDevice = devices.find((device) => device.deviceId === identity.deviceId);
+    if (currentServerDevice && await this.applyBackendApprovalIfAvailable(session, identity, currentServerDevice)) {
+      this.setOnboarding({ state: "complete", bootstrapEligible: false });
+      return;
+    }
+    const bootstrapEligible = await this.getBootstrapEligibility(session, identity);
+    if (bootstrapEligible) {
+      this.setOnboarding({ state: "bootstrap-eligible", bootstrapEligible: true });
+      return;
+    }
+    const local = await this.dependencies.trustStore.getDevice(session.user.id, identity.deviceId);
+    if (isLocallyVerified(local)) {
+      const pendingResponse = await this.dependencies.apiFactory(session.accessToken).devices.listPendingDevices();
+      const pending = serverDevices(pendingResponse.data).find((device) => isActiveServerDevice(device));
+      if (!pending) {
+        this.setOnboarding({ state: "complete", bootstrapEligible: false });
+        return;
+      }
+      await this.dependencies.trustStore.upsertServerReportedDevice({
+        userId: session.user.id,
+        ...pending,
+        capabilities: [...pending.capabilities],
+        trustState: pending.trustState,
+      });
+      const fingerprint = await this.pairingFingerprintFor(identity, pending);
+      this.setOnboarding({
+        state: "pairing-ready",
+        bootstrapEligible: false,
+        pairing: {
+          role: "approver",
+          fingerprint,
+          approverDeviceId: identity.deviceId,
+          pendingDeviceId: pending.deviceId,
+          pendingDeviceName: pending.name,
+          pendingPlatform: pending.platform,
+        },
+      });
+      return;
+    }
+    const approver = devices.find(
+      (device) =>
+        device.deviceId !== identity.deviceId &&
+        device.trustState === "trusted" &&
+        !hasApproval(device),
+    );
+    const current = devices.find((device) => device.deviceId === identity.deviceId);
+    if (!approver || !current || !identityMatchesServerDevice(identity, current)) {
+      this.setOnboarding({ state: "pairing-required", bootstrapEligible: false });
+      return;
+    }
+    await this.dependencies.trustStore.upsertServerReportedDevice({
+      userId: session.user.id,
+      ...approver,
+      capabilities: [...approver.capabilities],
+      trustState: approver.trustState,
+    });
+    const localApprover = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      approver.deviceId,
+    );
+    if (
+      localApprover?.trustState === "root" &&
+      localApprover.trustOrigin === "pairing" &&
+      localApprover.pairedForDeviceId === identity.deviceId &&
+      typeof localApprover.pairingFingerprint === "string"
+    ) {
+      this.setOnboarding({
+        state: "waiting-for-approval",
+        bootstrapEligible: false,
+        pairing: {
+          role: "pending",
+          fingerprint: localApprover.pairingFingerprint,
+          approverDeviceId: approver.deviceId,
+          pendingDeviceId: identity.deviceId,
+          pendingDeviceName: current.name,
+          pendingPlatform: current.platform,
+        },
+      });
+      return;
+    }
+    const fingerprint = await this.pairingFingerprintFor(identity, current, localApprover ?? undefined);
+    this.setOnboarding({
+      state: "pairing-ready",
+      bootstrapEligible: false,
+      pairing: {
+        role: "pending",
+        fingerprint,
+        approverDeviceId: approver.deviceId,
+        pendingDeviceId: identity.deviceId,
+        pendingDeviceName: current.name,
+        pendingPlatform: current.platform,
+      },
+    });
   }
 
   private async testClipboard(marker: string): Promise<{ ping: boolean; readText: boolean; writeText: boolean }> {
@@ -541,6 +1061,7 @@ export class CopyytServiceWorkerRuntime {
 
   private async updateDeviceStatus(identity: DeviceIdentity): Promise<void> {
     const trust = await this.dependencies.trustStore.getDevice(identity.userId, identity.deviceId);
+    const locallyReady = isLocallyVerified(trust);
     this.setStatus({
       ...this.status,
       connectionState:
@@ -553,6 +1074,7 @@ export class CopyytServiceWorkerRuntime {
         registration: identity.keyVersion === null ? "not-registered" : "registered",
         trustState: trust?.trustState ?? "unverified",
       },
+      syncReady: this.socketReady && locallyReady,
     });
   }
 
@@ -588,6 +1110,7 @@ export class CopyytServiceWorkerRuntime {
       this.setStatus({
         ...this.status,
         connectionState: "account-authenticated",
+        syncReady: false,
         socket: { connected: true, deviceAuthenticated: false },
       });
     };
@@ -595,21 +1118,18 @@ export class CopyytServiceWorkerRuntime {
       if (this.socket !== socket) return;
       const wasReady = this.socketReady;
       this.socketReady = false;
-      this.setStatus({
-        ...this.status,
-        connectionState: "error",
-        socket: { connected: false, deviceAuthenticated: false },
-        lastSyncError: {
-          code: "SOCKET_NOT_READY",
-          message: wasReady ? "The Copyyt socket disconnected" : "The socket disconnected before device authentication",
-          at: this.now().toISOString(),
-        },
-      });
+      this.setConnectionError(
+        "SOCKET_NOT_READY",
+        wasReady ? "The Copyyt socket disconnected" : "The socket disconnected before device authentication",
+      );
     };
-    const onConnectError = (): void => {
+    const onConnectError = (error?: unknown): void => {
       if (this.socket !== socket) return;
       this.socketReady = false;
-      this.setError("SOCKET_NOT_READY", "The Copyyt socket connection failed");
+      this.setConnectionError("SOCKET_NOT_READY", "The Copyyt socket connection failed");
+      if (isSocketAuthenticationFailure(error)) {
+        void this.recoverSocketAuthentication(socket);
+      }
     };
     const onChallenge = (payload: unknown): void => {
       if (this.socket !== socket) return;
@@ -618,19 +1138,22 @@ export class CopyytServiceWorkerRuntime {
     const onReady = (): void => {
       if (this.socket !== socket) return;
       this.socketReady = true;
+      const syncReady = isLocallyVerifiedStatus(this.status);
       this.setStatus({
         ...this.status,
         connectionState: "ready",
+        syncReady,
         socket: { connected: true, deviceAuthenticated: true },
       });
-      void this.refreshServerDevices(session).catch((error) => {
-        this.report(error, "SOCKET_PUBLISH_FAILED", "Device trust synchronization failed");
+      void this.refreshServerDevices(session).catch(() => {
+        this.recordSyncError("SOCKET_PUBLISH_FAILED", "Device trust synchronization failed");
       });
     };
     const onAuthFailure = (): void => {
       if (this.socket !== socket) return;
       this.socketReady = false;
-      this.setError("AUTH_REQUIRED", "The device socket authentication was rejected");
+      this.setConnectionError("AUTH_REQUIRED", "The device socket authentication was rejected");
+      void this.recoverSocketAuthentication(socket);
     };
     const onClipboardItem = (payload: unknown): void => {
       if (this.socket !== socket) return;
@@ -677,16 +1200,57 @@ export class CopyytServiceWorkerRuntime {
       });
     } catch (error) {
       const runtimeError = asRuntimeError(error, "AUTH_REQUIRED", "The device socket authentication failed");
-      this.setError(runtimeError.code, runtimeError.message);
+      this.setConnectionError(runtimeError.code, runtimeError.message);
       this.socketReady = false;
     } finally {
       this.challengeInFlight = false;
     }
   }
 
-  private async refreshServerDevices(session: RuntimeSession): Promise<void> {
+  private async recoverSocketAuthentication(socket: SocketLike): Promise<void> {
+    if (this.socket !== socket) return;
+    if (this.socketRecoveryTarget === socket && this.socketRecoveryInFlight) {
+      return this.socketRecoveryInFlight;
+    }
+    this.socketRecoveryTarget = socket;
+    this.socketRecoveryInFlight = (async () => {
+      try {
+        await this.refreshAccessToken();
+        if (!this.session || (this.socket !== null && this.socket !== socket)) return;
+        this.destroySocket(socket);
+        await this.ensureAccountInitialized();
+        this.connectSocket();
+      } catch {
+        if (this.session) {
+          this.setConnectionError("AUTH_REQUIRED", "The Copyyt session could not be renewed");
+        }
+      } finally {
+        this.socketRecoveryInFlight = null;
+        this.socketRecoveryTarget = null;
+      }
+    })();
+    return this.socketRecoveryInFlight;
+  }
+
+  private destroySocket(socket: SocketLike | null): void {
+    if (!socket) return;
+    if (this.socket === socket) {
+      this.socket = null;
+      this.socketAccountId = null;
+      this.socketReady = false;
+      this.challengeInFlight = false;
+    }
+    try {
+      socket.disconnect();
+    } catch {
+      // A stale socket is best-effort cleanup during token replacement.
+    }
+  }
+
+  private async refreshServerDevices(session: RuntimeSession): Promise<RegisteredDeviceResponse[]> {
     const response = await this.dependencies.apiFactory(session.accessToken).devices.listDevices();
-    for (const device of serverDevices(response.data)) {
+    const devices = serverDevices(response.data);
+    for (const device of devices) {
       await this.dependencies.trustStore.upsertServerReportedDevice({
         userId: session.user.id,
         deviceId: device.deviceId,
@@ -702,6 +1266,7 @@ export class CopyytServiceWorkerRuntime {
     }
     const identity = await this.identityLoader(session.user.id);
     if (identity) await this.updateDeviceStatus(identity);
+    return devices;
   }
 
   private async emitPublish(envelope: ClipboardItemEnvelope): Promise<void> {
@@ -743,20 +1308,53 @@ export class CopyytServiceWorkerRuntime {
     }
   }
 
-  private setError(code: RuntimeErrorCode, message: string): void {
+  private setOnboarding(
+    onboarding: RuntimeStatus["onboarding"],
+  ): void {
+    this.setStatus({ ...this.status, onboarding });
+  }
+
+  private recordSyncError(code: RuntimeErrorCode, message: string): void {
     this.setStatus({
       ...this.status,
-      connectionState: "error",
-      socket: {
-        ...this.status.socket,
-        deviceAuthenticated: false,
-      },
       lastSyncError: { code, message, at: this.now().toISOString() },
     });
   }
 
+  private setConnectionError(code: RuntimeErrorCode, message: string): void {
+    this.setStatus({
+      ...this.status,
+      connectionState: "error",
+      syncReady: false,
+      socket: {
+        connected: false,
+        deviceAuthenticated: false,
+      },
+      lastConnectionError: { code, message, at: this.now().toISOString() },
+    });
+  }
+
+  private recordOperationError(code: RuntimeErrorCode, message: string): void {
+    if (
+      code === "CLIPBOARD_READ_FAILED" ||
+      code === "CLIPBOARD_WRITE_FAILED" ||
+      code === "NO_VERIFIED_RECIPIENTS" ||
+      code === "ENCRYPTION_FAILED" ||
+      code === "DECRYPTION_FAILED" ||
+      code === "SOURCE_UNTRUSTED" ||
+      code === "SOCKET_PUBLISH_FAILED" ||
+      code === "PAIRING_FAILED" ||
+      code === "DEVICE_NOT_LOCALLY_TRUSTED" ||
+      code === "DEVICE_NOT_REGISTERED"
+    ) {
+      this.recordSyncError(code, message);
+    } else {
+      this.setConnectionError(code, message);
+    }
+  }
+
   private report(error: unknown, fallbackCode: RuntimeErrorCode, fallbackMessage: string): void {
     const runtimeError = asRuntimeError(error, fallbackCode, fallbackMessage);
-    this.setError(runtimeError.code, runtimeError.message);
+    this.recordOperationError(runtimeError.code, runtimeError.message);
   }
 }

@@ -26,6 +26,23 @@ export type DeviceTrustState =
   | "unverified"
   | "revoked";
 
+export type OnboardingState =
+  | "unknown"
+  | "bootstrap-eligible"
+  | "pairing-required"
+  | "pairing-ready"
+  | "waiting-for-approval"
+  | "complete";
+
+export interface PairingStatus {
+  role: "approver" | "pending";
+  fingerprint: string;
+  approverDeviceId: string;
+  pendingDeviceId: string;
+  pendingDeviceName?: string;
+  pendingPlatform?: string;
+}
+
 export interface RuntimeStatus {
   connectionState: RuntimeConnectionState;
   signedIn: boolean;
@@ -40,7 +57,19 @@ export interface RuntimeStatus {
     connected: boolean;
     deviceAuthenticated: boolean;
   };
+  /** Transport authentication is separate from permission to sync clipboard data. */
+  syncReady: boolean;
+  onboarding: {
+    state: OnboardingState;
+    bootstrapEligible: boolean;
+    pairing?: PairingStatus;
+  };
   lastSyncError?: {
+    code: RuntimeErrorCode;
+    message: string;
+    at: string;
+  };
+  lastConnectionError?: {
     code: RuntimeErrorCode;
     message: string;
     at: string;
@@ -56,6 +85,17 @@ export type RuntimeCommand =
   | { type: "runtime:get-status" }
   | { type: "runtime:send-current-clipboard" }
   | { type: "runtime:bootstrap-trust-anchor" }
+  | { type: "runtime:refresh-onboarding" }
+  | {
+      type: "runtime:approve-pending-device";
+      pendingDeviceId: string;
+      confirmedFingerprint: string;
+    }
+  | {
+      type: "runtime:confirm-paired-approver";
+      approverDeviceId: string;
+      confirmedFingerprint: string;
+    }
   | { type: "runtime:auth-google"; googleToken: string }
   | {
       type: "runtime:auth-passwordless";

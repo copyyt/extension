@@ -28,17 +28,35 @@ export interface RegisteredDeviceResponse {
   appVersion?: string;
   lastSeenAt?: string;
   revokedAt?: string | null;
+  approvedByDeviceId?: string | null;
+  approvalSignature?: string | null;
+  approvedAt?: string | null;
 }
 
 export type RegisteredDeviceListResponse =
   | RegisteredDeviceResponse[]
   | { devices: RegisteredDeviceResponse[] }
+  | { pendingDevices: RegisteredDeviceResponse[] }
   | { data: RegisteredDeviceResponse[] };
 
 export interface DeviceRegistrationApi {
   registerDevice(
     request: DeviceRegistrationRequest,
   ): Promise<AxiosResponse<RegisteredDeviceResponse>>;
+  listPendingDevices(): Promise<AxiosResponse<RegisteredDeviceListResponse>>;
+  approveDevice(
+    request: DeviceApprovalRequest,
+  ): Promise<AxiosResponse<RegisteredDeviceResponse>>;
+}
+
+export interface DeviceApprovalRequest {
+  approvingDeviceId: string;
+  approvingKeyVersion: number;
+  pendingDeviceId: string;
+  pendingKeyVersion: number;
+  pendingEncryptionPublicKey: string;
+  pendingSigningPublicKey: string;
+  approvalSignature: string;
 }
 
 export interface RegisterCurrentDeviceOptions {

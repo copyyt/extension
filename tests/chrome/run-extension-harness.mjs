@@ -4,7 +4,12 @@ import { spawn, spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 
 const keyPersistence = spawnSync("yarn", ["test:chrome:keys"], { stdio: "inherit" });
-if (keyPersistence.status !== 0) process.exit(keyPersistence.status ?? 1);
+const keyPersistenceFailed = keyPersistence.status !== 0;
+if (keyPersistenceFailed) {
+  console.error(
+    "Chrome key-persistence harness did not complete; this is separate from clipboard evidence, so the extension harness will still run.",
+  );
+}
 
 const build = spawnSync("yarn", ["build"], {
   env: { ...process.env, VITE_APP_TYPE: "extension" },
@@ -160,3 +165,5 @@ try {
   browserDevTools?.close();
   chromeProcess.kill("SIGTERM");
 }
+
+if (keyPersistenceFailed && process.exitCode === undefined) process.exitCode = keyPersistence.status ?? 1;

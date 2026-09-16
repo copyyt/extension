@@ -29,11 +29,26 @@ module service worker. Runtime session/status records live in
 `copyyt-runtime-v1` IndexedDB database and contain no plaintext. Processed
 items are retained for at most 24 hours and 500 records.
 
-For the first device, use the explicit **Trust this device (first setup)**
-action in the popup. A server-reported `trusted` label remains locally
-`unverified`; it never bootstraps a root. Phase 2A uses manual **Send current
-clipboard** and does not install clipboard polling or `clipboardchange`
-listeners.
+For the first device, the popup offers **Trust this device (first setup)**
+only after a fresh backend eligibility check proves that this is the account's
+only trusted device, its full identity matches, and no local root exists. The
+runtime repeats that check when the command is invoked, so a later registered
+device cannot take the self-root path. A server-reported `trusted` label
+remains locally `unverified`; it never establishes local cryptographic trust.
+This is still a TOFU bootstrap: a malicious backend could lie during the very
+first bootstrap, which is an accepted limitation of this phase.
+
+Later devices use the manual pairing ceremony. Both devices display the same
+full-key `copyyt-pairing-fingerprint-v1`; the existing locally trusted device
+signs the pending device's `copyyt-device-approval-v1` certificate, and the
+new device pins the approver only after the user confirms the matching
+fingerprint. Server trust labels alone never complete pairing. Access-token
+renewal is owned by the service worker and uses a single-flight refresh before
+recreating an authenticated socket when needed.
+
+Phase 2A uses manual **Send current clipboard** and does not install clipboard
+polling, `clipboardchange` listeners, WebRTC, or automatic clipboard
+detection.
 
 ## Development
 

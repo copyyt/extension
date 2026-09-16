@@ -34,6 +34,7 @@ export {
 export { registerCurrentDevice } from "./device-registration.ts";
 export type {
   DeviceRegistrationApi,
+  DeviceApprovalRequest,
   DeviceRegistrationRequest,
   RegisteredDeviceResponse,
   RegisterCurrentDeviceOptions,

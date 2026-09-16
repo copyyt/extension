@@ -10,6 +10,7 @@ export const RUNTIME_ERROR_CODES = [
   "DECRYPTION_FAILED",
   "SOURCE_UNTRUSTED",
   "SOCKET_PUBLISH_FAILED",
+  "PAIRING_FAILED",
 ] as const;
 
 export type RuntimeErrorCode = (typeof RUNTIME_ERROR_CODES)[number];

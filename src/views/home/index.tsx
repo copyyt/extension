@@ -12,7 +12,7 @@ import { useState } from "react";
 function statusLabel(status: RuntimeStatus): string {
   switch (status.connectionState) {
     case "ready":
-      return "Ready";
+      return status.syncReady ? "Ready" : "Connected; pairing required";
     case "device-authenticating":
       return "Authenticating device";
     case "connecting":
@@ -20,7 +20,7 @@ function statusLabel(status: RuntimeStatus): string {
     case "account-authenticated":
       return "Signed in; connecting device";
     case "error":
-      return status.lastSyncError?.message ?? "Connection error";
+      return status.lastConnectionError?.message ?? status.lastSyncError?.message ?? "Connection error";
     default:
       return "Signed out";
   }
@@ -32,6 +32,8 @@ function Home() {
   const { status, reload } = useRuntimeStatus();
   const [sending, setSending] = useState(false);
   const [trusting, setTrusting] = useState(false);
+  const [pairingBusy, setPairingBusy] = useState(false);
+  const [confirmedFingerprint, setConfirmedFingerprint] = useState("");
   const [message, setMessage] = useState<string | null>(null);
 
   const sendCurrentClipboard = async () => {
@@ -47,6 +49,52 @@ function Home() {
     } finally {
       setSending(false);
       void reload();
+    }
+  };
+
+  const refreshOnboarding = async () => {
+    setPairingBusy(true);
+    setMessage(null);
+    try {
+      await sendRuntimeCommand<RuntimeStatus>({ type: "runtime:refresh-onboarding" });
+      await reload();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to refresh pairing state");
+    } finally {
+      setPairingBusy(false);
+    }
+  };
+
+  const completePairing = async () => {
+    const pairing = status?.onboarding?.pairing;
+    if (!pairing || !confirmedFingerprint.trim()) {
+      setMessage("Enter the fingerprint shown on both devices.");
+      return;
+    }
+    setPairingBusy(true);
+    setMessage(null);
+    try {
+      if (pairing.role === "approver") {
+        await sendRuntimeCommand<RuntimeStatus>({
+          type: "runtime:approve-pending-device",
+          pendingDeviceId: pairing.pendingDeviceId,
+          confirmedFingerprint: confirmedFingerprint.trim().toUpperCase(),
+        });
+        setMessage("Device approved. Confirm the same fingerprint on the other device.");
+      } else {
+        await sendRuntimeCommand<RuntimeStatus>({
+          type: "runtime:confirm-paired-approver",
+          approverDeviceId: pairing.approverDeviceId,
+          confirmedFingerprint: confirmedFingerprint.trim().toUpperCase(),
+        });
+        setMessage("Pairing confirmation recorded.");
+      }
+      setConfirmedFingerprint("");
+      await reload();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to complete pairing");
+    } finally {
+      setPairingBusy(false);
     }
   };
 
@@ -66,6 +114,7 @@ function Home() {
 
   const localDeviceTrusted =
     status?.device.trustState === "root" || status?.device.trustState === "verified";
+  const pairing = status?.onboarding?.pairing;
 
   return (
     <section className="flex h-full flex-col sm:block">
@@ -112,7 +161,7 @@ function Home() {
         </div>
       </div>
 
-      {!localDeviceTrusted && status?.device.registration === "registered" ? (
+      {status?.onboarding?.bootstrapEligible === true ? (
         <Button
           variant="outlined"
           className="mt-3 w-full"
@@ -123,11 +172,61 @@ function Home() {
         </Button>
       ) : null}
 
+      {status?.onboarding?.state === "pairing-required" ? (
+        <div className="mt-3 rounded-lg border border-[#D1D5DB] p-3 text-xs">
+          <p className="font-semibold">Pair this device with an existing Copyyt device.</p>
+          <Button variant="outlined" className="mt-3 w-full" onClick={refreshOnboarding} disabled={pairingBusy}>
+            {pairingBusy ? "Refreshing…" : "Refresh pairing"}
+          </Button>
+        </div>
+      ) : null}
+
+      {pairing ? (
+        <div className="mt-3 rounded-lg border border-[#D1D5DB] p-3 text-xs">
+          <p className="font-semibold">
+            {pairing.role === "approver" ? "Approve a pending device" : "Confirm this device pairing"}
+          </p>
+          <p className="mt-2 text-[#4B5563]">
+            {pairing.pendingDeviceName ?? "Pending device"}
+            {pairing.pendingPlatform ? ` · ${pairing.pendingPlatform}` : ""}
+          </p>
+          <p className="mt-1 break-all font-mono text-[11px] text-[#4B5563]">
+            Device ID: {pairing.pendingDeviceId}
+          </p>
+          <p className="mt-2 break-all font-mono text-sm tracking-wide">{pairing.fingerprint}</p>
+          {status.onboarding.state === "waiting-for-approval" ? (
+            <p className="mt-2 text-[#4B5563]">Waiting for approval on the other device.</p>
+          ) : (
+            <>
+              <input
+                className="mt-3 w-full rounded border border-[#D1D5DB] px-2 py-2 font-mono text-xs uppercase"
+                value={confirmedFingerprint}
+                onChange={(event) => setConfirmedFingerprint(event.target.value)}
+                placeholder="XXXX-XXXX-…"
+                aria-label="Confirmed pairing fingerprint"
+              />
+              <Button variant="outlined" className="mt-3 w-full" onClick={completePairing} disabled={pairingBusy}>
+                {pairingBusy ? "Working…" : pairing.role === "approver" ? "Approve device" : "Confirm and pair"}
+              </Button>
+            </>
+          )}
+          <Button variant="outlined" className="mt-2 w-full" onClick={refreshOnboarding} disabled={pairingBusy}>
+            Refresh pairing
+          </Button>
+        </div>
+      ) : null}
+
+      {!pairing && status?.signedIn ? (
+        <Button variant="outlined" className="mt-3 w-full" onClick={refreshOnboarding} disabled={pairingBusy}>
+          {pairingBusy ? "Refreshing…" : "Refresh onboarding"}
+        </Button>
+      ) : null}
+
       <Button
         variant="primary"
         className="mt-3 w-full"
         onClick={sendCurrentClipboard}
-        disabled={sending || status?.connectionState !== "ready" || !localDeviceTrusted}
+        disabled={sending || status?.connectionState !== "ready" || !status?.syncReady || !localDeviceTrusted}
       >
         {sending ? "Encrypting and sending…" : "Send current clipboard"}
       </Button>
