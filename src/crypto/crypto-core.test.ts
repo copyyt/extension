@@ -29,6 +29,7 @@ import {
   buildDeviceApprovalMessage,
   buildKeyWrapContext,
   buildPayloadAad,
+  buildPairingFingerprintContext,
   buildSocketAuthMessage,
 } from "./protocol.ts";
 import type { ClientVerifiedDevice } from "./trust-store.ts";
@@ -245,6 +246,32 @@ test("cross-repository golden fixture has mirrored bytes and digests", async () 
       digest: "q9w8Hf7Y5+Q0P2qBm7bsq3ZKY5ry8Sew/TRB4BpGveM=",
     },
     {
+      name: "copyyt-pairing-fingerprint-v1",
+      bytes: buildPairingFingerprintContext({
+        userId: goldenUserId,
+        approvingDeviceId: deviceAId,
+        approvingKeyVersion: 4,
+        approvingSigningPublicKey: goldenKey,
+        approvingEncryptionPublicKey: goldenKey,
+        pendingDeviceId: deviceBId,
+        pendingKeyVersion: 9,
+        pendingSigningPublicKey: goldenKey,
+        pendingEncryptionPublicKey: goldenKey,
+      }),
+      expected:
+        "copyyt-pairing-fingerprint-v1\n" +
+        `userId=${goldenUserId}\n` +
+        `approvingDeviceId=${deviceAId}\n` +
+        "approvingKeyVersion=4\n" +
+        `approvingSigningPublicKey=${goldenKey}\n` +
+        `approvingEncryptionPublicKey=${goldenKey}\n` +
+        `pendingDeviceId=${deviceBId}\n` +
+        "pendingKeyVersion=9\n" +
+        `pendingSigningPublicKey=${goldenKey}\n` +
+        `pendingEncryptionPublicKey=${goldenKey}\n`,
+      digest: "PlSuEnpwvWJhGecRDdJ0DDFr+kFB1AuItga7ccKzq2s=",
+    },
+    {
       name: "copyyt-clipboard-envelope-v1",
       bytes: await buildClipboardEnvelopeSignatureMessage({
         userId: goldenUserId,
@@ -450,8 +477,11 @@ test("approval, socket signatures, pairing fingerprint, and key wrapping are pro
   const fingerprint = await pairingFingerprint({
     userId,
     approvingDeviceId: deviceAId,
+    approvingKeyVersion: 4,
     approvingSigningPublicKey: identityA.signingPublicKeyBase64,
+    approvingEncryptionPublicKey: identityA.encryptionPublicKeyBase64,
     pendingDeviceId: deviceBId,
+    pendingKeyVersion: 9,
     pendingSigningPublicKey: identityB.signingPublicKeyBase64,
     pendingEncryptionPublicKey: identityB.encryptionPublicKeyBase64,
   });
@@ -618,6 +648,75 @@ test("local bootstrap is explicit and never inferred from a server label", async
   assert.equal(reported.trustState, "unverified");
   assert.equal(store.listEncryptionRecipients(userId).length, 0);
   assert.equal(store.bootstrapInitialTrustAnchor(userId, identityA).trustState, "root");
+});
+
+test("pairing pins the full-key approver and leaves the pending device unverified", async () => {
+  const approverIdentity = await makeFixedIdentity(deviceAId, 4);
+  const pendingIdentity = await makeFixedIdentity(deviceBId, 9, true);
+  const store = new InMemoryTrustStore();
+  const approver = store.upsertServerReportedDevice({
+    ...verifiedDevice(approverIdentity),
+    trustState: "trusted",
+  });
+  const pending = store.upsertServerReportedDevice({
+    ...verifiedDevice(pendingIdentity),
+    trustState: "trusted",
+  });
+  const fingerprint = await pairingFingerprint({
+    userId,
+    approvingDeviceId: approver.deviceId,
+    approvingKeyVersion: approver.keyVersion,
+    approvingSigningPublicKey: approver.signingPublicKey,
+    approvingEncryptionPublicKey: approver.encryptionPublicKey,
+    pendingDeviceId: pending.deviceId,
+    pendingKeyVersion: pending.keyVersion,
+    pendingSigningPublicKey: pending.signingPublicKey,
+    pendingEncryptionPublicKey: pending.encryptionPublicKey,
+  });
+  const root = await store.pinPairedApprover(
+    userId,
+    pendingIdentity,
+    approverIdentity.deviceId,
+    fingerprint,
+  );
+  assert.equal(root.trustState, "root");
+  assert.equal(root.trustOrigin, "pairing");
+  assert.equal(root.pairedForDeviceId, pendingIdentity.deviceId);
+  assert.equal(root.pairingFingerprint, fingerprint);
+  assert.equal(store.getDevice(userId, pendingIdentity.deviceId)?.trustState, "unverified");
+
+  const pendingFields = {
+    pendingDeviceId: pendingIdentity.deviceId,
+    pendingKeyVersion: pendingIdentity.keyVersion!,
+    pendingEncryptionPublicKey: pendingIdentity.encryptionPublicKeyBase64,
+    pendingSigningPublicKey: pendingIdentity.signingPublicKeyBase64,
+  };
+  await store.applyApproval(userId, {
+    approvingDeviceId: approverIdentity.deviceId,
+    approvingKeyVersion: approverIdentity.keyVersion!,
+    ...pendingFields,
+    approvalSignature: await signDeviceApproval({
+      userId,
+      approvingIdentity: approverIdentity,
+      pendingDevice: pendingFields,
+    }),
+  });
+  assert.equal(store.getDevice(userId, pendingIdentity.deviceId)?.trustState, "verified");
+});
+
+test("revocation is monotonic across later server observations", async () => {
+  const identity = await makeFixedIdentity(deviceAId, 1);
+  const store = new InMemoryTrustStore();
+  store.upsertServerReportedDevice({ ...verifiedDevice(identity), trustState: "trusted" });
+  store.revokeDevice(userId, deviceAId);
+  assert.equal(
+    store.upsertServerReportedDevice({ ...verifiedDevice(identity), trustState: "trusted" }).trustState,
+    "revoked",
+  );
+  assert.equal(
+    store.upsertServerReportedDevice({ ...verifiedDevice(identity), trustState: "revoked" }).trustState,
+    "revoked",
+  );
 });
 
 function hex(value: string): Uint8Array {

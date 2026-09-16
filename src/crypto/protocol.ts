@@ -162,8 +162,11 @@ export function buildPayloadAad(input: PayloadAadInput): Uint8Array {
 export interface PairingFingerprintInput {
   userId: string;
   approvingDeviceId: string;
+  approvingKeyVersion: number;
   approvingSigningPublicKey: string;
+  approvingEncryptionPublicKey: string;
   pendingDeviceId: string;
+  pendingKeyVersion: number;
   pendingSigningPublicKey: string;
   pendingEncryptionPublicKey: string;
 }
@@ -175,8 +178,11 @@ export function buildPairingFingerprintContext(
     PAIRING_FINGERPRINT_CONTEXT_VERSION,
     `userId=${input.userId}`,
     `approvingDeviceId=${input.approvingDeviceId}`,
+    `approvingKeyVersion=${input.approvingKeyVersion}`,
     `approvingSigningPublicKey=${input.approvingSigningPublicKey}`,
+    `approvingEncryptionPublicKey=${input.approvingEncryptionPublicKey}`,
     `pendingDeviceId=${input.pendingDeviceId}`,
+    `pendingKeyVersion=${input.pendingKeyVersion}`,
     `pendingSigningPublicKey=${input.pendingSigningPublicKey}`,
     `pendingEncryptionPublicKey=${input.pendingEncryptionPublicKey}`,
   ]);

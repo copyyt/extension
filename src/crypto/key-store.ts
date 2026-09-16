@@ -40,10 +40,12 @@ export interface DeviceIdentity {
   readonly registration: DeviceRegistrationMetadata | null;
 }
 
-interface StoredIdentityRecord {
+export interface StoredIdentityRecord {
   schemaVersion: 1;
   userId: string;
   deviceId: string;
+  signingPublicKeyBase64: string;
+  encryptionPublicKeyBase64: string;
   signingPrivateKey: CryptoKey;
   signingPublicKey: CryptoKey;
   encryptionPrivateKey: CryptoKey;
@@ -113,29 +115,6 @@ async function addRecord(
   });
 }
 
-async function writeRecord(
-  userId: string,
-  record: StoredIdentityRecord,
-): Promise<void> {
-  const database = await openCryptoDatabase();
-  return new Promise((resolve, reject) => {
-    const transaction = database.transaction(IDENTITY_STORE, "readwrite");
-    transaction.objectStore(IDENTITY_STORE).put(record, userId);
-    transaction.oncomplete = () => {
-      closeDatabase(database);
-      resolve();
-    };
-    transaction.onerror = () => {
-      closeDatabase(database);
-      reject(transaction.error ?? new Error("Unable to persist device identity"));
-    };
-    transaction.onabort = () => {
-      closeDatabase(database);
-      reject(transaction.error ?? new Error("Unable to persist device identity"));
-    };
-  });
-}
-
 async function deleteRecord(userId: string): Promise<void> {
   assertUserId(userId);
   const database = await openCryptoDatabase();
@@ -196,7 +175,7 @@ function isPublicKey(
   );
 }
 
-function isValidRecord(record: unknown): record is StoredIdentityRecord {
+export function isValidStoredIdentityRecord(record: unknown): record is StoredIdentityRecord {
   if (!record || typeof record !== "object") {
     return false;
   }
@@ -218,6 +197,8 @@ function isValidRecord(record: unknown): record is StoredIdentityRecord {
     typeof candidate.userId === "string" &&
     candidate.userId.length > 0 &&
     typeof candidate.deviceId === "string" &&
+    isCanonicalBase64Bytes(candidate.signingPublicKeyBase64, 32) &&
+    isCanonicalBase64Bytes(candidate.encryptionPublicKeyBase64, 32) &&
     isKey(candidate.signingPrivateKey, "private", "Ed25519", "sign") &&
     isPublicKey(candidate.signingPublicKey, "Ed25519", "verify") &&
     isKey(candidate.encryptionPrivateKey, "private", "X25519", "deriveBits") &&
@@ -234,6 +215,12 @@ async function identityFromRecord(record: StoredIdentityRecord): Promise<DeviceI
     await globalThis.crypto.subtle.exportKey("raw", record.encryptionPublicKey),
   );
   if (signingPublicKey.length !== 32 || encryptionPublicKey.length !== 32) {
+    throw new DeviceIdentityCorruptError();
+  }
+  if (
+    record.signingPublicKeyBase64 !== bytesToBase64(signingPublicKey) ||
+    record.encryptionPublicKeyBase64 !== bytesToBase64(encryptionPublicKey)
+  ) {
     throw new DeviceIdentityCorruptError();
   }
 
@@ -282,6 +269,8 @@ async function createRecord(userId: string): Promise<StoredIdentityRecord> {
     schemaVersion: 1,
     userId,
     deviceId: globalThis.crypto.randomUUID(),
+    signingPublicKeyBase64: bytesToBase64(signingPublicKey),
+    encryptionPublicKeyBase64: bytesToBase64(encryptionPublicKey),
     signingPrivateKey: signingPair.privateKey,
     signingPublicKey: signingPair.publicKey,
     encryptionPrivateKey: encryptionPair.privateKey,
@@ -295,7 +284,7 @@ export async function getDeviceIdentity(userId: string): Promise<DeviceIdentity 
   if (!record) {
     return null;
   }
-  if (!isValidRecord(record) || record.userId !== userId) {
+  if (!isValidStoredIdentityRecord(record) || record.userId !== userId) {
     throw new DeviceIdentityCorruptError();
   }
   try {
@@ -347,24 +336,77 @@ export async function persistDeviceRegistrationMetadata(
   identity: DeviceIdentity,
   registration: DeviceRegistrationMetadata,
 ): Promise<DeviceIdentity> {
-  if (!Number.isSafeInteger(registration.keyVersion) || registration.keyVersion <= 0) {
-    throw new DeviceIdentityCorruptError();
-  }
-  const current = await readRecord(identity.userId);
   if (
-    !current ||
-    !isValidRecord(current) ||
-    current.userId !== identity.userId ||
-    current.deviceId !== identity.deviceId
+    !Number.isSafeInteger(registration.keyVersion) ||
+    registration.keyVersion <= 0 ||
+    typeof registration.name !== "string" ||
+    typeof registration.platform !== "string" ||
+    !Array.isArray(registration.capabilities) ||
+    !registration.capabilities.every((value) => typeof value === "string") ||
+    (registration.appVersion !== undefined && typeof registration.appVersion !== "string")
   ) {
     throw new DeviceIdentityCorruptError();
   }
-  current.registration = {
-    ...registration,
-    capabilities: [...registration.capabilities],
-  };
-  await writeRecord(identity.userId, current);
-  return identityFromRecord(current);
+  const database = await openCryptoDatabase();
+  const updated = await new Promise<StoredIdentityRecord>((resolve, reject) => {
+    const transaction = database.transaction(IDENTITY_STORE, "readwrite");
+    const store = transaction.objectStore(IDENTITY_STORE);
+    const request = store.get(identity.userId);
+    let nextRecord: StoredIdentityRecord | undefined;
+    let failure: unknown;
+    request.onerror = () => {
+      failure = request.error ?? new DeviceIdentityCorruptError();
+      transaction.abort();
+    };
+    request.onsuccess = () => {
+      const current = request.result as StoredIdentityRecord | undefined;
+      if (
+        !current ||
+        !isValidStoredIdentityRecord(current) ||
+        current.userId !== identity.userId ||
+        current.deviceId !== identity.deviceId
+      ) {
+        failure = new DeviceIdentityCorruptError();
+        transaction.abort();
+        return;
+      }
+      // Rebuild from the record read in this same transaction. The caller can
+      // update registration metadata, but can never supply replacement keys.
+      nextRecord = {
+        schemaVersion: current.schemaVersion,
+        userId: current.userId,
+        deviceId: current.deviceId,
+        signingPublicKeyBase64: current.signingPublicKeyBase64,
+        encryptionPublicKeyBase64: current.encryptionPublicKeyBase64,
+        signingPrivateKey: current.signingPrivateKey,
+        signingPublicKey: current.signingPublicKey,
+        encryptionPrivateKey: current.encryptionPrivateKey,
+        encryptionPublicKey: current.encryptionPublicKey,
+        registration: {
+          ...registration,
+          capabilities: [...registration.capabilities],
+        },
+      };
+      store.put(nextRecord, identity.userId);
+    };
+    transaction.oncomplete = () => {
+      closeDatabase(database);
+      if (failure || !nextRecord) {
+        reject(failure ?? new DeviceIdentityCorruptError());
+      } else {
+        resolve(nextRecord);
+      }
+    };
+    transaction.onerror = () => {
+      closeDatabase(database);
+      reject(failure ?? transaction.error ?? new DeviceIdentityCorruptError());
+    };
+    transaction.onabort = () => {
+      closeDatabase(database);
+      reject(failure ?? transaction.error ?? new DeviceIdentityCorruptError());
+    };
+  });
+  return identityFromRecord(updated);
 }
 
 export async function clearDeviceIdentity(userId: string): Promise<void> {

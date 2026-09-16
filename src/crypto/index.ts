@@ -29,6 +29,7 @@ export {
   type ClientVerifiedDevice,
   type LocalDeviceRecord,
   type LocalTrustState,
+  type TrustOrigin,
 } from "./trust-store";
 export { registerCurrentDevice } from "./device-registration";
 export type {

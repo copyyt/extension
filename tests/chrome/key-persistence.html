@@ -53,7 +53,7 @@
       await import("/src/crypto/key-store.ts");
     const { IndexedDBTrustStore } = await import("/src/crypto/trust-store.ts");
     const { registerCurrentDevice } = await import("/src/crypto/device-registration.ts");
-    const { signDeviceApproval } = await import("/src/crypto/crypto-core.ts");
+    const { pairingFingerprint, signDeviceApproval } = await import("/src/crypto/crypto-core.ts");
 
     const userA = uuid();
     const userB = uuid();
@@ -151,6 +151,80 @@
     await storeTwo.revokeDevice(rootUser, pendingIdentity.deviceId);
     const storeThree = new IndexedDBTrustStore();
     assert((await storeThree.getDevice(rootUser, pendingIdentity.deviceId)).trustState === "revoked", "revoked device remains revoked after trust-store reconstruction");
+
+    const pairingUser = uuid();
+    let pairingIdentity = await getOrCreateDeviceIdentity(pairingUser);
+    pairingIdentity = await persistDeviceRegistrationMetadata(pairingIdentity, {
+      keyVersion: 1,
+      name: "Pairing pending",
+      platform: "chrome",
+      capabilities: ["clipboard"],
+      appVersion: "harness",
+    });
+    const approverSigningPair = await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign", "verify"]);
+    const approverEncryptionPair = await crypto.subtle.generateKey({ name: "X25519" }, false, ["deriveBits"]);
+    const approverIdentity = await createDeviceIdentityForTesting({
+      userId: pairingUser,
+      deviceId: uuid(),
+      keyVersion: 2,
+      signingPrivateKey: approverSigningPair.privateKey,
+      signingPublicKey: approverSigningPair.publicKey,
+      encryptionPrivateKey: approverEncryptionPair.privateKey,
+      encryptionPublicKey: approverEncryptionPair.publicKey,
+    });
+    const pairingStore = new IndexedDBTrustStore();
+    const pairingPending = await pairingStore.upsertServerReportedDevice({
+      userId: pairingUser,
+      deviceId: pairingIdentity.deviceId,
+      keyVersion: pairingIdentity.keyVersion,
+      encryptionPublicKey: pairingIdentity.encryptionPublicKeyBase64,
+      signingPublicKey: pairingIdentity.signingPublicKeyBase64,
+      trustState: "trusted",
+    });
+    const pairingApprover = await pairingStore.upsertServerReportedDevice({
+      userId: pairingUser,
+      deviceId: approverIdentity.deviceId,
+      keyVersion: approverIdentity.keyVersion,
+      encryptionPublicKey: approverIdentity.encryptionPublicKeyBase64,
+      signingPublicKey: approverIdentity.signingPublicKeyBase64,
+      trustState: "trusted",
+    });
+    const confirmedPairingFingerprint = await pairingFingerprint({
+      userId: pairingUser,
+      approvingDeviceId: pairingApprover.deviceId,
+      approvingKeyVersion: pairingApprover.keyVersion,
+      approvingSigningPublicKey: pairingApprover.signingPublicKey,
+      approvingEncryptionPublicKey: pairingApprover.encryptionPublicKey,
+      pendingDeviceId: pairingPending.deviceId,
+      pendingKeyVersion: pairingPending.keyVersion,
+      pendingSigningPublicKey: pairingPending.signingPublicKey,
+      pendingEncryptionPublicKey: pairingPending.encryptionPublicKey,
+    });
+    const pairedRoot = await pairingStore.pinPairedApprover(
+      pairingUser,
+      pairingIdentity,
+      approverIdentity.deviceId,
+      confirmedPairingFingerprint,
+    );
+    assert(pairedRoot.trustState === "root" && pairedRoot.trustOrigin === "pairing", "pairing pins the remote device as a root");
+    assert((await pairingStore.getDevice(pairingUser, pairingIdentity.deviceId)).trustState === "unverified", "pairing leaves the pending device unverified");
+    const pairingPendingFields = {
+      pendingDeviceId: pairingIdentity.deviceId,
+      pendingKeyVersion: pairingIdentity.keyVersion,
+      pendingEncryptionPublicKey: pairingIdentity.encryptionPublicKeyBase64,
+      pendingSigningPublicKey: pairingIdentity.signingPublicKeyBase64,
+    };
+    await pairingStore.applyApproval(pairingUser, {
+      approvingDeviceId: approverIdentity.deviceId,
+      approvingKeyVersion: approverIdentity.keyVersion,
+      ...pairingPendingFields,
+      approvalSignature: await signDeviceApproval({
+        userId: pairingUser,
+        approvingIdentity: approverIdentity,
+        pendingDevice: pairingPendingFields,
+      }),
+    });
+    assert((await pairingStore.getDevice(pairingUser, pairingIdentity.deviceId)).trustState === "verified", "paired pending device becomes verified only after signed approval");
 
     const registrationUser = uuid();
     const registrationStore = new IndexedDBTrustStore();

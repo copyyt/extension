@@ -369,6 +369,9 @@ export async function verifyDeviceApproval(input: {
     (approverDevice.trustState !== "root" && approverDevice.trustState !== "verified") ||
     certificate.approvingDeviceId !== approverDevice.deviceId ||
     certificate.approvingKeyVersion !== approverDevice.keyVersion ||
+    !Number.isSafeInteger(approverDevice.keyVersion) ||
+    approverDevice.keyVersion <= 0 ||
+    !isCanonicalBase64Bytes(approverDevice.signingPublicKey, 32) ||
     !isCanonicalBase64Bytes(certificate.approvalSignature, 64) ||
     !isCanonicalBase64Bytes(certificate.pendingEncryptionPublicKey, 32) ||
     !isCanonicalBase64Bytes(certificate.pendingSigningPublicKey, 32)
