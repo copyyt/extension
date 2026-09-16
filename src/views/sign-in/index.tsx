@@ -49,7 +49,7 @@ const SignIn = () => {
       { email },
       {
         onSuccess: (data) => {
-          setIsNew(data.data.data.isNew);
+          setIsNew(data.data.isNew);
           setCurrentView("verify-email");
         },
       },

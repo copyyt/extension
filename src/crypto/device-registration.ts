@@ -30,6 +30,11 @@ export interface RegisteredDeviceResponse {
   revokedAt?: string | null;
 }
 
+export type RegisteredDeviceListResponse =
+  | RegisteredDeviceResponse[]
+  | { devices: RegisteredDeviceResponse[] }
+  | { data: RegisteredDeviceResponse[] };
+
 export interface DeviceRegistrationApi {
   registerDevice(
     request: DeviceRegistrationRequest,

@@ -1,68 +1,72 @@
-import withAuth from "@/hocs/with-auth.hoc";
 import Button from "@/components/button";
+import withAuth from "@/hocs/with-auth.hoc";
+import { sendRuntimeCommand } from "@/runtime/client";
+import type { RuntimeStatus } from "@/runtime/messages";
+import { useRuntimeStatus } from "@/hooks/runtime-status.hook";
 import { useLogout } from "@/hooks/auth.hook";
 import { useUserStore } from "@/hooks/user-store.hook";
 import Logo from "@/vectors/logo";
-import { useEffect, useState } from "react";
-import { useSocket } from "@/hooks/socket.hook";
-import useDebounce from "@/hooks/debounce.hook";
-import { useGetLastMessage } from "@/hooks/user.hook";
-import { useViewLoader } from "@/hooks/loader.hook";
 import LogoutIcon from "@/vectors/logout";
-import PasteIcon from "@/vectors/paste";
-import CopyIcon from "@/vectors/copy-icon";
+import { useState } from "react";
 
-const Home = () => {
+function statusLabel(status: RuntimeStatus): string {
+  switch (status.connectionState) {
+    case "ready":
+      return "Ready";
+    case "device-authenticating":
+      return "Authenticating device";
+    case "connecting":
+      return "Connecting";
+    case "account-authenticated":
+      return "Signed in; connecting device";
+    case "error":
+      return status.lastSyncError?.message ?? "Connection error";
+    default:
+      return "Signed out";
+  }
+}
+
+function Home() {
   const { user } = useUserStore();
   const logout = useLogout();
+  const { status, reload } = useRuntimeStatus();
+  const [sending, setSending] = useState(false);
+  const [trusting, setTrusting] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
 
-  const [text, setText] = useState("");
-
-  const lastMessageQuery = useGetLastMessage();
-  const lastMessage = lastMessageQuery.data?.data?.data;
-
-  const onMessage = (value: string) => {
-    if (value !== text) {
-      setText(value);
+  const sendCurrentClipboard = async () => {
+    setSending(true);
+    setMessage(null);
+    try {
+      const result = await sendRuntimeCommand<{ itemId: string }>({
+        type: "runtime:send-current-clipboard",
+      });
+      setMessage(`Encrypted item accepted: ${result.itemId}`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to send clipboard");
+    } finally {
+      setSending(false);
+      void reload();
     }
   };
 
-  useEffect(() => {
-    if (lastMessage) {
-      setText(lastMessage);
-    }
-  }, [lastMessage]);
-
-  const { socket, isConnected } = useSocket(onMessage);
-
-  const pasteClipboard = async () => {
+  const trustThisDevice = async () => {
+    setTrusting(true);
+    setMessage(null);
     try {
-      const clipboardContents = await navigator.clipboard.readText();
-      setText(clipboardContents);
+      await sendRuntimeCommand<RuntimeStatus>({ type: "runtime:bootstrap-trust-anchor" });
+      setMessage("This device is now locally trusted.");
+      await reload();
     } catch (error) {
-      console.error(error);
+      setMessage(error instanceof Error ? error.message : "Unable to trust this device");
+    } finally {
+      setTrusting(false);
     }
   };
 
-  async function writeClipboardText() {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch (error) {
-      console.error(error);
-    }
-  }
+  const localDeviceTrusted =
+    status?.device.trustState === "root" || status?.device.trustState === "verified";
 
-  useDebounce(
-    () => {
-      if (text && isConnected) {
-        socket.emit("message", text);
-      }
-    },
-    1000,
-    [text],
-  );
-
-  useViewLoader([lastMessageQuery.isLoading]);
   return (
     <section className="flex h-full flex-col sm:block">
       <div className="flex items-center justify-between">
@@ -79,43 +83,62 @@ const Home = () => {
             Logout
           </Button>
           <div className="relative flex h-10 w-10 items-center justify-center rounded-full bg-[#1E6892] font-semibold text-white uppercase">
-            {(user?.name ?? "o").slice(0, 1)}
+            {(user?.name ?? status?.user?.name ?? "o").slice(0, 1)}
           </div>
         </div>
       </div>
 
       <p className="font-work mt-4 text-sm text-[#4B5563]">
-        This extension helps you copy text across various computers using the
-        the extension. Just paste here and pick up there.
+        Copyyt sends clipboard text as an encrypted device-to-device envelope.
+        The server never receives the plaintext.
       </p>
 
-      <textarea
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        className="mt-7 h-[200px] w-full flex-1 resize-none rounded-lg border border-[#D1D5DB] p-2 text-xs outline-none"
-      />
+      <div className="mt-7 space-y-3 rounded-lg border border-[#D1D5DB] p-4 text-xs">
+        <div className="flex justify-between gap-4">
+          <span className="text-[#4B5563]">Account</span>
+          <span>{status?.signedIn ? "Signed in" : "Signed out"}</span>
+        </div>
+        <div className="flex justify-between gap-4">
+          <span className="text-[#4B5563]">Device</span>
+          <span>{status?.device.registration ?? "unknown"}</span>
+        </div>
+        <div className="flex justify-between gap-4">
+          <span className="text-[#4B5563]">Local trust</span>
+          <span>{status?.device.trustState ?? "unknown"}</span>
+        </div>
+        <div className="flex justify-between gap-4">
+          <span className="text-[#4B5563]">Socket</span>
+          <span>{status ? statusLabel(status) : "Loading"}</span>
+        </div>
+      </div>
 
-      <div className="mt-2 flex justify-end gap-2">
+      {!localDeviceTrusted && status?.device.registration === "registered" ? (
         <Button
           variant="outlined"
-          className="flex items-center gap-2"
-          onClick={pasteClipboard}
+          className="mt-3 w-full"
+          onClick={trustThisDevice}
+          disabled={trusting}
         >
-          <PasteIcon />
-          Paste
+          {trusting ? "Trusting device…" : "Trust this device (first setup)"}
         </Button>
-        <Button
-          variant="primary"
-          className="flex items-center gap-2"
-          onClick={writeClipboardText}
-        >
-          <CopyIcon />
-          Copy
-        </Button>
-      </div>
+      ) : null}
+
+      <Button
+        variant="primary"
+        className="mt-3 w-full"
+        onClick={sendCurrentClipboard}
+        disabled={sending || status?.connectionState !== "ready" || !localDeviceTrusted}
+      >
+        {sending ? "Encrypting and sending…" : "Send current clipboard"}
+      </Button>
+
+      {status?.lastSyncError ? (
+        <p className="mt-3 text-xs text-[#FF2635]">{status.lastSyncError.message}</p>
+      ) : null}
+      {message ? <p className="mt-3 break-all text-xs text-[#4B5563]">{message}</p> : null}
     </section>
   );
-};
+}
 
 const HomeWithAuth = withAuth(Home);
 

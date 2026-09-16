@@ -15,8 +15,25 @@ persisted by `IndexedDBTrustStore`; call `bootstrapInitialTrustAnchor(...)`
 explicitly for the first-device ceremony. Server registration labels never
 establish local cryptographic trust.
 
-Phase 1D deliberately does not add clipboard monitoring, an offscreen
-document, or a persistent Socket.IO lifecycle. Those belong to the next phase.
+Phase 2A adds the MV3 runtime around that core. The service worker owns the
+session, device registration, durable trust reads, Socket.IO connection,
+challenge signing, encryption/decryption, deduplication, and popup status.
+The offscreen document is only a `CLIPBOARD`-reason adapter for
+`READ_TEXT`, `WRITE_TEXT`, and `PING` messages. The popup does not own a socket
+or return clipboard text through runtime messages.
+
+The extension build emits `assets/service-worker.js` and
+`assets/offscreen.js`; `manifest.extension.json` registers the former as a
+module service worker. Runtime session/status records live in
+`chrome.storage.local`. Processed and outbound item metadata live in the
+`copyyt-runtime-v1` IndexedDB database and contain no plaintext. Processed
+items are retained for at most 24 hours and 500 records.
+
+For the first device, use the explicit **Trust this device (first setup)**
+action in the popup. A server-reported `trusted` label remains locally
+`unverified`; it never bootstraps a root. Phase 2A uses manual **Send current
+clipboard** and does not install clipboard polling or `clipboardchange`
+listeners.
 
 ## Development
 
@@ -24,12 +41,22 @@ document, or a persistent Socket.IO lifecycle. Those belong to the next phase.
 yarn build
 yarn lint
 yarn test:crypto
+yarn test:runtime
 yarn test:chrome
 ```
 
-`yarn test:chrome` launches the local Vite harness in Chrome and verifies
-cross-realm identity creation plus real IndexedDB `CryptoKey` persistence.
+`yarn test:chrome` first runs the existing local Vite harness for cross-realm
+identity creation and real IndexedDB `CryptoKey` persistence, then builds the
+extension and launches a separate Chrome instance against
+`runtime-harness.html`. The second harness asks the service worker to create
+the offscreen document and exercises the real OS clipboard adapter without
+returning clipboard contents in its result.
 Set `CHROME_BIN` when Chrome is not installed in a standard location.
+
+To test Chrome with its UI enabled, set `COPYYT_CHROME_HEADLESS=0`. Some
+managed or already-running Chrome installations refuse command-line unpacked
+extension loading; the harness reports that browser limitation instead of
+adding a runtime workaround.
 
 ## Template notes
 

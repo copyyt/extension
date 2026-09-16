@@ -42,6 +42,15 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: "./index.html",
+        ...(isPWA
+          ? {}
+          : {
+              "service-worker": "./src/service-worker.ts",
+              offscreen: "./src/offscreen.ts",
+            }),
+      },
+      output: {
+        entryFileNames: "assets/[name].js",
       },
     },
   },

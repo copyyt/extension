@@ -14,13 +14,13 @@ export {
   type DeviceApprovalCertificate,
   type EncryptClipboardItemInput,
   type VerifiedRecipient,
-} from "./crypto-core";
+} from "./crypto-core.ts";
 export {
   getDeviceIdentity,
   getOrCreateDeviceIdentity,
   clearDeviceIdentity,
   type DeviceIdentity,
-} from "./key-store";
+} from "./key-store.ts";
 export {
   IndexedDBTrustStore,
   DurableTrustStore,
@@ -30,14 +30,14 @@ export {
   type LocalDeviceRecord,
   type LocalTrustState,
   type TrustOrigin,
-} from "./trust-store";
-export { registerCurrentDevice } from "./device-registration";
+} from "./trust-store.ts";
+export { registerCurrentDevice } from "./device-registration.ts";
 export type {
   DeviceRegistrationApi,
   DeviceRegistrationRequest,
   RegisteredDeviceResponse,
   RegisterCurrentDeviceOptions,
-} from "./device-registration";
+} from "./device-registration.ts";
 export {
   buildClipboardEnvelopeSignatureMessage,
   buildDeviceApprovalMessage,
@@ -45,11 +45,11 @@ export {
   buildPairingFingerprintContext,
   buildPayloadAad,
   buildSocketAuthMessage,
-} from "./protocol";
+} from "./protocol.ts";
 export {
   base64ToBytes,
   bytesToBase64,
   isCanonicalBase64Bytes,
   utf8Decode,
   utf8Encode,
-} from "./bytes";
+} from "./bytes.ts";

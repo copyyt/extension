@@ -54,6 +54,10 @@
     const { IndexedDBTrustStore } = await import("/src/crypto/trust-store.ts");
     const { registerCurrentDevice } = await import("/src/crypto/device-registration.ts");
     const { pairingFingerprint, signDeviceApproval } = await import("/src/crypto/crypto-core.ts");
+    const {
+      IndexedDBOutboundItemStore,
+      IndexedDBProcessedItemStore,
+    } = await import("/src/runtime/runtime-db.ts");
 
     const userA = uuid();
     const userB = uuid();
@@ -245,6 +249,24 @@
       trustStore: registrationStore,
     });
     assert((await registrationStore.getDevice(registrationUser, (await getDeviceIdentity(registrationUser)).deviceId)).trustState === "unverified", "registration response cannot establish a local root");
+
+    const metadataUser = uuid();
+    const outboundMetadata = new IndexedDBOutboundItemStore();
+    const processedMetadata = new IndexedDBProcessedItemStore();
+    await outboundMetadata.mark({
+      userId: metadataUser,
+      itemId: uuid(),
+      publishedAt: new Date().toISOString(),
+      sourceDeviceId: uuid(),
+    });
+    const processedItemId = uuid();
+    await processedMetadata.mark({
+      userId: metadataUser,
+      itemId: processedItemId,
+      processedAt: new Date().toISOString(),
+      sourceDeviceId: uuid(),
+    });
+    assert(await new IndexedDBProcessedItemStore().has(metadataUser, processedItemId), "processed item metadata survives store reconstruction");
 
     output.textContent = `PASS\n${checks.map((check) => `✓ ${check}`).join("\n")}`;
   }

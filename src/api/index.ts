@@ -8,6 +8,7 @@ import {
 import type {
   DeviceRegistrationRequest,
   RegisteredDeviceResponse,
+  RegisteredDeviceListResponse,
 } from "../crypto/device-registration";
 
 export const getApis = (axiosInstance: AxiosInstance) => ({
@@ -33,11 +34,10 @@ export const getApis = (axiosInstance: AxiosInstance) => ({
     resendEmailOtp: async (email: string) =>
       axiosInstance.post("/auth/resend-email-otp", { email }),
   },
-  user: {
-    lastMessage: async () => axiosInstance.get("/user/last-message"),
-  },
   devices: {
     registerDevice: async (data: DeviceRegistrationRequest) =>
       axiosInstance.post<RegisteredDeviceResponse>("/devices", data),
+    listDevices: async () =>
+      axiosInstance.get<RegisteredDeviceListResponse>("/devices"),
   },
 });
