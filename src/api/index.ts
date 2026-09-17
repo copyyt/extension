@@ -24,14 +24,22 @@ export const getApis = (axiosInstance: AxiosInstance) => ({
       ),
     verifyEmail: async (data: IVerifyEmail) =>
       axiosInstance.post<SignInResponse>("/auth/verify-email", data),
-    refreshTokens: async () =>
-      axiosInstance.post<SignInResponse>("/auth/refresh-tokens", null, {
-        withCredentials: true,
-      }),
-    logout: async () =>
-      axiosInstance.post("/auth/logout", null, {
-        withCredentials: true,
-      }),
+    refreshTokens: async (refreshToken?: string) =>
+      axiosInstance.post<SignInResponse>(
+        "/auth/refresh-tokens",
+        refreshToken === undefined ? null : { refreshToken },
+        {
+          withCredentials: true,
+        },
+      ),
+    logout: async (refreshToken?: string) =>
+      axiosInstance.post(
+        "/auth/logout",
+        refreshToken === undefined ? null : { refreshToken },
+        {
+          withCredentials: true,
+        },
+      ),
     resendEmailOtp: async (email: string) =>
       axiosInstance.post("/auth/resend-email-otp", { email }),
   },

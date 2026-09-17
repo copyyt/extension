@@ -60,10 +60,11 @@ import {
   type SyncPreferences,
   type SyncPreferencesStore,
 } from "./sync-preferences.ts";
-import type {
-  RuntimeSession,
-  SessionStore,
-  StatusStore,
+import {
+  isRuntimeSessionV2,
+  type RuntimeSession,
+  type SessionStore,
+  type StatusStore,
 } from "./session-store.ts";
 
 export interface RuntimeApi {
@@ -73,8 +74,8 @@ export interface RuntimeApi {
     }): Promise<AxiosResponse<ILoginResponse>>;
     googleSign(token: string): Promise<AxiosResponse<SignInResponse>>;
     verifyEmail(data: IVerifyEmail): Promise<AxiosResponse<SignInResponse>>;
-    refreshTokens(): Promise<AxiosResponse<SignInResponse>>;
-    logout(): Promise<AxiosResponse<unknown>>;
+    refreshTokens(refreshToken?: string): Promise<AxiosResponse<SignInResponse>>;
+    logout(refreshToken?: string): Promise<AxiosResponse<unknown>>;
     resendEmailOtp(email: string): Promise<AxiosResponse<unknown>>;
   };
   devices: DeviceRegistrationApi & {
@@ -340,12 +341,49 @@ function tokenNeedsRefresh(token: string, now: Date): boolean {
   }
 }
 
+const KNOWN_REFRESH_CREDENTIAL_REJECTION_CODES = new Set([
+  "refresh_token_invalid",
+  "refresh_token_expired",
+  "invalid_refresh_token",
+  "expired_refresh_token",
+  "invalid_or_expired_refresh_token",
+]);
+
+function backendErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const response = (error as { response?: unknown }).response;
+  if (!response || typeof response !== "object") return undefined;
+  const data = (response as { data?: unknown }).data;
+  const candidates = [
+    data,
+    data && typeof data === "object"
+      ? (data as { message?: unknown }).message
+      : undefined,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string") return candidate;
+    if (!candidate || typeof candidate !== "object") continue;
+    const code = (candidate as { code?: unknown }).code;
+    if (typeof code === "string") return code;
+  }
+  return undefined;
+}
+
 function refreshFailureIsDefinitive(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const response = (error as { response?: unknown }).response;
   if (!response || typeof response !== "object") return false;
   const status = (response as { status?: unknown }).status;
-  return typeof status === "number" && status >= 400 && status < 500;
+  if (status === 401) return true;
+  const code = backendErrorCode(error);
+  return (
+    typeof code === "string" &&
+    KNOWN_REFRESH_CREDENTIAL_REJECTION_CODES.has(code)
+  );
+}
+
+function isRefreshTokenNotFound(error: unknown): boolean {
+  return backendErrorCode(error) === "refresh_token_not_found";
 }
 
 function isSocketAuthenticationFailure(error: unknown): boolean {
@@ -555,6 +593,9 @@ export class CopyytServiceWorkerRuntime {
   private startup: Promise<void> | null = null;
   private initialization: Promise<void> | null = null;
   private refreshInFlight: Promise<RuntimeSession> | null = null;
+  private sessionMutationInFlight: Promise<void> = Promise.resolve();
+  private sessionGeneration = 0;
+  private syncPreferencesWriteInFlight: Promise<void> = Promise.resolve();
   private connectivityReconcileInFlight: Promise<void> | null = null;
   private pendingConnectivityIntent: ConnectivityReconcileIntent | null = null;
   private activeConnectivityIntent: ConnectivityReconcileIntent | null = null;
@@ -876,7 +917,8 @@ export class CopyytServiceWorkerRuntime {
         error.code === "AUTH_REQUIRED" &&
         !this.session
       ) {
-        await this.clearSession();
+        // refreshAccessToken already cleared the session after an
+        // authoritative credential rejection.
         return;
       }
 
@@ -1628,18 +1670,19 @@ export class CopyytServiceWorkerRuntime {
     }
 
     const previous = this.status.syncPreferences;
-    if (!preferences.sendEnabled) {
-      // Clear the latest-wins slot before persistence completes so a pending
-      // observation cannot cross a successful disable transition.
-      this.pendingAutoObservation = null;
-    }
-    await this.dependencies.syncPreferencesStore.set({ ...preferences });
-
+    // Advance the in-memory barriers before awaiting durable persistence. A
+    // clipboard operation can already be between awaits when this command is
+    // accepted, so storage ordering cannot be the policy authority.
     if (previous.sendEnabled !== preferences.sendEnabled) {
       this.sendPolicyRevision += 1;
     }
     if (previous.receiveEnabled !== preferences.receiveEnabled) {
       this.receivePolicyRevision += 1;
+    }
+    if (!preferences.sendEnabled) {
+      // Clear the latest-wins slot before persistence completes so a pending
+      // observation cannot cross the disable barrier.
+      this.pendingAutoObservation = null;
     }
 
     if (!previous.sendEnabled && preferences.sendEnabled) {
@@ -1651,6 +1694,25 @@ export class CopyytServiceWorkerRuntime {
       syncPreferences: { ...preferences },
       ...(preferences.sendEnabled ? {} : { clipboardWatch: "stopped" }),
     });
+
+    // Serialize preference writes so rapid mode changes cannot leave storage
+    // in an older state than the in-memory barrier that accepted them.
+    const persistence = this.syncPreferencesWriteInFlight.then(
+      () => this.dependencies.syncPreferencesStore.set({ ...preferences }),
+      () => this.dependencies.syncPreferencesStore.set({ ...preferences }),
+    );
+    this.syncPreferencesWriteInFlight = persistence.then(
+      () => undefined,
+      () => undefined,
+    );
+    try {
+      await persistence;
+    } catch {
+      throw new RuntimeError(
+        "SYNC_PREFERENCES_INVALID",
+        "Clipboard sync preferences could not be saved",
+      );
+    }
     return this.getStatus();
   }
 
@@ -1721,12 +1783,15 @@ export class CopyytServiceWorkerRuntime {
   private async refreshAccessToken(): Promise<RuntimeSession> {
     if (this.refreshInFlight) return this.refreshInFlight;
     const session = this.requireSession();
+    const sessionGeneration = this.sessionGeneration;
     this.refreshInFlight = (async () => {
       let response: AxiosResponse<SignInResponse>;
       try {
         response = await this.dependencies
           .apiFactory(session.accessToken)
-          .auth.refreshTokens();
+          .auth.refreshTokens(
+            isRuntimeSessionV2(session) ? session.refreshToken : undefined,
+          );
       } catch (error) {
         if (refreshFailureIsDefinitive(error)) {
           await this.clearSession();
@@ -1735,9 +1800,26 @@ export class CopyytServiceWorkerRuntime {
             "The Copyyt session is no longer valid",
           );
         }
+        if (isRefreshTokenNotFound(error)) {
+          throw new RuntimeError(
+            "AUTH_REQUIRED",
+            isRuntimeSessionV2(session)
+              ? "Copyyt could not find the durable refresh credential for this extension session. Sign in again to restore it."
+              : "Copyyt could not restore this legacy session because its refresh credential is unavailable. Sign in again to continue.",
+          );
+        }
         throw error;
       }
-      await this.saveSession(response.data);
+      if (this.session !== session || this.sessionGeneration !== sessionGeneration) {
+        throw new RuntimeError(
+          "AUTH_REQUIRED",
+          "The Copyyt session changed before token refresh completed",
+        );
+      }
+      await this.saveSession(response.data, {
+        session,
+        generation: sessionGeneration,
+      });
       return this.session!;
     })().finally(() => {
       this.refreshInFlight = null;
@@ -1745,54 +1827,117 @@ export class CopyytServiceWorkerRuntime {
     return this.refreshInFlight;
   }
 
-  private async saveSession(response: SignInResponse): Promise<void> {
-    if (
-      this.session &&
-      this.session.user.id === response.user.id &&
-      this.session.accessToken !== response.accessToken
-    ) {
-      this.destroySocket(this.socket);
-    }
+  private async saveSession(
+    response: SignInResponse,
+    expected?: { session: RuntimeSession; generation: number },
+  ): Promise<void> {
     const session: RuntimeSession = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       accessToken: response.accessToken,
+      refreshToken: response.refreshToken,
       user: response.user,
     };
-    await this.dependencies.sessionStore.set(session);
-    this.session = session;
-    this.serverDeviceState = "unknown";
-    this.setStatus({
-      ...DEFAULT_STATUS,
-      connectionState: "account-authenticated",
-      signedIn: true,
-      user: userFromSession(session),
-      syncPreferences: { ...this.status.syncPreferences },
+
+    if (
+      expected &&
+      (this.session !== expected.session ||
+        this.sessionGeneration !== expected.generation)
+    ) {
+      throw new RuntimeError(
+        "AUTH_REQUIRED",
+        "The Copyyt session changed before token refresh completed",
+      );
+    }
+
+    if (!expected) this.sessionGeneration += 1;
+    await this.enqueueSessionMutation(async () => {
+      if (
+        expected &&
+        (this.session !== expected.session ||
+          this.sessionGeneration !== expected.generation)
+      ) {
+        throw new RuntimeError(
+          "AUTH_REQUIRED",
+          "The Copyyt session changed before token refresh completed",
+        );
+      }
+      if (
+        this.session &&
+        this.session.user.id === response.user.id &&
+        this.session.accessToken !== response.accessToken
+      ) {
+        this.destroySocket(this.socket);
+      }
+      await this.dependencies.sessionStore.set(session);
+      // A clearSession() can invalidate a refresh while the storage write is
+      // pending. The queued clear then runs after this write, leaving local
+      // storage cleared rather than resurrecting the session.
+      if (
+        expected &&
+        (this.session !== expected.session ||
+          this.sessionGeneration !== expected.generation)
+      ) {
+        throw new RuntimeError(
+          "AUTH_REQUIRED",
+          "The Copyyt session changed before token refresh completed",
+        );
+      }
+      this.session = session;
+      this.serverDeviceState = "unknown";
+      this.setStatus({
+        ...DEFAULT_STATUS,
+        connectionState: "account-authenticated",
+        signedIn: true,
+        user: userFromSession(session),
+        syncPreferences: { ...this.status.syncPreferences },
+      });
     });
     await this.ensureRecoveryAlarm();
   }
 
+  private enqueueSessionMutation(
+    mutation: () => Promise<void>,
+  ): Promise<void> {
+    const operation = this.sessionMutationInFlight.then(mutation, mutation);
+    this.sessionMutationInFlight = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
   private async logout(): Promise<void> {
-    // Stop live clipboard observation as soon as local logout begins, before
-    // waiting on the best-effort server logout request.
+    // Stop live clipboard observation as soon as local logout begins. The
+    // backend request is deliberately fire-and-forget so an unavailable
+    // backend cannot delay clearing the durable local credentials.
     this.destroySocket(this.socket);
     if (this.session) {
+      const session = this.session;
+      const refreshToken = isRuntimeSessionV2(this.session)
+        ? this.session.refreshToken
+        : undefined;
       try {
-        await this.dependencies
-          .apiFactory(this.session.accessToken)
-          .auth.logout();
+        void Promise.resolve(
+          this.dependencies
+            .apiFactory(session.accessToken)
+            .auth.logout(refreshToken),
+        ).catch(() => undefined);
       } catch {
-        // Local logout still completes if the server is unavailable.
+        // Local logout still completes if constructing the request fails.
       }
     }
     await this.clearSession();
   }
 
   private async clearSession(): Promise<void> {
+    this.sessionGeneration += 1;
+    this.session = null;
     this.destroySocket(this.socket);
     this.pendingConnectivityIntent = null;
-    this.session = null;
     this.serverDeviceState = "unknown";
-    await this.dependencies.sessionStore.clear();
+    await this.enqueueSessionMutation(() =>
+      this.dependencies.sessionStore.clear(),
+    );
     this.setStatus({
       ...DEFAULT_STATUS,
       connectionState: "signed-out",

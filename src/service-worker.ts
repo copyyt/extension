@@ -6,6 +6,7 @@ import { IndexedDBOutboundItemStore, IndexedDBProcessedItemStore } from "./runti
 import {
   ChromeSessionStore,
   ChromeStatusStore,
+  restrictLocalStorageToTrustedContexts,
 } from "./runtime/session-store.ts";
 import { ChromeSyncPreferencesStore } from "./runtime/sync-preferences.ts";
 import {
@@ -54,7 +55,9 @@ if (import.meta.env.DEV) {
   console.info("COPYyt service worker starting");
 }
 
-const runtimeReady = runtime.start().then(
+const runtimeReady = restrictLocalStorageToTrustedContexts().then(() =>
+  runtime.start(),
+).then(
   () => {
     if (import.meta.env.DEV) {
       console.info("COPYyt service worker ready");

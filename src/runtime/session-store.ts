@@ -3,16 +3,48 @@ import type { IUser } from "../interfaces/user.interface.ts";
 export const SESSION_STORAGE_KEY = "copyyt.runtime.session";
 export const STATUS_STORAGE_KEY = "copyyt.runtime.status";
 
-export interface RuntimeSession {
+export interface RuntimeSessionV1 {
   schemaVersion: 1;
   accessToken: string;
   user: IUser;
+}
+
+export interface RuntimeSessionV2 {
+  schemaVersion: 2;
+  accessToken: string;
+  refreshToken: string;
+  user: IUser;
+}
+
+/**
+ * A v1 session is intentionally still a valid runtime session. It represents
+ * a legacy installation whose refresh token was never persisted and is
+ * therefore eligible for cookie-based migration when the access token needs
+ * renewal.
+ */
+export type RuntimeSession = RuntimeSessionV1 | RuntimeSessionV2;
+
+export type RuntimeSessionMigrationState = "v1-pending" | "v2";
+
+export function isRuntimeSessionV2(
+  session: RuntimeSession,
+): session is RuntimeSessionV2 {
+  return session.schemaVersion === 2;
+}
+
+export function runtimeSessionMigrationState(
+  session: RuntimeSession,
+): RuntimeSessionMigrationState {
+  return isRuntimeSessionV2(session) ? "v2" : "v1-pending";
 }
 
 export interface KeyValueStorageArea {
   get(keys?: string | string[] | Record<string, unknown>): Promise<Record<string, unknown>>;
   set(items: Record<string, unknown>): Promise<void>;
   remove(keys: string | string[]): Promise<void>;
+  setAccessLevel?(details: {
+    accessLevel: "TRUSTED_CONTEXTS" | "TRUSTED_AND_UNTRUSTED_CONTEXTS";
+  }): Promise<void> | void;
 }
 
 function storageArea(): KeyValueStorageArea {
@@ -42,13 +74,45 @@ function isSession(value: unknown): value is RuntimeSession {
   if (!value || typeof value !== "object") {
     return false;
   }
-  const candidate = value as Partial<RuntimeSession>;
+  const candidate = value as {
+    schemaVersion?: unknown;
+    accessToken?: unknown;
+    refreshToken?: unknown;
+    user?: unknown;
+  };
+  if (
+    typeof candidate.accessToken !== "string" ||
+    candidate.accessToken.length === 0 ||
+    !isUser(candidate.user)
+  ) {
+    return false;
+  }
+  if (candidate.schemaVersion === 1) return true;
   return (
-    candidate.schemaVersion === 1 &&
-    typeof candidate.accessToken === "string" &&
-    candidate.accessToken.length > 0 &&
-    isUser(candidate.user)
+    candidate.schemaVersion === 2 &&
+    typeof candidate.refreshToken === "string" &&
+    candidate.refreshToken.length > 0
   );
+}
+
+/**
+ * Chrome 137 added trusted-context storage access for extension storage.
+ * Older Chromium implementations simply do not expose this method, so the
+ * extension keeps working there while newer versions keep local credentials
+ * out of untrusted/content-script contexts.
+ */
+export async function restrictLocalStorageToTrustedContexts(): Promise<void> {
+  const extensionChrome = globalThis.chrome as typeof chrome | undefined;
+  const local = extensionChrome?.storage?.local as
+    | KeyValueStorageArea
+    | undefined;
+  if (!local?.setAccessLevel) return;
+  try {
+    await local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
+  } catch {
+    // This is a defense-in-depth capability. Storage remains usable when a
+    // browser exposes the method but rejects it for an incompatible context.
+  }
 }
 
 export interface SessionStore {

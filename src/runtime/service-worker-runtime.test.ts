@@ -134,17 +134,56 @@ function response<T>(data: T): AxiosResponse<T> {
   return { data } as AxiosResponse<T>;
 }
 
+function gatedSyncPreferencesStore(): {
+  store: SyncPreferencesStore;
+  setStarted: Promise<void>;
+  releaseSet: () => void;
+  getStored: () => Promise<{
+    schemaVersion: 1;
+    sendEnabled: boolean;
+    receiveEnabled: boolean;
+  }>;
+} {
+  let stored = {
+    schemaVersion: 1 as const,
+    sendEnabled: true,
+    receiveEnabled: true,
+  };
+  let markStarted!: () => void;
+  const setStarted = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  let releaseSet!: () => void;
+  const setGate = new Promise<void>((resolve) => {
+    releaseSet = resolve;
+  });
+  return {
+    store: {
+      get: async () => ({ ...stored }),
+      set: async (preferences) => {
+        markStarted();
+        await setGate;
+        stored = { ...preferences };
+      },
+    },
+    setStarted,
+    releaseSet,
+    getStored: async () => ({ ...stored }),
+  };
+}
+
 function makeRuntime(overrides: Partial<{
   trustStore: ClientTrustStore;
   clipboardAdapter: ClipboardAdapter;
   socket: FakeSocket;
   localTrustState: LocalDeviceRecord["trustState"];
   accessToken: string;
-  refreshTokens: () => Promise<AxiosResponse<SignInResponse>>;
+  refreshTokens: (refreshToken?: string) => Promise<AxiosResponse<SignInResponse>>;
   googleSign: () => Promise<AxiosResponse<SignInResponse>>;
   verifyEmail: () => Promise<AxiosResponse<SignInResponse>>;
   signInPasswordless: () => Promise<AxiosResponse<ILoginResponse>>;
   resendEmailOtp: () => Promise<AxiosResponse<unknown>>;
+  logout: (refreshToken?: string) => Promise<AxiosResponse<unknown>>;
   initialSession: RuntimeSession | null;
   listDevices: () => Promise<AxiosResponse<unknown>>;
   listPendingDevices: () => Promise<AxiosResponse<unknown>>;
@@ -206,7 +245,7 @@ function makeRuntime(overrides: Partial<{
       googleSign: overrides.googleSign ?? (async () => { throw new Error("not used"); }),
       verifyEmail: overrides.verifyEmail ?? (async () => { throw new Error("not used"); }),
       refreshTokens: overrides.refreshTokens ?? (async () => { throw new Error("not used"); }),
-      logout: async () => response(undefined),
+      logout: overrides.logout ?? (async () => response(undefined)),
       resendEmailOtp: overrides.resendEmailOtp ?? (async () => response(undefined)),
     },
     devices: {
@@ -547,6 +586,63 @@ test("malformed preference commands fail closed", async () => {
     sendEnabled: true,
     receiveEnabled: true,
   });
+});
+
+test("Send disable becomes a barrier before its storage write completes", async () => {
+  const preferences = gatedSyncPreferencesStore();
+  let releaseEncryption!: () => void;
+  let markEncryptionStarted!: () => void;
+  const encryptionStarted = new Promise<void>((resolve) => {
+    markEncryptionStarted = resolve;
+  });
+  const encryptionGate = new Promise<void>((resolve) => {
+    releaseEncryption = resolve;
+  });
+  const setup = await startReady({
+    syncPreferencesStore: preferences.store,
+    encrypt: async (input) => {
+      markEncryptionStarted();
+      await encryptionGate;
+      return {
+        itemId: "pending-storage-send-item",
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+
+  const publish = setup.runtime.publishClipboardText("old clipboard value");
+  await encryptionStarted;
+  const disabling = setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: false,
+      receiveEnabled: true,
+    }),
+  );
+  await preferences.setStarted;
+  assert.equal(setup.runtime.getStatus().syncPreferences.sendEnabled, false);
+
+  releaseEncryption();
+  await assert.rejects(
+    publish,
+    (error: unknown) =>
+      error instanceof RuntimeError && error.code === "CLIPBOARD_SEND_DISABLED",
+  );
+  assert.equal(
+    setup.socket.emissions.some((item) => item.event === "clipboard:publish"),
+    false,
+  );
+  preferences.releaseSet();
+  assert.equal((await disabling).ok, true);
+  assert.equal((await preferences.getStored()).sendEnabled, false);
 });
 
 test("popup status fallback treats a legacy status without syncPreferences as Both", () => {
@@ -901,6 +997,53 @@ test("an in-flight receive is consumed when receive is disabled before clipboard
   );
 });
 
+test("Receive disable becomes a barrier before its storage write completes", async () => {
+  const preferences = gatedSyncPreferencesStore();
+  let releaseDecryption!: () => void;
+  let markDecryptionStarted!: () => void;
+  const decryptionStarted = new Promise<void>((resolve) => {
+    markDecryptionStarted = resolve;
+  });
+  const decryptionGate = new Promise<void>((resolve) => {
+    releaseDecryption = resolve;
+  });
+  let writes = 0;
+  const setup = await startReady({
+    syncPreferencesStore: preferences.store,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async () => {
+        writes += 1;
+      },
+    },
+    decrypt: async () => {
+      markDecryptionStarted();
+      await decryptionGate;
+      return { plaintext: "old inbound value", plaintextBytes: new Uint8Array() };
+    },
+  });
+
+  const receive = setup.runtime.receiveClipboardItem(
+    inboundEnvelope("pending-storage-receive-item"),
+  );
+  await decryptionStarted;
+  const disabling = setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: true,
+      receiveEnabled: false,
+    }),
+  );
+  await preferences.setStarted;
+  assert.equal(setup.runtime.getStatus().syncPreferences.receiveEnabled, false);
+
+  releaseDecryption();
+  await receive;
+  assert.equal(writes, 0);
+  preferences.releaseSet();
+  assert.equal((await disabling).ok, true);
+});
+
 test("an in-flight receive is not revived by Both after receive briefly turns Off", async () => {
   let releaseDecryption!: () => void;
   let markDecryptionStarted!: () => void;
@@ -1156,8 +1299,9 @@ test("Google authentication saves its response as the normal runtime session", a
 
   assert.equal(result.ok, true);
   assert.deepEqual(await setup.sessionStore.get(), {
-    schemaVersion: 1,
+    schemaVersion: 2,
     accessToken: "google-access-token",
+    refreshToken: "google-refresh-token",
     user,
   });
   assert.equal(setup.runtime.getStatus().signedIn, true);
@@ -1185,8 +1329,110 @@ test("OTP verification saves its response as the normal runtime session", async 
   );
 
   assert.equal(result.ok, true);
-  assert.equal((await setup.sessionStore.get())?.accessToken, "otp-access-token");
+  assert.deepEqual(await setup.sessionStore.get(), {
+    schemaVersion: 2,
+    accessToken: "otp-access-token",
+    refreshToken: "otp-refresh-token",
+    user,
+  });
   assert.equal(setup.runtime.getStatus().signedIn, true);
+});
+
+test("refresh rotates and durably replaces the v2 refresh credential", async () => {
+  const refreshArguments: Array<string | undefined> = [];
+  const setup = makeRuntime({
+    initialSession: {
+      schemaVersion: 2,
+      accessToken: "old-access-token",
+      refreshToken: "old-refresh-token",
+      user,
+    },
+    refreshTokens: async (refreshToken) => {
+      refreshArguments.push(refreshToken);
+      return response(refreshedSession("new-access-token", "new-refresh-token"));
+    },
+  });
+
+  await setup.runtime.start();
+  const result = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:auth-refresh" }),
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(refreshArguments, ["old-refresh-token"]);
+  assert.deepEqual(await setup.sessionStore.get(), {
+    schemaVersion: 2,
+    accessToken: "new-access-token",
+    refreshToken: "new-refresh-token",
+    user,
+  });
+});
+
+test("concurrent refresh demand uses one old token and shares the persisted replacement", async () => {
+  const refreshArguments: Array<string | undefined> = [];
+  let releaseRefresh!: () => void;
+  const refreshGate = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const setup = makeRuntime({
+    initialSession: {
+      schemaVersion: 2,
+      accessToken: "old-access-token",
+      refreshToken: "old-refresh-token",
+      user,
+    },
+    refreshTokens: async (refreshToken) => {
+      refreshArguments.push(refreshToken);
+      await refreshGate;
+      return response(refreshedSession("shared-access-token", "shared-refresh-token"));
+    },
+  });
+
+  await setup.runtime.start();
+  const first = setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:auth-refresh" }),
+  );
+  const second = setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:auth-refresh" }),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(refreshArguments, ["old-refresh-token"]);
+
+  releaseRefresh();
+  const results = await Promise.all([first, second]);
+  assert.deepEqual(results.map((result) => result.ok), [true, true]);
+  assert.deepEqual(await setup.sessionStore.get(), {
+    schemaVersion: 2,
+    accessToken: "shared-access-token",
+    refreshToken: "shared-refresh-token",
+    user,
+  });
+});
+
+test("runtime logout sends the v2 refresh token and always clears local session", async () => {
+  let logoutRefreshToken: string | undefined;
+  const setup = makeRuntime({
+    initialSession: {
+      schemaVersion: 2,
+      accessToken: "access-token",
+      refreshToken: "refresh-token",
+      user,
+    },
+    logout: async (refreshToken) => {
+      logoutRefreshToken = refreshToken;
+      throw new Error("backend unavailable");
+    },
+  });
+
+  await setup.runtime.start();
+  const result = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:logout" }),
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(logoutRefreshToken, "refresh-token");
+  assert.equal(await setup.sessionStore.get(), null);
+  assert.equal(setup.runtime.getStatus().signedIn, false);
 });
 
 async function startReady(overrides: Parameters<typeof makeRuntime>[0] = {}) {
@@ -1273,8 +1519,8 @@ function jwtWithExpiry(exp: number): string {
   return `eyJhbGciOiJub25lIn0.${payload}.unsigned`;
 }
 
-function refreshedSession(token: string): SignInResponse {
-  return { message: "refreshed", accessToken: token, refreshToken: "refresh", user };
+function refreshedSession(token: string, refreshToken = "refresh"): SignInResponse {
+  return { message: "refreshed", accessToken: token, refreshToken, user };
 }
 
 test("normal signed-out startup does not attempt refresh or produce an auth error", async () => {
@@ -1297,17 +1543,26 @@ test("normal signed-out startup does not attempt refresh or produce an auth erro
 
 test("an expired persisted token is refreshed before the first socket", async () => {
   const newToken = "fresh-access-token";
+  let refreshArgument: string | undefined;
   let refreshCalls = 0;
   const setup = makeRuntime({
     accessToken: jwtWithExpiry(Math.floor(Date.now() / 1000) - 10),
-    refreshTokens: async () => {
+    refreshTokens: async (refreshToken) => {
       refreshCalls += 1;
+      refreshArgument = refreshToken;
       return response(refreshedSession(newToken));
     },
   });
   await setup.runtime.start();
   assert.equal(refreshCalls, 1);
+  assert.equal(refreshArgument, undefined);
   assert.deepEqual(setup.getSocketOptions()?.auth, { token: newToken });
+  assert.deepEqual(await setup.sessionStore.get(), {
+    schemaVersion: 2,
+    accessToken: newToken,
+    refreshToken: "refresh",
+    user,
+  });
 });
 
 test("socket auth failure recreates the socket with a refreshed token", async () => {
@@ -1378,6 +1633,49 @@ test("transient refresh failure retains the local session while definitive rejec
   definitive.socket.trigger("auth:failure");
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(await definitive.sessionStore.get(), null);
+});
+
+test("arbitrary refresh 4xx responses retain the durable session", async () => {
+  for (const status of [400, 404, 408, 409, 425, 429, 500]) {
+    const setup = makeRuntime({
+      refreshTokens: async () => {
+        throw { response: { status } };
+      },
+    });
+    await setup.runtime.start();
+    setup.socket.trigger("auth:failure");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(await setup.sessionStore.get(), `session retained for HTTP ${status}`);
+  }
+});
+
+test("refresh_token_not_found reports recovery without erasing the v2 session", async () => {
+  const setup = makeRuntime({
+    initialSession: {
+      schemaVersion: 2,
+      accessToken: "access-token",
+      refreshToken: "refresh-token",
+      user,
+    },
+    refreshTokens: async () => {
+      throw {
+        response: {
+          status: 400,
+          data: { message: "refresh_token_not_found" },
+        },
+      };
+    },
+  });
+
+  await setup.runtime.start();
+  const result = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:auth-refresh" }),
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "AUTH_REQUIRED");
+  assert.match(result.error?.message ?? "", /durable refresh credential/i);
+  assert.ok(await setup.sessionStore.get());
 });
 
 function makePairingTrustStore(
