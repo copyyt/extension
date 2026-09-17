@@ -8,17 +8,11 @@ import { useUserStore } from "@/hooks/user-store.hook";
 import Logo from "@/vectors/logo";
 import LogoutIcon from "@/vectors/logout";
 import { useState } from "react";
-
-type ClipboardSyncMode = "both" | "send-only" | "receive-only" | "off";
-
-function clipboardSyncMode(status: RuntimeStatus): ClipboardSyncMode {
-  if (status.syncPreferences.sendEnabled && status.syncPreferences.receiveEnabled) {
-    return "both";
-  }
-  if (status.syncPreferences.sendEnabled) return "send-only";
-  if (status.syncPreferences.receiveEnabled) return "receive-only";
-  return "off";
-}
+import {
+  clipboardSyncMode,
+  syncPreferencesForStatus,
+  type ClipboardSyncMode,
+} from "./sync-preferences";
 
 function statusLabel(status: RuntimeStatus): string {
   switch (status.connectionState) {
@@ -153,7 +147,8 @@ function Home() {
   const localDeviceTrusted =
     status?.device.trustState === "root" || status?.device.trustState === "verified";
   const pairing = status?.onboarding?.pairing;
-  const selectedSyncMode = status ? clipboardSyncMode(status) : "both";
+  const syncPreferences = syncPreferencesForStatus(status);
+  const selectedSyncMode = clipboardSyncMode(syncPreferences);
   const syncModes: Array<{ mode: ClipboardSyncMode; label: string }> = [
     { mode: "both", label: "Both" },
     { mode: "send-only", label: "Send only" },
@@ -305,7 +300,7 @@ function Home() {
           sending ||
           !status?.signedIn ||
           !localDeviceTrusted ||
-          !status.syncPreferences.sendEnabled
+          !syncPreferences.sendEnabled
         }
       >
         {sending ? "Encrypting and sending…" : "Send current clipboard"}

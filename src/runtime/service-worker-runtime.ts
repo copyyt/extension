@@ -543,6 +543,8 @@ export class CopyytServiceWorkerRuntime {
   private readonly signApproval: typeof signDeviceApproval;
   private readonly now: () => Date;
   private status: RuntimeStatus = DEFAULT_STATUS;
+  private sendPolicyRevision = 0;
+  private receivePolicyRevision = 0;
   private session: RuntimeSession | null = null;
   private socket: SocketLike | null = null;
   private socketAccountId: string | null = null;
@@ -1211,12 +1213,8 @@ export class CopyytServiceWorkerRuntime {
   }
 
   async publishClipboardText(text: string): Promise<{ itemId: string }> {
-    if (!this.status.syncPreferences.sendEnabled) {
-      throw new RuntimeError(
-        "CLIPBOARD_SEND_DISABLED",
-        "Clipboard sending is disabled for this device",
-      );
-    }
+    const sendPolicyRevision = this.sendPolicyRevision;
+    this.requireSendPolicy(sendPolicyRevision);
     if (!isClipboardText(text)) {
       throw new RuntimeError(
         "CLIPBOARD_READ_FAILED",
@@ -1304,6 +1302,7 @@ export class CopyytServiceWorkerRuntime {
         "Clipboard encryption failed",
       );
     }
+    this.requireSendPolicy(sendPolicyRevision);
     // Record before emitting so a synchronous self-echo cannot rewrite the
     // clipboard, and so the decision survives a worker restart.
     await this.dependencies.outboundItemStore.mark({
@@ -1312,6 +1311,7 @@ export class CopyytServiceWorkerRuntime {
       publishedAt: this.now().toISOString(),
       sourceDeviceId: envelope.sourceDeviceId,
     });
+    this.requireSendPolicy(sendPolicyRevision);
     await this.emitPublish(envelope);
     return { itemId: envelope.itemId };
   }
@@ -1329,6 +1329,7 @@ export class CopyytServiceWorkerRuntime {
     const session = this.session;
     const key = `${session.user.id}:${envelope.itemId}`;
     if (this.inboundInFlight.has(key)) return;
+    const receivePolicyRevision = this.receivePolicyRevision;
     if (
       await this.dependencies.processedItemStore.has(
         session.user.id,
@@ -1358,10 +1359,11 @@ export class CopyytServiceWorkerRuntime {
         return;
       }
 
-      if (!this.status.syncPreferences.receiveEnabled) {
+      if (!this.isReceivePolicyCurrent(receivePolicyRevision)) {
         // Receive-disabled is a deliberate local policy decision. The
-        // envelope is consumed before decryption and is never replayed after
-        // the preference changes.
+        // envelope is consumed before decryption, including when receive was
+        // disabled while the item was waiting on metadata, and is never
+        // replayed after the preference changes.
         await this.dependencies.processedItemStore.mark({
           userId: session.user.id,
           itemId: envelope.itemId,
@@ -1395,6 +1397,16 @@ export class CopyytServiceWorkerRuntime {
       }
       const selfEcho =
         locallyPublished && envelope.sourceDeviceId === identity.deviceId;
+      if (!this.isReceivePolicyCurrent(receivePolicyRevision)) {
+        await this.dependencies.processedItemStore.mark({
+          userId: session.user.id,
+          itemId: envelope.itemId,
+          processedAt: this.now().toISOString(),
+          sourceDeviceId: envelope.sourceDeviceId,
+          disposition: "receive-disabled",
+        });
+        return;
+      }
       let decrypted: { plaintext: string; plaintextBytes: Uint8Array };
       try {
         decrypted = await this.decrypt({
@@ -1404,10 +1416,33 @@ export class CopyytServiceWorkerRuntime {
           trustStore: this.dependencies.trustStore,
         });
       } catch {
+        if (!this.isReceivePolicyCurrent(receivePolicyRevision)) {
+          await this.dependencies.processedItemStore.mark({
+            userId: session.user.id,
+            itemId: envelope.itemId,
+            processedAt: this.now().toISOString(),
+            sourceDeviceId: envelope.sourceDeviceId,
+            disposition: "receive-disabled",
+          });
+          return;
+        }
         throw new RuntimeError(
           "DECRYPTION_FAILED",
           "Clipboard decryption or verification failed",
         );
+      }
+      if (!this.isReceivePolicyCurrent(receivePolicyRevision)) {
+        // A receive-mode transition while decrypting invalidates this item.
+        // Consume it without allowing the old plaintext to cross the new
+        // policy boundary or replay after receive is enabled again.
+        await this.dependencies.processedItemStore.mark({
+          userId: session.user.id,
+          itemId: envelope.itemId,
+          processedAt: this.now().toISOString(),
+          sourceDeviceId: envelope.sourceDeviceId,
+          disposition: "receive-disabled",
+        });
+        return;
       }
       if (selfEcho) {
         await this.dependencies.processedItemStore.mark({
@@ -1416,6 +1451,16 @@ export class CopyytServiceWorkerRuntime {
           processedAt: this.now().toISOString(),
           sourceDeviceId: envelope.sourceDeviceId,
           disposition: "self-echo",
+        });
+        return;
+      }
+      if (!this.isReceivePolicyCurrent(receivePolicyRevision)) {
+        await this.dependencies.processedItemStore.mark({
+          userId: session.user.id,
+          itemId: envelope.itemId,
+          processedAt: this.now().toISOString(),
+          sourceDeviceId: envelope.sourceDeviceId,
+          disposition: "receive-disabled",
         });
         return;
       }
@@ -1590,6 +1635,13 @@ export class CopyytServiceWorkerRuntime {
     }
     await this.dependencies.syncPreferencesStore.set({ ...preferences });
 
+    if (previous.sendEnabled !== preferences.sendEnabled) {
+      this.sendPolicyRevision += 1;
+    }
+    if (previous.receiveEnabled !== preferences.receiveEnabled) {
+      this.receivePolicyRevision += 1;
+    }
+
     if (!previous.sendEnabled && preferences.sendEnabled) {
       this.clipboardWatchResetRequested = true;
       this.pendingAutoObservation = null;
@@ -1600,6 +1652,25 @@ export class CopyytServiceWorkerRuntime {
       ...(preferences.sendEnabled ? {} : { clipboardWatch: "stopped" }),
     });
     return this.getStatus();
+  }
+
+  private requireSendPolicy(revision: number): void {
+    if (
+      !this.status.syncPreferences.sendEnabled ||
+      revision !== this.sendPolicyRevision
+    ) {
+      throw new RuntimeError(
+        "CLIPBOARD_SEND_DISABLED",
+        "Clipboard sending is disabled for this device",
+      );
+    }
+  }
+
+  private isReceivePolicyCurrent(revision: number): boolean {
+    return (
+      this.status.syncPreferences.receiveEnabled &&
+      revision === this.receivePolicyRevision
+    );
   }
 
   private async authenticate(

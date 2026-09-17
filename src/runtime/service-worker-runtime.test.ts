@@ -11,7 +11,11 @@ import type { ClipboardAdapter } from "./clipboard-adapter.ts";
 import type { ClipboardWatcherOptions } from "./clipboard-watcher.ts";
 import { createRuntimeMessageListener } from "./service-worker-bootstrap.ts";
 import { createOffscreenClipboardWatcher } from "./offscreen-watcher.ts";
-import { InMemoryItemMetadataStore } from "./runtime-db.ts";
+import {
+  InMemoryItemMetadataStore,
+  type ProcessedItemRecord,
+  type ProcessedItemStore,
+} from "./runtime-db.ts";
 import type { RuntimeSession, SessionStore, StatusStore } from "./session-store.ts";
 import {
   CopyytServiceWorkerRuntime,
@@ -26,6 +30,10 @@ import {
   InMemorySyncPreferencesStore,
   type SyncPreferencesStore,
 } from "./sync-preferences.ts";
+import {
+  clipboardSyncMode,
+  syncPreferencesForStatus,
+} from "../views/home/sync-preferences.ts";
 
 const user: IUser = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -77,6 +85,21 @@ class MemoryStatusStore implements StatusStore<RuntimeStatus> {
   status: RuntimeStatus | null = null;
   async get(): Promise<RuntimeStatus | null> { return this.status; }
   async set(status: RuntimeStatus): Promise<void> { this.status = status; }
+}
+
+class RecordingProcessedItemStore implements ProcessedItemStore {
+  readonly records = new Map<string, ProcessedItemRecord>();
+
+  async has(userId: string, itemId: string): Promise<boolean> {
+    return this.records.has(`${userId}:${itemId}`);
+  }
+
+  async mark(record: Omit<ProcessedItemRecord, "key">): Promise<void> {
+    this.records.set(`${record.userId}:${record.itemId}`, {
+      ...record,
+      key: `${record.userId}:${record.itemId}`,
+    });
+  }
 }
 
 class FakeSocket implements SocketLike {
@@ -240,6 +263,7 @@ function makeRuntime(overrides: Partial<{
     clipboardAdapter,
     syncPreferencesStore,
     processedItemStore,
+    outboundItemStore,
     getSocketOptions: () => socketOptions,
   };
 }
@@ -525,6 +549,129 @@ test("malformed preference commands fail closed", async () => {
   });
 });
 
+test("popup status fallback treats a legacy status without syncPreferences as Both", () => {
+  const legacyStatus = {} as { syncPreferences?: RuntimeStatus["syncPreferences"] };
+  const preferences = syncPreferencesForStatus(legacyStatus);
+
+  assert.deepEqual(preferences, {
+    schemaVersion: 1,
+    sendEnabled: true,
+    receiveEnabled: true,
+  });
+  assert.equal(clipboardSyncMode(preferences), "both");
+});
+
+test("an in-flight publish is canceled after Send is disabled before emission", async () => {
+  let releaseEncryption!: () => void;
+  let markEncryptionStarted!: () => void;
+  const encryptionStarted = new Promise<void>((resolve) => {
+    markEncryptionStarted = resolve;
+  });
+  const encryptionGate = new Promise<void>((resolve) => {
+    releaseEncryption = resolve;
+  });
+  const setup = await startReady({
+    encrypt: async (input) => {
+      markEncryptionStarted();
+      await encryptionGate;
+      return {
+        itemId: "send-boundary-item",
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+
+  const publish = setup.runtime.publishClipboardText("old clipboard value");
+  await encryptionStarted;
+  const disabled = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: false,
+      receiveEnabled: true,
+    }),
+  );
+  assert.equal(disabled.ok, true);
+  releaseEncryption();
+
+  await assert.rejects(
+    publish,
+    (error: unknown) =>
+      error instanceof RuntimeError && error.code === "CLIPBOARD_SEND_DISABLED",
+  );
+  assert.equal(
+    setup.socket.emissions.filter((item) => item.event === "clipboard:publish").length,
+    0,
+  );
+  assert.equal(
+    await setup.outboundItemStore.has(user.id, "send-boundary-item"),
+    false,
+  );
+});
+
+test("an in-flight publish is not revived by Both after Send briefly turns Off", async () => {
+  let releaseEncryption!: () => void;
+  let markEncryptionStarted!: () => void;
+  const encryptionStarted = new Promise<void>((resolve) => {
+    markEncryptionStarted = resolve;
+  });
+  const encryptionGate = new Promise<void>((resolve) => {
+    releaseEncryption = resolve;
+  });
+  const setup = await startReady({
+    encrypt: async (input) => {
+      markEncryptionStarted();
+      await encryptionGate;
+      return {
+        itemId: "send-revision-boundary-item",
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+
+  const publish = setup.runtime.publishClipboardText("pre-Off clipboard value");
+  await encryptionStarted;
+  for (const preferences of [
+    { sendEnabled: false, receiveEnabled: false },
+    { sendEnabled: true, receiveEnabled: true },
+  ] as const) {
+    const result = await setup.runtime.handleMessage(
+      runtimeMessage({ type: "runtime:set-sync-preferences", ...preferences }),
+    );
+    assert.equal(result.ok, true);
+  }
+  releaseEncryption();
+
+  await assert.rejects(
+    publish,
+    (error: unknown) =>
+      error instanceof RuntimeError && error.code === "CLIPBOARD_SEND_DISABLED",
+  );
+  assert.equal(
+    setup.socket.emissions.filter((item) => item.event === "clipboard:publish").length,
+    0,
+  );
+  assert.equal(
+    await setup.outboundItemStore.has(user.id, "send-revision-boundary-item"),
+    false,
+  );
+});
+
 test("send disabled stops the watcher, drops pending auto work, and rejects manual Send", async () => {
   const watchCalls: Array<{ type: "start" | "stop"; resetBaseline?: boolean }> = [];
   let releasePublish!: () => void;
@@ -705,6 +852,101 @@ test("receive disabled consumes an item without decrypting and never replays it"
   await setup.runtime.receiveClipboardItem(envelope);
   assert.equal(writes, 0);
   assert.equal(decryptions, 0);
+});
+
+test("an in-flight receive is consumed when receive is disabled before clipboard write", async () => {
+  let releaseDecryption!: () => void;
+  let markDecryptionStarted!: () => void;
+  const decryptionStarted = new Promise<void>((resolve) => {
+    markDecryptionStarted = resolve;
+  });
+  const decryptionGate = new Promise<void>((resolve) => {
+    releaseDecryption = resolve;
+  });
+  let writes = 0;
+  const processedItemStore = new RecordingProcessedItemStore();
+  const setup = await startReady({
+    processedItemStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async () => {
+        writes += 1;
+      },
+    },
+    decrypt: async () => {
+      markDecryptionStarted();
+      await decryptionGate;
+      return { plaintext: "old inbound value", plaintextBytes: new Uint8Array() };
+    },
+  });
+
+  const envelope = inboundEnvelope("receive-boundary-item");
+  const receive = setup.runtime.receiveClipboardItem(envelope);
+  await decryptionStarted;
+  const disabled = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: true,
+      receiveEnabled: false,
+    }),
+  );
+  assert.equal(disabled.ok, true);
+  releaseDecryption();
+  await receive;
+
+  assert.equal(writes, 0);
+  assert.equal(
+    processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition,
+    "receive-disabled",
+  );
+});
+
+test("an in-flight receive is not revived by Both after receive briefly turns Off", async () => {
+  let releaseDecryption!: () => void;
+  let markDecryptionStarted!: () => void;
+  const decryptionStarted = new Promise<void>((resolve) => {
+    markDecryptionStarted = resolve;
+  });
+  const decryptionGate = new Promise<void>((resolve) => {
+    releaseDecryption = resolve;
+  });
+  let writes = 0;
+  const processedItemStore = new RecordingProcessedItemStore();
+  const setup = await startReady({
+    processedItemStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async () => {
+        writes += 1;
+      },
+    },
+    decrypt: async () => {
+      markDecryptionStarted();
+      await decryptionGate;
+      return { plaintext: "pre-Off inbound value", plaintextBytes: new Uint8Array() };
+    },
+  });
+
+  const envelope = inboundEnvelope("receive-revision-boundary-item");
+  const receive = setup.runtime.receiveClipboardItem(envelope);
+  await decryptionStarted;
+  for (const preferences of [
+    { sendEnabled: false, receiveEnabled: false },
+    { sendEnabled: true, receiveEnabled: true },
+  ] as const) {
+    const result = await setup.runtime.handleMessage(
+      runtimeMessage({ type: "runtime:set-sync-preferences", ...preferences }),
+    );
+    assert.equal(result.ok, true);
+  }
+  releaseDecryption();
+  await receive;
+
+  assert.equal(writes, 0);
+  assert.equal(
+    processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition,
+    "receive-disabled",
+  );
 });
 
 test("Receive only never starts the watcher and Off keeps the socket ready", async () => {
