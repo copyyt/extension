@@ -5,7 +5,7 @@ import type { DeviceIdentity } from "../crypto/key-store.ts";
 import type { RegisteredDeviceResponse } from "../crypto/device-registration.ts";
 import type { ClientTrustStore, ClientVerifiedDevice, LocalDeviceRecord } from "../crypto/trust-store.ts";
 import type { IUser } from "../interfaces/user.interface.ts";
-import type { SignInResponse } from "../interfaces/auth.interface.ts";
+import type { ILoginResponse, SignInResponse } from "../interfaces/auth.interface.ts";
 import { RuntimeError } from "./errors.ts";
 import type { ClipboardAdapter } from "./clipboard-adapter.ts";
 import { InMemoryItemMetadataStore } from "./runtime-db.ts";
@@ -25,7 +25,7 @@ const user: IUser = {
   name: "Test User",
   email: "test@example.com",
   emailVerified: true,
-  authId: "auth-id",
+  googleSubject: "google-subject",
 };
 const identity = {
   userId: user.id,
@@ -101,6 +101,11 @@ function makeRuntime(overrides: Partial<{
   localTrustState: LocalDeviceRecord["trustState"];
   accessToken: string;
   refreshTokens: () => Promise<AxiosResponse<SignInResponse>>;
+  googleSign: () => Promise<AxiosResponse<SignInResponse>>;
+  verifyEmail: () => Promise<AxiosResponse<SignInResponse>>;
+  signInPasswordless: () => Promise<AxiosResponse<ILoginResponse>>;
+  resendEmailOtp: () => Promise<AxiosResponse<unknown>>;
+  initialSession: RuntimeSession | null;
   listDevices: () => Promise<AxiosResponse<unknown>>;
   listPendingDevices: () => Promise<AxiosResponse<unknown>>;
   approveDevice: (request: unknown) => Promise<AxiosResponse<unknown>>;
@@ -112,8 +117,10 @@ function makeRuntime(overrides: Partial<{
 }> = {}) {
   const runtimeIdentity = overrides.identity ?? identity;
   const runtimeRegisteredDevice = overrides.registeredDevice ?? registeredDevice;
-  const session: RuntimeSession = { schemaVersion: 1, accessToken: overrides.accessToken ?? "access-token", user };
-  const sessionStore = new MemorySessionStore(session);
+  const initialSession: RuntimeSession | null = overrides.initialSession === undefined
+    ? { schemaVersion: 1, accessToken: overrides.accessToken ?? "access-token", user }
+    : overrides.initialSession;
+  const sessionStore = new MemorySessionStore(initialSession);
   const statusStore = new MemoryStatusStore();
   const socket = overrides.socket ?? new FakeSocket();
   const clipboardAdapter = overrides.clipboardAdapter ?? {
@@ -140,12 +147,12 @@ function makeRuntime(overrides: Partial<{
   } satisfies ClientTrustStore);
   const api = {
     auth: {
-      signInPasswordless: async () => response({ message: "ok", data: { isNew: false } }),
-      googleSign: async () => { throw new Error("not used"); },
-      verifyEmail: async () => { throw new Error("not used"); },
+      signInPasswordless: overrides.signInPasswordless ?? (async () => response({ message: "ok", data: { isNew: false } })),
+      googleSign: overrides.googleSign ?? (async () => { throw new Error("not used"); }),
+      verifyEmail: overrides.verifyEmail ?? (async () => { throw new Error("not used"); }),
       refreshTokens: overrides.refreshTokens ?? (async () => { throw new Error("not used"); }),
       logout: async () => response(undefined),
-      resendEmailOtp: async () => response(undefined),
+      resendEmailOtp: overrides.resendEmailOtp ?? (async () => response(undefined)),
     },
     devices: {
       registerDevice: async () => response(runtimeRegisteredDevice),
@@ -292,6 +299,58 @@ function runtimeMessage(command: RuntimeCommand, requestId = crypto.randomUUID()
     command,
   };
 }
+
+test("Google authentication saves its response as the normal runtime session", async () => {
+  const setup = makeRuntime({
+    initialSession: null,
+    googleSign: async () =>
+      response({
+        message: "Google Auth Successful",
+        accessToken: "google-access-token",
+        refreshToken: "google-refresh-token",
+        user,
+      }),
+  });
+
+  await setup.runtime.start();
+  const result = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:auth-google", googleToken: "google-token" }),
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(await setup.sessionStore.get(), {
+    schemaVersion: 1,
+    accessToken: "google-access-token",
+    user,
+  });
+  assert.equal(setup.runtime.getStatus().signedIn, true);
+});
+
+test("OTP verification saves its response as the normal runtime session", async () => {
+  const setup = makeRuntime({
+    initialSession: null,
+    verifyEmail: async () =>
+      response({
+        message: "Signin Successful",
+        accessToken: "otp-access-token",
+        refreshToken: "otp-refresh-token",
+        user,
+      }),
+  });
+
+  await setup.runtime.start();
+  const result = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:auth-verify-email",
+      email: "test@example.com",
+      code: 123456,
+    }),
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal((await setup.sessionStore.get())?.accessToken, "otp-access-token");
+  assert.equal(setup.runtime.getStatus().signedIn, true);
+});
 
 async function startReady(overrides: Parameters<typeof makeRuntime>[0] = {}) {
   const setup = makeRuntime({ localTrustState: "verified", ...overrides });

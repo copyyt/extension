@@ -39,7 +39,8 @@ function isResponse(value: unknown): value is OffscreenResponse {
 export class OffscreenClipboardAdapter implements ClipboardAdapter {
   constructor(
     private readonly api: RuntimeMessagingApi = chrome,
-    private readonly ensureDocument: () => Promise<void> = () => ensureOffscreenDocument(),
+    private readonly ensureDocument: () => Promise<void> = () =>
+      ensureOffscreenDocument(),
   ) {}
 
   async readText(): Promise<string> {
@@ -47,32 +48,58 @@ export class OffscreenClipboardAdapter implements ClipboardAdapter {
     try {
       response = await this.send({ type: "READ_TEXT" });
     } catch {
-      throw new RuntimeError("CLIPBOARD_READ_FAILED", "The operating-system clipboard could not be read");
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The operating-system clipboard could not be read",
+      );
     }
     if (response.type === "ERROR") {
-      throw new RuntimeError("CLIPBOARD_READ_FAILED", "The operating-system clipboard could not be read");
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        response.error?.message ??
+          "The operating-system clipboard could not be read",
+      );
     }
-    if (response.type !== "READ_TEXT_RESULT" || typeof response.text !== "string") {
-      throw new RuntimeError("CLIPBOARD_READ_FAILED", "The clipboard adapter returned an invalid response");
+    if (
+      response.type !== "READ_TEXT_RESULT" ||
+      typeof response.text !== "string"
+    ) {
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The clipboard adapter returned an invalid response",
+      );
     }
     return response.text;
   }
 
   async writeText(text: string): Promise<void> {
     if (typeof text !== "string") {
-      throw new RuntimeError("CLIPBOARD_WRITE_FAILED", "Clipboard text must be a string");
+      throw new RuntimeError(
+        "CLIPBOARD_WRITE_FAILED",
+        "Clipboard text must be a string",
+      );
     }
     let response: OffscreenResponse;
     try {
       response = await this.send({ type: "WRITE_TEXT", text });
     } catch {
-      throw new RuntimeError("CLIPBOARD_WRITE_FAILED", "The operating-system clipboard could not be written");
+      throw new RuntimeError(
+        "CLIPBOARD_WRITE_FAILED",
+        "The operating-system clipboard could not be written",
+      );
     }
     if (response.type === "ERROR") {
-      throw new RuntimeError("CLIPBOARD_WRITE_FAILED", "The operating-system clipboard could not be written");
+      throw new RuntimeError(
+        "CLIPBOARD_WRITE_FAILED",
+        response.error?.message ??
+          "The operating-system clipboard could not be written",
+      );
     }
     if (response.type !== "WRITE_TEXT_RESULT") {
-      throw new RuntimeError("CLIPBOARD_WRITE_FAILED", "The clipboard adapter returned an invalid response");
+      throw new RuntimeError(
+        "CLIPBOARD_WRITE_FAILED",
+        "The clipboard adapter returned an invalid response",
+      );
     }
   }
 
@@ -81,10 +108,16 @@ export class OffscreenClipboardAdapter implements ClipboardAdapter {
     try {
       response = await this.send({ type: "PING" });
     } catch {
-      throw new RuntimeError("CLIPBOARD_READ_FAILED", "The clipboard adapter did not respond");
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The clipboard adapter did not respond",
+      );
     }
     if (response.type !== "PONG") {
-      throw new RuntimeError("CLIPBOARD_READ_FAILED", "The clipboard adapter returned an invalid response");
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The clipboard adapter returned an invalid response",
+      );
     }
   }
 
@@ -99,16 +132,28 @@ export class OffscreenClipboardAdapter implements ClipboardAdapter {
       ...input,
     };
     if (!isOffscreenRequest(message)) {
-      throw new RuntimeError("CLIPBOARD_READ_FAILED", "The clipboard request is invalid");
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The clipboard request is invalid",
+      );
     }
     let rawResponse: unknown;
     try {
       rawResponse = await this.api.runtime.sendMessage(message);
     } catch {
-      throw new RuntimeError("CLIPBOARD_READ_FAILED", "The clipboard adapter did not respond");
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The clipboard adapter did not respond",
+      );
     }
-    if (!isResponse(rawResponse) || rawResponse.requestId !== message.requestId) {
-      throw new RuntimeError("CLIPBOARD_READ_FAILED", "The clipboard adapter returned an invalid response");
+    if (
+      !isResponse(rawResponse) ||
+      rawResponse.requestId !== message.requestId
+    ) {
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The clipboard adapter returned an invalid response",
+      );
     }
     return rawResponse;
   }

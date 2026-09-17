@@ -30,10 +30,11 @@ function isUser(value: unknown): value is IUser {
   const candidate = value as Partial<IUser>;
   return (
     typeof candidate.id === "string" &&
-    typeof candidate.name === "string" &&
+    (candidate.name === undefined || typeof candidate.name === "string") &&
     typeof candidate.email === "string" &&
     typeof candidate.emailVerified === "boolean" &&
-    typeof candidate.authId === "string"
+    (candidate.googleSubject === undefined ||
+      typeof candidate.googleSubject === "string")
   );
 }
 

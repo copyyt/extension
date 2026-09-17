@@ -8,6 +8,7 @@ import { useViewStore } from "@/hooks/view-store.hook";
 import { APP_TYPE } from "@/utils/constants";
 import GoogleIcon from "@/vectors/google";
 import Logo from "@/vectors/logo";
+import { useToastStore } from "@/hooks/toast-store.hook";
 import { useState } from "react";
 
 const SignIn = () => {
@@ -16,6 +17,7 @@ const SignIn = () => {
   const { email, setEmail } = useEmailStore();
   const { setIsNew } = useIsNewStore();
   const { setCurrentView } = useViewStore();
+  const { setToast } = useToastStore();
 
   const { getToken } = useGoogleAuthWeb();
   const handleGoogleAuth = () => {
@@ -26,7 +28,13 @@ const SignIn = () => {
           signInGoogle.mutate(token);
         })
         .catch((error) => {
-          console.error("Error obtaining Google token:", error);
+          setToast({
+            open: true,
+            text:
+              error instanceof Error && error.message
+                ? error.message
+                : "Google sign-in was cancelled or unavailable.",
+          });
         })
         .finally(() => {
           setLoading(false);
@@ -38,6 +46,11 @@ const SignIn = () => {
       setLoading(false);
       if (token) {
         signInGoogle.mutate(token);
+      } else {
+        setToast({
+          open: true,
+          text: "Google sign-in was cancelled or unavailable.",
+        });
       }
     });
   };

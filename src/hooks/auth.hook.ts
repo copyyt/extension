@@ -9,6 +9,27 @@ import { APP_TYPE } from "@/utils/constants";
 import { sendRuntimeCommand } from "@/runtime/client";
 import type { AuthenticatedRuntimeResult } from "@/runtime/messages";
 
+function authErrorMessage(error: unknown, fallback: string): string {
+  if (isAxiosError(error)) {
+    const payload = error.response?.data as
+      | { message?: unknown }
+      | undefined;
+    const message = payload?.message;
+    if (typeof message === "string" && message.trim()) return message;
+    if (message && typeof message === "object") {
+      const description = (message as { description?: unknown }).description;
+      if (typeof description === "string" && description.trim()) {
+        return description;
+      }
+    }
+  }
+  if (error && typeof error === "object") {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+  }
+  return fallback;
+}
+
 async function runtimeAuth(
   command: Parameters<typeof sendRuntimeCommand>[0],
 ): Promise<AuthenticatedRuntimeResult> {
@@ -19,6 +40,7 @@ export function useGoogleSignIn() {
   const Api = useAxios();
   const { setUser } = useUserStore();
   const { setCurrentView } = useViewStore();
+  const { setToast } = useToastStore();
 
   return useMutation({
     mutationFn: async (token: string) => {
@@ -36,7 +58,10 @@ export function useGoogleSignIn() {
       setCurrentView("home");
     },
     onError: (error) => {
-      console.error(error);
+      setToast({
+        open: true,
+        text: authErrorMessage(error, "Google sign-in failed. Please try again."),
+      });
     },
   });
 }
@@ -44,6 +69,7 @@ export function useGoogleSignIn() {
 export function useRefreshTokens() {
   const Api = useAxios();
   const { setUser } = useUserStore();
+  const { setToast } = useToastStore();
 
   return useMutation({
     mutationFn: async () => {
@@ -60,7 +86,10 @@ export function useRefreshTokens() {
       setUser(data.user);
     },
     onError: (error) => {
-      console.error(error);
+      setToast({
+        open: true,
+        text: authErrorMessage(error, "Your Copyyt session could not be restored."),
+      });
     },
   });
 }
@@ -77,11 +106,13 @@ export function useSignInPasswordless() {
           })
         : Api.auth.signInPasswordless(data).then((response) => response.data),
     onError: (error) => {
-      if (isAxiosError(error)) {
-        setToast({ open: true, text: error?.response?.data.message });
-      }
-
-      console.error(error);
+      setToast({
+        open: true,
+        text: authErrorMessage(
+          error,
+          "We could not send the verification email. Please try again.",
+        ),
+      });
     },
   });
 }
@@ -90,6 +121,7 @@ export function useVerifyEmail() {
   const Api = useAxios();
   const { setUser } = useUserStore();
   const { setCurrentView } = useViewStore();
+  const { setToast } = useToastStore();
 
   return useMutation({
     mutationFn: async (data: IVerifyEmail) => {
@@ -107,7 +139,13 @@ export function useVerifyEmail() {
       setCurrentView("home");
     },
     onError: (error) => {
-      console.error(error);
+      setToast({
+        open: true,
+        text: authErrorMessage(
+          error,
+          "The verification code is invalid or has expired.",
+        ),
+      });
     },
   });
 }
@@ -126,10 +164,13 @@ export function useResendEmaiOtp() {
       setToast({ open: true, text: "OTP sent successfully" });
     },
     onError: (error) => {
-      if (isAxiosError(error)) {
-        setToast({ open: true, text: error?.response?.data.message });
-      }
-      console.error(error);
+      setToast({
+        open: true,
+        text: authErrorMessage(
+          error,
+          "We could not resend the verification email. Please try again.",
+        ),
+      });
     },
   });
 }
@@ -138,6 +179,7 @@ export function useLogout() {
   const Api = useAxios();
   const { clearUser } = useUserStore();
   const { setCurrentView } = useViewStore();
+  const { setToast } = useToastStore();
 
   const { mutate } = useMutation({
     mutationFn: async () => {
@@ -148,7 +190,10 @@ export function useLogout() {
       }
     },
     onError: (error) => {
-      console.error(error);
+      setToast({
+        open: true,
+        text: authErrorMessage(error, "Sign out failed. Please try again."),
+      });
     },
   });
   const logout = () => {
