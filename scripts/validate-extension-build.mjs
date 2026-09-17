@@ -4,6 +4,7 @@ import { parse } from "acorn";
 
 const outputDirectory = path.resolve("build-extension");
 const manifestPath = path.join(outputDirectory, "manifest.json");
+const popupPath = path.join(outputDirectory, "index.html");
 const workerPath = path.join(outputDirectory, "assets/service-worker.js");
 
 async function assertFileExists(filePath, description) {
@@ -100,6 +101,11 @@ for (const reference of collectManifestFileReferences(manifest)) {
     throw new Error(`Manifest file reference escapes the extension output: ${reference}`);
   }
   await assertFileExists(resolvedPath, `Manifest-referenced file ${reference}`);
+}
+
+const popupSource = await readFile(popupPath, "utf8");
+if (/\brel\s*=\s*["']modulepreload["']/iu.test(popupSource)) {
+  throw new Error("build-extension/index.html must not contain rel=\"modulepreload\"");
 }
 
 const workerSource = await readFile(workerPath, "utf8");

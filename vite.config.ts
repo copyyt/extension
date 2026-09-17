@@ -49,6 +49,7 @@ export default defineConfig({
   build: {
     outDir: target === "extension" ? "build-extension" : "build",
     emptyOutDir: !isExtensionWorkerBuild,
+    ...(isExtension ? { modulePreload: false } : {}),
     rollupOptions: {
       input: isPWA || isExtensionWorkerBuild ? extensionInputs : {
         main: "./index.html",
