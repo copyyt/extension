@@ -5,8 +5,12 @@ import { useViewStore } from "@/hooks/view-store.hook";
 import ViewLoader from "@/components/loader";
 import { useRefreshTokens } from "@/hooks/auth.hook";
 import { APP_TYPE } from "@/utils/constants";
-import { getRuntimeStatus } from "@/runtime/client";
 import { useUserStore } from "@/hooks/user-store.hook";
+import { getRuntimeStatus } from "@/runtime/client";
+import {
+  bootstrapExtensionAuth,
+  shouldRefreshWebAuth,
+} from "./auth-bootstrap";
 
 export default function withAuth<T>(Component: React.FC<T>) {
   return function IsAuth(props: T & React.JSX.IntrinsicAttributes) {
@@ -19,20 +23,16 @@ export default function withAuth<T>(Component: React.FC<T>) {
 
     useEffect(() => {
       if (APP_TYPE === "extension") {
-        getRuntimeStatus()
-          .then((status) => {
-            if (status.signedIn && status.user) {
-              setUser(status.user);
+        bootstrapExtensionAuth(getRuntimeStatus)
+          .then((result) => {
+            if (result.authenticated) {
+              setUser(result.user);
               setIsAuthenticated(true);
-            } else {
-              refreshTokens.mutate(undefined, {
-                onSuccess: () => setIsAuthenticated(true),
-                onError: () => {
-                  setIsAuthenticated(false);
-                  setCurrentView("sign-in");
-                },
-              });
+              return;
             }
+
+            setIsAuthenticated(false);
+            setCurrentView(result.view);
           })
           .catch(() => {
             setIsAuthenticated(false);
@@ -40,8 +40,7 @@ export default function withAuth<T>(Component: React.FC<T>) {
           });
         return;
       }
-      const auth = checkJwtExpiry(localStorage.getItem("accessToken")!);
-      if (!auth) {
+      if (shouldRefreshWebAuth(localStorage.getItem("accessToken"), checkJwtExpiry)) {
         refreshTokens.mutate(undefined, {
           onSuccess: () => {
             return setIsAuthenticated(true);
@@ -53,7 +52,7 @@ export default function withAuth<T>(Component: React.FC<T>) {
           },
         });
       } else {
-        setIsAuthenticated(auth);
+        setIsAuthenticated(true);
       }
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
 

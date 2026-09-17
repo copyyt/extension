@@ -508,6 +508,24 @@ function refreshedSession(token: string): SignInResponse {
   return { message: "refreshed", accessToken: token, refreshToken: "refresh", user };
 }
 
+test("normal signed-out startup does not attempt refresh or produce an auth error", async () => {
+  let refreshCalls = 0;
+  const setup = makeRuntime({
+    initialSession: null,
+    refreshTokens: async () => {
+      refreshCalls += 1;
+      return response(refreshedSession("unexpected-token"));
+    },
+  });
+
+  await setup.runtime.start();
+
+  assert.equal(refreshCalls, 0);
+  assert.equal(setup.runtime.getStatus().signedIn, false);
+  assert.equal(setup.runtime.getStatus().user, undefined);
+  assert.equal(setup.runtime.getStatus().lastConnectionError, undefined);
+});
+
 test("an expired persisted token is refreshed before the first socket", async () => {
   const newToken = "fresh-access-token";
   let refreshCalls = 0;
