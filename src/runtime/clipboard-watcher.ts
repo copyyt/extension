@@ -1,10 +1,17 @@
+export type ClipboardTimerId = ReturnType<typeof globalThis.setInterval>;
+export type ClipboardSetInterval = (
+  handler: () => void,
+  ms: number,
+) => ClipboardTimerId;
+export type ClipboardClearInterval = (id: ClipboardTimerId) => void;
+
 export interface ClipboardWatcherOptions {
   readText: () => string | Promise<string>;
   onChanged: (text: string) => void | Promise<void>;
   onError?: (error: unknown) => void;
   intervalMs?: number;
-  setInterval?: typeof globalThis.setInterval;
-  clearInterval?: typeof globalThis.clearInterval;
+  setIntervalFn?: ClipboardSetInterval;
+  clearIntervalFn?: ClipboardClearInterval;
 }
 
 export interface ClipboardWatchStartOptions {
@@ -20,9 +27,9 @@ export class ClipboardWatcher {
   private readonly onChanged: ClipboardWatcherOptions["onChanged"];
   private readonly onError: (error: unknown) => void;
   private readonly intervalMs: number;
-  private readonly setIntervalFn: typeof globalThis.setInterval;
-  private readonly clearIntervalFn: typeof globalThis.clearInterval;
-  private timer: ReturnType<typeof globalThis.setInterval> | null = null;
+  private readonly setIntervalFn: ClipboardSetInterval;
+  private readonly clearIntervalFn: ClipboardClearInterval;
+  private timer: ClipboardTimerId | null = null;
   private running = false;
   private reading = false;
   private generation = 0;
@@ -35,8 +42,12 @@ export class ClipboardWatcher {
     this.onChanged = options.onChanged;
     this.onError = options.onError ?? (() => undefined);
     this.intervalMs = options.intervalMs ?? 800;
-    this.setIntervalFn = options.setInterval ?? globalThis.setInterval;
-    this.clearIntervalFn = options.clearInterval ?? globalThis.clearInterval;
+    this.setIntervalFn =
+      options.setIntervalFn ??
+      ((handler, ms) => globalThis.setInterval(handler, ms));
+    this.clearIntervalFn =
+      options.clearIntervalFn ??
+      ((id) => globalThis.clearInterval(id));
   }
 
   get isWatching(): boolean {
@@ -54,9 +65,9 @@ export class ClipboardWatcher {
     this.running = true;
     const generation = this.generation;
     this.timer = this.setIntervalFn(() => {
-      void this.poll(generation);
+      this.pollSafely(generation);
     }, this.intervalMs);
-    void this.poll(generation);
+    this.pollSafely(generation);
   }
 
   stop(): void {
@@ -105,14 +116,31 @@ export class ClipboardWatcher {
       if (!changed || text.length === 0) return;
 
       try {
-        void Promise.resolve(this.onChanged(text)).catch(this.onError);
+        await this.onChanged(text);
       } catch (error) {
-        this.onError(error);
+        this.handleWatcherError(error);
       }
     } catch (error) {
-      if (this.running && generation === this.generation) this.onError(error);
+      if (this.running && generation === this.generation) {
+        this.handleWatcherError(error);
+      }
     } finally {
       this.reading = false;
+    }
+  }
+
+  private pollSafely(generation: number): void {
+    void this.poll(generation).catch((error) => {
+      this.handleWatcherError(error);
+    });
+  }
+
+  private handleWatcherError(error: unknown): void {
+    try {
+      this.onError(error);
+    } catch {
+      // Error reporting must never turn a timer callback into an unhandled
+      // rejected Promise.
     }
   }
 }

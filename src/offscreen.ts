@@ -4,10 +4,9 @@ import {
   OFFSCREEN_SOURCE,
   RUNTIME_SOURCE,
   type OffscreenRequest,
-  type OffscreenClipboardObservation,
   type OffscreenResponse,
 } from "./runtime/messages.ts";
-import { ClipboardWatcher } from "./runtime/clipboard-watcher.ts";
+import { createOffscreenClipboardWatcher } from "./runtime/offscreen-watcher.ts";
 
 export const CLIPBOARD_WATCH_INTERVAL_MS = 800;
 
@@ -74,20 +73,10 @@ function writeClipboardText(text: string): void {
   }
 }
 
-const clipboardWatcher = new ClipboardWatcher({
+const clipboardWatcher = createOffscreenClipboardWatcher({
   readText: readClipboardText,
   intervalMs: CLIPBOARD_WATCH_INTERVAL_MS,
-  onChanged: (text) => {
-    const observation: OffscreenClipboardObservation = {
-      source: OFFSCREEN_SOURCE,
-      target: RUNTIME_SOURCE,
-      type: "CLIPBOARD_CHANGED",
-      text,
-    };
-    // An observation is intentionally fire-and-forget. The service worker
-    // validates it and waits for its startup promise before handling it.
-    void chrome.runtime.sendMessage(observation).catch(() => undefined);
-  },
+  runtime: chrome.runtime,
   onError: (error) => {
     // Clipboard polling failures are transient and must not expose clipboard
     // content or create extension-error noise.

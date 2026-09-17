@@ -9,9 +9,8 @@ let creationPromise: Promise<void> | null = null;
 
 async function hasOffscreenDocument(api: ChromeOffscreenApi): Promise<boolean> {
   const url = api.runtime.getURL(OFFSCREEN_PATH);
-  const getContexts = api.runtime.getContexts;
-  if (typeof getContexts === "function") {
-    const contexts = await getContexts({
+  if (typeof api.runtime.getContexts === "function") {
+    const contexts = await api.runtime.getContexts({
       contextTypes: ["OFFSCREEN_DOCUMENT" as chrome.runtime.ContextType],
       documentUrls: [url],
     });

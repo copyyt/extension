@@ -35,8 +35,8 @@ function makeWatcher(
     onChanged: (text) => {
       changed.push(text);
     },
-    setInterval: timers.setInterval,
-    clearInterval: timers.clearInterval,
+    setIntervalFn: timers.setInterval,
+    clearIntervalFn: timers.clearInterval,
   });
   return { watcher, timers };
 }
@@ -164,4 +164,75 @@ test("a recreated watcher baselines the existing clipboard without emitting", as
   assert.deepEqual(changed, []);
   recreated.watcher.stop();
   void timers;
+});
+
+test("default timer wrappers preserve the global receiver", async () => {
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const strictSetInterval = function (
+    this: typeof globalThis,
+    handler: TimerHandler,
+    timeout?: number,
+  ): number {
+    void handler;
+    void timeout;
+    if (this !== globalThis) throw new TypeError("Illegal invocation");
+    return 1;
+  } as typeof globalThis.setInterval;
+  const strictClearInterval = function (
+    this: typeof globalThis,
+    id: ReturnType<typeof globalThis.setInterval>,
+  ): void {
+    void id;
+    if (this !== globalThis) throw new TypeError("Illegal invocation");
+  } as typeof globalThis.clearInterval;
+
+  globalThis.setInterval = strictSetInterval;
+  globalThis.clearInterval = strictClearInterval;
+  try {
+    const watcher = new ClipboardWatcher({
+      readText: () => "baseline",
+      onChanged: () => undefined,
+    });
+    watcher.start();
+    await flush();
+    watcher.stop();
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+  }
+});
+
+test("polling failures cannot become unhandled Promise rejections", async () => {
+  const timers = new FakeTimers();
+  let errorReports = 0;
+  let unhandled: unknown;
+  const onUnhandled = (reason: unknown) => {
+    unhandled = reason;
+  };
+  process.on("unhandledRejection", onUnhandled);
+
+  const watcher = new ClipboardWatcher({
+    readText: async () => {
+      throw new Error("clipboard read failed");
+    },
+    onChanged: () => undefined,
+    onError: () => {
+      errorReports += 1;
+      throw new Error("error reporter failed");
+    },
+    setIntervalFn: timers.setInterval,
+    clearIntervalFn: timers.clearInterval,
+  });
+
+  watcher.start();
+  await flush();
+  timers.tick();
+  await flush();
+  watcher.stop();
+  await flush();
+  process.off("unhandledRejection", onUnhandled);
+
+  assert.equal(errorReports, 2);
+  assert.equal(unhandled, undefined);
 });

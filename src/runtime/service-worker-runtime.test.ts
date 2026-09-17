@@ -8,6 +8,9 @@ import type { IUser } from "../interfaces/user.interface.ts";
 import type { ILoginResponse, SignInResponse } from "../interfaces/auth.interface.ts";
 import { RuntimeError } from "./errors.ts";
 import type { ClipboardAdapter } from "./clipboard-adapter.ts";
+import type { ClipboardWatcherOptions } from "./clipboard-watcher.ts";
+import { createRuntimeMessageListener } from "./service-worker-bootstrap.ts";
+import { createOffscreenClipboardWatcher } from "./offscreen-watcher.ts";
 import { InMemoryItemMetadataStore } from "./runtime-db.ts";
 import type { RuntimeSession, SessionStore, StatusStore } from "./session-store.ts";
 import {
@@ -1435,6 +1438,89 @@ test("automatic observations use the same publish path as manual Send", async ()
   await setup.runtime.handleClipboardObservation(clipboardObservation("automatic text"));
   assert.deepEqual(encryptedTexts, ["manual text", "automatic text"]);
   assert.equal(typeof setup.runtime.getStatus().lastAutoSyncAt, "string");
+});
+
+test("an offscreen clipboard change routes to automatic publish without popup involvement", async () => {
+  const encryptedTexts: string[] = [];
+  const setup = await startReady({
+    localTrustState: "verified",
+    encrypt: async (input) => {
+      encryptedTexts.push(input.plaintext as string);
+      return {
+        itemId: "offscreen-automatic-item",
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: new Date().toISOString(),
+      };
+    },
+  });
+
+  let clipboard = "baseline";
+  const callbacks = new Map<number, () => void>();
+  let nextTimerId = 1;
+  const setIntervalFn: NonNullable<ClipboardWatcherOptions["setIntervalFn"]> =
+    (handler) => {
+    const id = nextTimerId++;
+    callbacks.set(id, handler as () => void);
+    return id as unknown as ReturnType<typeof globalThis.setInterval>;
+  };
+  const clearIntervalFn: NonNullable<ClipboardWatcherOptions["clearIntervalFn"]> =
+    (handle) => {
+    callbacks.delete(handle as unknown as number);
+  };
+  const runtimeListener = createRuntimeMessageListener({
+    runtime: {
+      handleMessage: async () => {
+        throw new Error("popup runtime path must not be used");
+      },
+      handleClipboardObservation: (message) =>
+        setup.runtime.handleClipboardObservation(message),
+    },
+    runtimeReady: Promise.resolve(),
+    getStartupError: () => null,
+    runtimeId: "extension-id",
+    extensionUrl: "chrome-extension://extension-id/",
+  });
+  const runtime = {
+    sendMessage(message: unknown): Promise<unknown> {
+      if (this !== runtime) throw new TypeError("Illegal invocation");
+      return new Promise((resolve, reject) => {
+        const accepted = runtimeListener(
+          message,
+          {
+            id: "extension-id",
+            url: "chrome-extension://extension-id/offscreen.html",
+            contextType: "OFFSCREEN_DOCUMENT",
+          },
+          resolve,
+        );
+        if (!accepted) reject(new Error("offscreen observation was rejected"));
+      });
+    },
+  };
+  const watcher = createOffscreenClipboardWatcher({
+    readText: () => clipboard,
+    runtime,
+    setIntervalFn,
+    clearIntervalFn,
+  });
+
+  watcher.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  clipboard = "automatic text";
+  for (const callback of [...callbacks.values()]) callback();
+  for (let attempt = 0; attempt < 5 && encryptedTexts.length === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.deepEqual(encryptedTexts, ["automatic text"]);
+  watcher.stop();
 });
 
 test("automatic observations are dropped while sync is not ready and are not queued", async () => {
