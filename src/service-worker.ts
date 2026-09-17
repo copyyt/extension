@@ -16,7 +16,7 @@ import { createRuntimeMessageListener } from "./runtime/service-worker-bootstrap
 import { RUNTIME_ERROR_CODES, type RuntimeErrorCode } from "./runtime/errors.ts";
 import {
   CONNECTIVITY_RECOVERY_ALARM_NAME,
-  CONNECTIVITY_RECOVERY_PERIOD_MINUTES,
+  ensureConnectivityRecoveryAlarm,
   isLateConnectivityRecoveryAlarm,
 } from "./runtime/connectivity-recovery.ts";
 import { SOCKET_URL } from "./utils/constants.ts";
@@ -39,10 +39,7 @@ const runtime = new CopyytServiceWorkerRuntime({
   broadcastStatus: (message) =>
     chrome.runtime.sendMessage(message).catch(() => undefined),
   recoveryAlarm: {
-    ensure: () =>
-      chrome.alarms.create(CONNECTIVITY_RECOVERY_ALARM_NAME, {
-        periodInMinutes: CONNECTIVITY_RECOVERY_PERIOD_MINUTES,
-      }),
+    ensure: () => ensureConnectivityRecoveryAlarm(chrome.alarms),
     clear: async () => {
       await chrome.alarms.clear(CONNECTIVITY_RECOVERY_ALARM_NAME);
     },

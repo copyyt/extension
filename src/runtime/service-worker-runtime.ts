@@ -104,6 +104,11 @@ export interface ConnectivityReconcileOptions {
   waitForReady?: boolean;
 }
 
+interface ConnectivityReconcileIntent {
+  reason: string;
+  options: ConnectivityReconcileOptions;
+}
+
 export interface RuntimeDependencies {
   socketUrl: string;
   appVersion: string;
@@ -152,6 +157,7 @@ const DEFAULT_STATUS: RuntimeStatus = {
 const TOKEN_REFRESH_SKEW_MS = 60_000;
 const STARTUP_CONNECTIVITY_KICK_TIMEOUT_MS = 250;
 const CONNECTIVITY_RECONCILIATION_TIMEOUT_MS = 15_000;
+const MAX_CONNECTIVITY_RECONCILIATION_FOLLOW_UPS = 2;
 
 function userFromSession(session: RuntimeSession): IUser {
   return { ...session.user };
@@ -519,6 +525,12 @@ export class CopyytServiceWorkerRuntime {
   private initialization: Promise<void> | null = null;
   private refreshInFlight: Promise<RuntimeSession> | null = null;
   private connectivityReconcileInFlight: Promise<void> | null = null;
+  private pendingConnectivityIntent: ConnectivityReconcileIntent | null = null;
+  private activeConnectivityIntent: ConnectivityReconcileIntent | null = null;
+  private activeConnectivitySatisfaction: {
+    forceSocketRecycle: boolean;
+    forceTokenRefresh: boolean;
+  } | null = null;
   private connectivityAttemptSequence = 0;
   private activeConnectivityAttempt = 0;
   private recoveryReason: string | null = null;
@@ -571,8 +583,12 @@ export class CopyytServiceWorkerRuntime {
     reason: string,
     options: ConnectivityReconcileOptions = {},
   ): Promise<void> {
-    const operation = this.connectivityReconcileInFlight ??
-      this.beginConnectivityReconciliation(reason, options);
+    let operation = this.connectivityReconcileInFlight;
+    if (operation) {
+      this.queueConnectivityEscalation(reason, options);
+    } else {
+      operation = this.beginConnectivityReconciliation(reason, options);
+    }
     await this.awaitConnectivityOperation(
       operation,
       CONNECTIVITY_RECONCILIATION_TIMEOUT_MS,
@@ -605,7 +621,15 @@ export class CopyytServiceWorkerRuntime {
         }),
       ]);
     } catch (error) {
-      if (timedOut) this.abandonConnectivityOperation(operation);
+      if (timedOut) {
+        // The reconciliation continues as the single-flight owner. A caller
+        // timing out must not clear the in-flight marker and allow a second
+        // recovery to create a parallel socket.
+        this.setConnectionRecovering(
+          "SOCKET_NOT_READY",
+          "Copyyt connectivity recovery will retry after the current attempt timed out",
+        );
+      }
       throw error;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
@@ -616,12 +640,27 @@ export class CopyytServiceWorkerRuntime {
     reason: string,
     options: ConnectivityReconcileOptions,
   ): Promise<void> {
-    const attemptId = ++this.connectivityAttemptSequence;
-    this.activeConnectivityAttempt = attemptId;
-    const operation = this.reconcileConnectivityInternal(reason, options)
+    const pending = this.pendingConnectivityIntent;
+    this.pendingConnectivityIntent = null;
+    const initialIntent: ConnectivityReconcileIntent = pending
+      ? {
+          reason: pending.reason,
+          options: {
+            ...options,
+            forceSocketRecycle:
+              Boolean(options.forceSocketRecycle) ||
+              Boolean(pending.options.forceSocketRecycle),
+            forceTokenRefresh:
+              Boolean(options.forceTokenRefresh) ||
+              Boolean(pending.options.forceTokenRefresh),
+          },
+        }
+      : { reason, options };
+    const operation = this.runConnectivityReconciliation(initialIntent)
       .finally(() => {
         if (this.connectivityReconcileInFlight === operation) {
           this.connectivityReconcileInFlight = null;
+          this.activeConnectivityIntent = null;
           this.activeConnectivityAttempt = 0;
         }
       });
@@ -629,14 +668,90 @@ export class CopyytServiceWorkerRuntime {
     return operation;
   }
 
-  private abandonConnectivityOperation(operation: Promise<void>): void {
-    if (this.connectivityReconcileInFlight !== operation) return;
-    this.activeConnectivityAttempt = 0;
-    this.connectivityReconcileInFlight = null;
-    this.setConnectionRecovering(
-      "SOCKET_NOT_READY",
-      "Copyyt connectivity recovery will retry after the current attempt timed out",
-    );
+  private queueConnectivityEscalation(
+    reason: string,
+    options: ConnectivityReconcileOptions,
+  ): void {
+    const active = this.activeConnectivityIntent;
+    if (!active) return;
+    const pending = this.pendingConnectivityIntent;
+    const requestedForce =
+      Boolean(options.forceSocketRecycle) ||
+      Boolean(options.forceTokenRefresh);
+    if (!requestedForce && !pending) return;
+
+    this.pendingConnectivityIntent = {
+      reason: requestedForce ? reason : pending!.reason,
+      options: {
+        forceSocketRecycle:
+          Boolean(options.forceSocketRecycle) ||
+          Boolean(pending?.options.forceSocketRecycle),
+        forceTokenRefresh:
+          Boolean(options.forceTokenRefresh) ||
+          Boolean(pending?.options.forceTokenRefresh),
+      },
+    };
+  }
+
+  private async runConnectivityReconciliation(
+    initialIntent: ConnectivityReconcileIntent,
+  ): Promise<void> {
+    let intent = initialIntent;
+    let followUpCount = 0;
+
+    try {
+      while (true) {
+        const attemptId = ++this.connectivityAttemptSequence;
+        this.activeConnectivityAttempt = attemptId;
+        this.activeConnectivityIntent = intent;
+        this.activeConnectivitySatisfaction = {
+          forceSocketRecycle: false,
+          forceTokenRefresh: false,
+        };
+        await this.reconcileConnectivityInternal(
+          intent.reason,
+          intent.options,
+        );
+
+        const pending = this.pendingConnectivityIntent;
+        this.pendingConnectivityIntent = null;
+        const satisfaction = this.activeConnectivitySatisfaction;
+        const unsatisfiedPending = pending && {
+          reason: pending.reason,
+          options: {
+            forceSocketRecycle:
+              Boolean(pending.options.forceSocketRecycle) &&
+              !satisfaction?.forceSocketRecycle,
+            forceTokenRefresh:
+              Boolean(pending.options.forceTokenRefresh) &&
+              !satisfaction?.forceTokenRefresh,
+          },
+        };
+        if (
+          !unsatisfiedPending?.options.forceSocketRecycle &&
+          !unsatisfiedPending?.options.forceTokenRefresh
+        ) {
+          return;
+        }
+        if (
+          followUpCount >= MAX_CONNECTIVITY_RECONCILIATION_FOLLOW_UPS
+        ) {
+          // Preserve a late escalation for the next recovery trigger while
+          // keeping this operation bounded.
+          this.pendingConnectivityIntent = unsatisfiedPending;
+          return;
+        }
+
+        // A stronger request that arrived during an attempt is handled by a
+        // bounded aggregated follow-up. Identical concurrent requests do not
+        // create another follow-up or another socket once the work is known
+        // to have been satisfied.
+        followUpCount += 1;
+        intent = unsatisfiedPending;
+      }
+    } finally {
+      this.activeConnectivitySatisfaction = null;
+    }
   }
 
   private isActiveConnectivityAttempt(attemptId: number): boolean {
@@ -649,8 +764,20 @@ export class CopyytServiceWorkerRuntime {
   ): Promise<void> {
     if (!this.session) return;
 
+    if (
+      !options.forceSocketRecycle &&
+      !options.forceTokenRefresh &&
+      this.isSocketTransportReady()
+    ) {
+      // The periodic alarm is a cheap health probe when the live transport is
+      // already fully ready. Do not touch account state, membership, socket,
+      // or watcher state on this path.
+      return;
+    }
+
     const attemptId = this.activeConnectivityAttempt;
     const wasTransportReady = this.isSocketTransportReady();
+    const socketBeforeAttempt = this.socket;
     this.recoveryReason = reason;
     if (!wasTransportReady || options.forceSocketRecycle) {
       this.pendingAutoObservation = null;
@@ -667,6 +794,9 @@ export class CopyytServiceWorkerRuntime {
         tokenNeedsRefresh(session.accessToken, this.now())
       ) {
         session = await this.refreshAccessToken();
+        if (this.activeConnectivitySatisfaction) {
+          this.activeConnectivitySatisfaction.forceTokenRefresh = true;
+        }
       }
 
       // These calls restore the local identity/trust view and refresh server
@@ -682,8 +812,21 @@ export class CopyytServiceWorkerRuntime {
 
       if (options.forceSocketRecycle) {
         this.destroySocket(this.socket);
+        if (this.activeConnectivitySatisfaction) {
+          this.activeConnectivitySatisfaction.forceSocketRecycle = true;
+        }
       }
       this.connectSocket();
+      if (
+        this.socket &&
+        this.socket !== socketBeforeAttempt &&
+        this.activeConnectivitySatisfaction
+      ) {
+        // A normal attempt can also replace a stale transport (for example
+        // after a token refresh). That satisfies a concurrent recycle request
+        // without creating an unnecessary second replacement socket.
+        this.activeConnectivitySatisfaction.forceSocketRecycle = true;
+      }
       if (wasTransportReady && !options.forceSocketRecycle) {
         this.recoveryReason = null;
       }
@@ -1422,6 +1565,7 @@ export class CopyytServiceWorkerRuntime {
 
   private async clearSession(): Promise<void> {
     this.destroySocket(this.socket);
+    this.pendingConnectivityIntent = null;
     this.session = null;
     this.serverDeviceState = "unknown";
     await this.dependencies.sessionStore.clear();

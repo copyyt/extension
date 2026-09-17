@@ -9,6 +9,25 @@ export const CONNECTIVITY_RECOVERY_PERIOD_MS =
 // scheduler was busy.
 export const RESUME_DETECTION_THRESHOLD_MS = 5 * 60_000;
 
+export interface ConnectivityRecoveryAlarmApi {
+  get(name: string): Promise<unknown | null | undefined>;
+  create(
+    name: string,
+    alarmInfo: { periodInMinutes: number },
+  ): Promise<void>;
+}
+
+export async function ensureConnectivityRecoveryAlarm(
+  alarms: ConnectivityRecoveryAlarmApi,
+): Promise<void> {
+  const existing = await alarms.get(CONNECTIVITY_RECOVERY_ALARM_NAME);
+  if (!existing) {
+    await alarms.create(CONNECTIVITY_RECOVERY_ALARM_NAME, {
+      periodInMinutes: CONNECTIVITY_RECOVERY_PERIOD_MINUTES,
+    });
+  }
+}
+
 export interface ConnectivityRecoveryAlarm {
   name: string;
   scheduledTime?: number;
