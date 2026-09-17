@@ -18,12 +18,14 @@ import {
   type RegisteredDeviceListResponse,
   type RegisteredDeviceResponse,
 } from "../crypto/device-registration.ts";
+import { DeviceIdentityCorruptError } from "../crypto/key-store.ts";
 import type { DeviceApprovalCertificate } from "../crypto/crypto-core.ts";
 import type {
   ClientTrustStore,
   ClientVerifiedDevice,
   LocalDeviceRecord,
 } from "../crypto/trust-store.ts";
+import { TrustStoreError } from "../crypto/trust-store.ts";
 import type {
   SignInResponse,
   ILoginResponse,
@@ -93,6 +95,15 @@ export interface SocketOptions {
   transports?: ("websocket" | "polling")[];
 }
 
+export interface ConnectivityReconcileOptions {
+  /** Dispose the current transport even when Socket.IO still reports it connected. */
+  forceSocketRecycle?: boolean;
+  /** Refresh the access token even when its locally decoded expiry is not near. */
+  forceTokenRefresh?: boolean;
+  /** Wait for device challenge authentication and transport readiness. */
+  waitForReady?: boolean;
+}
+
 export interface RuntimeDependencies {
   socketUrl: string;
   appVersion: string;
@@ -113,6 +124,10 @@ export interface RuntimeDependencies {
   signApproval?: typeof signDeviceApproval;
   now?: () => Date;
   broadcastStatus?: (message: RuntimeStatusBroadcast) => Promise<void> | void;
+  recoveryAlarm?: {
+    ensure: () => Promise<void> | void;
+    clear: () => Promise<void> | void;
+  };
 }
 
 const DEFAULT_STATUS: RuntimeStatus = {
@@ -135,6 +150,8 @@ const DEFAULT_STATUS: RuntimeStatus = {
 };
 
 const TOKEN_REFRESH_SKEW_MS = 60_000;
+const STARTUP_CONNECTIVITY_KICK_TIMEOUT_MS = 250;
+const CONNECTIVITY_RECONCILIATION_TIMEOUT_MS = 15_000;
 
 function userFromSession(session: RuntimeSession): IUser {
   return { ...session.user };
@@ -324,6 +341,10 @@ function isSocketAuthenticationFailure(error: unknown): boolean {
   );
 }
 
+function isFatalLocalInitializationFailure(error: unknown): boolean {
+  return error instanceof DeviceIdentityCorruptError || error instanceof TrustStoreError;
+}
+
 function authResult(response: SignInResponse): AuthenticatedRuntimeResult {
   return { message: response.message, user: response.user };
 }
@@ -497,8 +518,14 @@ export class CopyytServiceWorkerRuntime {
   private startup: Promise<void> | null = null;
   private initialization: Promise<void> | null = null;
   private refreshInFlight: Promise<RuntimeSession> | null = null;
-  private socketRecoveryInFlight: Promise<void> | null = null;
-  private socketRecoveryTarget: SocketLike | null = null;
+  private connectivityReconcileInFlight: Promise<void> | null = null;
+  private connectivityAttemptSequence = 0;
+  private activeConnectivityAttempt = 0;
+  private recoveryReason: string | null = null;
+  private socketListeners = new Map<
+    SocketLike,
+    Array<{ event: string; listener: (...args: unknown[]) => void }>
+  >();
   private readonly inboundInFlight = new Set<string>();
   private clipboardWatchRunning = false;
   private clipboardWatchDesired = false;
@@ -530,6 +557,210 @@ export class CopyytServiceWorkerRuntime {
     return this.startup;
   }
 
+  hasAuthenticatedSession(): boolean {
+    return this.session !== null;
+  }
+
+  /**
+   * Reconciles the durable account state with the live transport. This is the
+   * only path used for recovery after a disconnect, alarm wake, or dormant
+   * runtime command. Connectivity failures are deliberately contained here:
+   * they update status and can be retried by a later event.
+   */
+  async reconcileConnectivity(
+    reason: string,
+    options: ConnectivityReconcileOptions = {},
+  ): Promise<void> {
+    const operation = this.connectivityReconcileInFlight ??
+      this.beginConnectivityReconciliation(reason, options);
+    await this.awaitConnectivityOperation(
+      operation,
+      CONNECTIVITY_RECONCILIATION_TIMEOUT_MS,
+    );
+
+    if (options.waitForReady && this.session && !this.isSocketTransportReady()) {
+      await this.waitForSocketReady(CONNECTIVITY_RECONCILIATION_TIMEOUT_MS);
+    }
+  }
+
+  private async awaitConnectivityOperation(
+    operation: Promise<void>,
+    timeoutMs: number,
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    try {
+      await Promise.race([
+        operation,
+        new Promise<void>((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(
+              new RuntimeError(
+                "SOCKET_NOT_READY",
+                "Copyyt connectivity recovery timed out",
+              ),
+            );
+          }, timeoutMs);
+        }),
+      ]);
+    } catch (error) {
+      if (timedOut) this.abandonConnectivityOperation(operation);
+      throw error;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private beginConnectivityReconciliation(
+    reason: string,
+    options: ConnectivityReconcileOptions,
+  ): Promise<void> {
+    const attemptId = ++this.connectivityAttemptSequence;
+    this.activeConnectivityAttempt = attemptId;
+    const operation = this.reconcileConnectivityInternal(reason, options)
+      .finally(() => {
+        if (this.connectivityReconcileInFlight === operation) {
+          this.connectivityReconcileInFlight = null;
+          this.activeConnectivityAttempt = 0;
+        }
+      });
+    this.connectivityReconcileInFlight = operation;
+    return operation;
+  }
+
+  private abandonConnectivityOperation(operation: Promise<void>): void {
+    if (this.connectivityReconcileInFlight !== operation) return;
+    this.activeConnectivityAttempt = 0;
+    this.connectivityReconcileInFlight = null;
+    this.setConnectionRecovering(
+      "SOCKET_NOT_READY",
+      "Copyyt connectivity recovery will retry after the current attempt timed out",
+    );
+  }
+
+  private isActiveConnectivityAttempt(attemptId: number): boolean {
+    return this.activeConnectivityAttempt === attemptId;
+  }
+
+  private async reconcileConnectivityInternal(
+    reason: string,
+    options: ConnectivityReconcileOptions,
+  ): Promise<void> {
+    if (!this.session) return;
+
+    const attemptId = this.activeConnectivityAttempt;
+    const wasTransportReady = this.isSocketTransportReady();
+    this.recoveryReason = reason;
+    if (!wasTransportReady || options.forceSocketRecycle) {
+      this.pendingAutoObservation = null;
+      this.setConnectionRecovering(
+        "SOCKET_NOT_READY",
+        `Copyyt is reconnecting (${reason})`,
+      );
+    }
+
+    try {
+      let session = this.requireSession();
+      if (
+        options.forceTokenRefresh ||
+        tokenNeedsRefresh(session.accessToken, this.now())
+      ) {
+        session = await this.refreshAccessToken();
+      }
+
+      // These calls restore the local identity/trust view and refresh server
+      // membership before a new socket is allowed to become sync-ready.
+      await this.ensureAccountInitialized();
+      if (!this.isActiveConnectivityAttempt(attemptId)) return;
+      await this.refreshOnboarding();
+      if (!this.isActiveConnectivityAttempt(attemptId)) return;
+      if (!this.session || this.serverDeviceState !== "trusted") {
+        this.maybeConnectSocket();
+        return;
+      }
+
+      if (options.forceSocketRecycle) {
+        this.destroySocket(this.socket);
+      }
+      this.connectSocket();
+      if (wasTransportReady && !options.forceSocketRecycle) {
+        this.recoveryReason = null;
+      }
+    } catch (error) {
+      if (!this.isActiveConnectivityAttempt(attemptId)) return;
+      if (isFatalLocalInitializationFailure(error)) {
+        throw error;
+      }
+      if (refreshFailureIsDefinitive(error)) {
+        await this.clearSession();
+        return;
+      }
+      if (
+        error instanceof RuntimeError &&
+        error.code === "AUTH_REQUIRED" &&
+        !this.session
+      ) {
+        await this.clearSession();
+        return;
+      }
+
+      // Network, Socket.IO, and temporary backend availability errors are
+      // connection state—not runtime startup death. Do not poison the worker.
+      this.serverDeviceState = "unknown";
+      this.setConnectionRecovering(
+        error instanceof RuntimeError ? error.code : "SOCKET_NOT_READY",
+        error instanceof Error
+          ? `Copyyt connectivity recovery is unavailable: ${error.message}`
+          : "Copyyt connectivity recovery is temporarily unavailable",
+      );
+    }
+  }
+
+  private async waitForSocketReady(timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.isSocketTransportReady()) return;
+      if (!this.socket || this.serverDeviceState !== "trusted") break;
+      if (
+        this.status.lastConnectionError &&
+        this.socket &&
+        !this.socket.connected
+      ) {
+        break;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+    throw new RuntimeError(
+      "SOCKET_NOT_READY",
+      "Copyyt is still reconnecting; the device connection is not ready",
+    );
+  }
+
+  private isSocketTransportReady(): boolean {
+    return Boolean(
+      this.socket &&
+        this.socket.connected &&
+        this.socketReady &&
+        this.status.connectionState === "ready" &&
+        this.status.socket.connected &&
+        this.status.socket.deviceAuthenticated,
+    );
+  }
+
+  private async ensureRecoveryAlarm(): Promise<void> {
+    if (!this.dependencies.recoveryAlarm) return;
+    if (this.session) {
+      await Promise.resolve(this.dependencies.recoveryAlarm.ensure()).catch(
+        () => undefined,
+      );
+    } else {
+      await Promise.resolve(this.dependencies.recoveryAlarm.clear()).catch(
+        () => undefined,
+      );
+    }
+  }
+
   private async startInternal(): Promise<void> {
     const persistedStatus = await this.dependencies.statusStore
       .get()
@@ -553,6 +784,12 @@ export class CopyytServiceWorkerRuntime {
               : {}),
             ...(persistedStatus.lastConnectionError
               ? { lastConnectionError: persistedStatus.lastConnectionError }
+              : {}),
+            ...(persistedStatus.lastRecoveredAt
+              ? { lastRecoveredAt: persistedStatus.lastRecoveredAt }
+              : {}),
+            ...(persistedStatus.lastRecoveryReason
+              ? { lastRecoveryReason: persistedStatus.lastRecoveryReason }
               : {}),
             ...(persistedStatus.lastAutoSyncAt
               ? { lastAutoSyncAt: persistedStatus.lastAutoSyncAt }
@@ -587,6 +824,7 @@ export class CopyytServiceWorkerRuntime {
         signedIn: false,
         user: undefined,
       });
+      await this.ensureRecoveryAlarm();
       return;
     }
     this.setStatus({
@@ -595,40 +833,39 @@ export class CopyytServiceWorkerRuntime {
       signedIn: true,
       user: userFromSession(this.session),
     });
-    try {
-      if (tokenNeedsRefresh(this.session.accessToken, this.now())) {
-        try {
-          await this.refreshAccessToken();
-        } catch (error) {
-          if (refreshFailureIsDefinitive(error)) throw error;
-          // Keep the local session during a transient refresh outage. Socket
-          // connection/reconnection can recover when the service is back.
-        }
+    let startupTimedOut = false;
+    const startupConnectivity = this.beginConnectivityReconciliation(
+      "startup",
+      {},
+    ).catch((error: unknown) => {
+      // A local fatal error is allowed to fail startup when it is observed
+      // during the bounded startup kick. If it occurs after the kick timed
+      // out, contain it as a runtime diagnostic rather than creating an
+      // unhandled rejection in the service worker.
+      if (!startupTimedOut && isFatalLocalInitializationFailure(error)) {
+        throw error;
       }
-      await this.ensureAccountInitialized();
-      await this.refreshOnboarding().catch(() => {
-        // Onboarding is fail-closed when the backend cannot be queried.
-        this.serverDeviceState = "unknown";
-        this.setOnboarding({ state: "unknown", bootstrapEligible: false });
-      });
-      this.maybeConnectSocket();
-    } catch (error) {
-      if (
-        refreshFailureIsDefinitive(error) ||
-        (!this.session &&
-          error instanceof RuntimeError &&
-          error.code === "AUTH_REQUIRED")
-      ) {
-        await this.clearSession();
-      } else {
-        this.serverDeviceState = "unknown";
+      if (isFatalLocalInitializationFailure(error)) {
         this.report(
           error,
           "DEVICE_NOT_REGISTERED",
-          "The Copyyt device is not ready",
+          "The Copyyt local device state is not usable",
         );
       }
+    });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        startupConnectivity,
+        new Promise<void>((resolve) => {
+          timeout = setTimeout(resolve, STARTUP_CONNECTIVITY_KICK_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      startupTimedOut = true;
+      if (timeout !== undefined) clearTimeout(timeout);
     }
+    await this.ensureRecoveryAlarm();
   }
 
   getStatus(): RuntimeStatus {
@@ -637,12 +874,19 @@ export class CopyytServiceWorkerRuntime {
 
   /** Handles a validated, fire-and-forget observation from the offscreen document. */
   async handleClipboardObservation(message: unknown): Promise<void> {
-    if (
-      !isOffscreenClipboardObservation(message) ||
-      message.text.length === 0 ||
-      !isClipboardText(message.text) ||
-      !this.isAutomaticSyncEligible()
-    ) {
+    if (!isOffscreenClipboardObservation(message) || message.text.length === 0) {
+      return;
+    }
+    if (!isClipboardText(message.text)) return;
+    if (!this.isAutomaticSyncEligible()) {
+      // The observation is intentionally not retained. It may wake a dormant
+      // runtime, but only a later clipboard change after a fresh baseline can
+      // be published.
+      if (this.session) {
+        void this.reconcileConnectivity("clipboard-observation").catch(
+          () => undefined,
+        );
+      }
       return;
     }
 
@@ -958,9 +1202,25 @@ export class CopyytServiceWorkerRuntime {
   private async handleCommand(command: RuntimeCommand): Promise<unknown> {
     switch (command.type) {
       case "runtime:get-status":
+        if (this.session && !this.isSocketTransportReady()) {
+          // Status is intentionally non-blocking. The recovery operation is
+          // single-flight and continues after this response is delivered.
+          void this.reconcileConnectivity("status").catch(() => undefined);
+        }
         return this.getStatus();
       case "runtime:send-current-clipboard": {
         this.requireSession();
+        if (!this.isSocketTransportReady()) {
+          await this.reconcileConnectivity("manual-send", {
+            waitForReady: true,
+          });
+        }
+        if (!this.isSocketTransportReady()) {
+          throw new RuntimeError(
+            "SOCKET_NOT_READY",
+            "Copyyt is still reconnecting; the device connection is not ready",
+          );
+        }
         let text: string;
         try {
           text = await this.dependencies.clipboardAdapter.readText();
@@ -970,7 +1230,33 @@ export class CopyytServiceWorkerRuntime {
             "The operating-system clipboard could not be read",
           );
         }
-        return this.publishClipboardText(text);
+        try {
+          return await this.publishClipboardText(text);
+        } catch (error) {
+          const runtimeError =
+            error instanceof RuntimeError
+              ? error
+              : asRuntimeError(
+                  error,
+                  "SOCKET_PUBLISH_FAILED",
+                  "The clipboard publish failed",
+                );
+          if (
+            runtimeError.code !== "SOCKET_NOT_READY" &&
+            runtimeError.code !== "SOCKET_PUBLISH_FAILED"
+          ) {
+            throw error;
+          }
+
+          // A sleeping laptop can leave Socket.IO's connected flag stale.
+          // Recycle once after a transport publish failure, then use the same
+          // shared publish path with the freshly authenticated socket.
+          await this.reconcileConnectivity("manual-send-retry", {
+            forceSocketRecycle: true,
+            waitForReady: true,
+          });
+          return this.publishClipboardText(text);
+        }
       }
       case "runtime:bootstrap-trust-anchor":
         return this.bootstrapTrustAnchor();
@@ -1115,6 +1401,7 @@ export class CopyytServiceWorkerRuntime {
       signedIn: true,
       user: userFromSession(session),
     });
+    await this.ensureRecoveryAlarm();
   }
 
   private async logout(): Promise<void> {
@@ -1139,6 +1426,7 @@ export class CopyytServiceWorkerRuntime {
     this.serverDeviceState = "unknown";
     await this.dependencies.sessionStore.clear();
     this.setStatus({ ...DEFAULT_STATUS, connectionState: "signed-out" });
+    await this.ensureRecoveryAlarm();
   }
 
   private async bootstrapTrustAnchor(): Promise<RuntimeStatus> {
@@ -1899,6 +2187,9 @@ export class CopyytServiceWorkerRuntime {
     if (
       !this.socket ||
       !this.socketReady ||
+      !this.socket.connected ||
+      !this.status.socket.connected ||
+      !this.status.socket.deviceAuthenticated ||
       this.status.connectionState !== "ready"
     ) {
       throw new RuntimeError(
@@ -1992,6 +2283,7 @@ export class CopyytServiceWorkerRuntime {
       user: userFromSession(this.session),
       socket: { connected: false, deviceAuthenticated: false },
       syncReady: false,
+      clipboardWatch: "stopped",
     });
   }
 
@@ -2011,10 +2303,26 @@ export class CopyytServiceWorkerRuntime {
       return;
     }
     if (this.socket && this.socketAccountId === session.user.id) {
+      if (this.isSocketTransportReady()) return;
+      if (this.socket.connected && this.socketReady) {
+        // A transport that is connected without Copyyt device authentication
+        // is not reusable as a ready transport. Recycle it through the same
+        // listener-safe path as a sleep/wake recovery.
+        this.destroySocket(this.socket);
+      }
+    }
+    if (this.socket && this.socketAccountId === session.user.id) {
+      this.socketReady = false;
+      this.setStatus({
+        ...this.status,
+        connectionState: "connecting",
+        socket: { connected: false, deviceAuthenticated: false },
+        syncReady: false,
+      });
       if (!this.socket.connected) this.socket.connect();
       return;
     }
-    this.socket?.disconnect();
+    this.destroySocket(this.socket);
     this.socketReady = false;
     this.socketAccountId = session.user.id;
     this.setStatus({
@@ -2046,45 +2354,69 @@ export class CopyytServiceWorkerRuntime {
         ...this.status,
         connectionState: "account-authenticated",
         syncReady: false,
+        clipboardWatch: "stopped",
         socket: { connected: true, deviceAuthenticated: false },
       });
     };
-    const onDisconnect = (): void => {
+    const onDisconnect = (reason?: unknown): void => {
       if (this.socket !== socket) return;
-      const wasReady = this.socketReady;
       this.socketReady = false;
+      this.challengeInFlight = false;
+      this.pendingAutoObservation = null;
       this.setConnectionError(
         "SOCKET_NOT_READY",
-        wasReady
-          ? "The Copyyt socket disconnected"
-          : "The socket disconnected before device authentication",
+        reason instanceof Error
+          ? `Socket disconnected: ${reason.message}`
+          : typeof reason === "string"
+            ? `Socket disconnected: ${reason}`
+            : "Copyyt is reconnecting after a socket disconnect",
       );
+      if (reason === "io server disconnect") {
+        void this.reconcileConnectivity("socket-disconnect", {
+          forceSocketRecycle: true,
+        }).catch(() => undefined);
+      } else if (reason !== "io client disconnect") {
+        // Socket.IO normally retries transport closes itself. The explicit
+        // reconciliation also covers implementations/reasons where connect()
+        // is required, while the microtask keeps the disconnect state
+        // observable to the event that delivered it.
+        queueMicrotask(() => {
+          if (this.socket !== socket || !this.session) return;
+          void this.reconcileConnectivity("socket-disconnect").catch(
+            () => undefined,
+          );
+        });
+      }
     };
     const onConnectError = (error?: unknown): void => {
-      console.error("COPYyt socket connect_error", error);
-
       if (this.socket !== socket) return;
 
       this.socketReady = false;
-      this.setConnectionError(
-        "SOCKET_NOT_READY",
+      this.markTransportDisconnected(
         error instanceof Error
           ? `Socket connection failed: ${error.message}`
-          : "The Copyyt socket connection failed",
+          : "Copyyt is reconnecting after a socket connection failure",
       );
 
       if (isSocketAuthenticationFailure(error)) {
         if (this.challengeReceived) {
           void this.handleDeviceAuthenticationFailure(socket);
         } else {
-          void this.recoverSocketAuthentication(socket);
+          void this.reconcileConnectivity("socket-auth-failure", {
+            forceSocketRecycle: true,
+            forceTokenRefresh: true,
+          }).catch(() => undefined);
         }
+      } else {
+        void this.reconcileConnectivity("socket-connect-error").catch(
+          () => undefined,
+        );
       }
     };
     const onChallenge = (payload: unknown): void => {
       if (this.socket !== socket) return;
       this.challengeReceived = true;
-      void this.authenticateDevice(payload);
+      void this.authenticateDevice(socket, payload);
     };
     const onReady = (): void => {
       if (this.socket !== socket) return;
@@ -2097,13 +2429,35 @@ export class CopyytServiceWorkerRuntime {
         connectionState: "ready",
         syncReady,
         socket: { connected: true, deviceAuthenticated: true },
+        ...(this.recoveryReason
+          ? {
+              lastRecoveredAt: this.now().toISOString(),
+              lastRecoveryReason: this.recoveryReason,
+            }
+          : {}),
       });
-      void this.refreshServerDevices(session).catch(() => {
-        this.recordSyncError(
-          "SOCKET_PUBLISH_FAILED",
-          "Device trust synchronization failed",
-        );
-      });
+      this.recoveryReason = null;
+      // The pre-connect reconciliation has already refreshed membership. This
+      // second refresh catches trust changes that raced the challenge without
+      // delaying the established transport event.
+      void this.refreshServerDevices(session).then(
+        () => {
+          if (this.socket !== socket) return;
+          const locallyTrusted = isLocallyVerifiedStatus(this.status);
+          this.setStatus({
+            ...this.status,
+            syncReady:
+              this.serverDeviceState === "trusted" && locallyTrusted,
+          });
+        },
+        () => {
+          if (this.socket !== socket) return;
+          this.recordSyncError(
+            "SOCKET_PUBLISH_FAILED",
+            "Device trust synchronization failed",
+          );
+        },
+      );
     };
     const onAuthFailure = (): void => {
       if (this.socket !== socket) return;
@@ -2111,29 +2465,72 @@ export class CopyytServiceWorkerRuntime {
       if (this.challengeReceived) {
         void this.handleDeviceAuthenticationFailure(socket);
       } else {
-        this.setConnectionError(
-          "AUTH_REQUIRED",
-          "The account socket authentication was rejected",
+        this.markTransportDisconnected(
+          "Copyyt is reconnecting after account socket authentication failed",
         );
-        void this.recoverSocketAuthentication(socket);
+        void this.reconcileConnectivity("socket-auth-failure", {
+          forceSocketRecycle: true,
+          forceTokenRefresh: true,
+        })
+          .catch(() => undefined)
+          .then(() => {
+            if (this.session && !this.isSocketTransportReady()) {
+              this.setConnectionError(
+                "AUTH_REQUIRED",
+                "The account socket authentication was rejected",
+              );
+            }
+          });
       }
     };
     const onClipboardItem = (payload: unknown): void => {
       if (this.socket !== socket) return;
       void this.receiveClipboardItem(payload);
     };
-    socket.on("connect", onConnect);
-    socket.on("disconnect", onDisconnect);
-    socket.on("connect_error", onConnectError);
-    socket.on("auth:challenge", onChallenge);
-    socket.on("auth:ready", onReady);
-    socket.on("auth:failure", onAuthFailure);
-    socket.on("clipboard:item", onClipboardItem);
+
+    this.attachSocketListeners(socket, [
+      ["connect", onConnect],
+      ["disconnect", onDisconnect],
+      ["connect_error", onConnectError],
+      ["auth:challenge", onChallenge],
+      ["auth:ready", onReady],
+      ["auth:failure", onAuthFailure],
+      ["clipboard:item", onClipboardItem],
+    ]);
     socket.connect();
   }
 
-  private async authenticateDevice(payload: unknown): Promise<void> {
-    if (this.challengeInFlight || !this.socket) return;
+  private attachSocketListeners(
+    socket: SocketLike,
+    listeners: Array<[
+      string,
+      (...args: unknown[]) => void,
+    ]>,
+  ): void {
+    this.detachSocketListeners(socket);
+    const bindings = listeners.map(([event, listener]) => ({ event, listener }));
+    this.socketListeners.set(socket, bindings);
+    for (const { event, listener } of bindings) socket.on(event, listener);
+  }
+
+  private detachSocketListeners(socket: SocketLike): void {
+    const bindings = this.socketListeners.get(socket);
+    if (!bindings) return;
+    if (socket.off) {
+      for (const { event, listener } of bindings) {
+        socket.off(event, listener);
+      }
+    }
+    this.socketListeners.delete(socket);
+  }
+
+  private async authenticateDevice(
+    socket: SocketLike,
+    payload: unknown,
+  ): Promise<void> {
+    if (this.challengeInFlight || this.socket !== socket || !socket.connected) {
+      return;
+    }
     this.challengeInFlight = true;
     try {
       const session = this.requireSession();
@@ -2144,7 +2541,7 @@ export class CopyytServiceWorkerRuntime {
           "The device must be registered before socket authentication",
         );
       }
-      const parts = challengeParts(payload, this.socket.id ?? "");
+      const parts = challengeParts(payload, socket.id ?? "");
       if (
         !parts ||
         (parts.userId !== undefined && parts.userId !== session.user.id)
@@ -2158,6 +2555,8 @@ export class CopyytServiceWorkerRuntime {
         ...this.status,
         connectionState: "device-authenticating",
         socket: { connected: true, deviceAuthenticated: false },
+        syncReady: false,
+        clipboardWatch: "stopped",
       });
       const signature = await this.signChallenge({
         userId: session.user.id,
@@ -2165,7 +2564,8 @@ export class CopyytServiceWorkerRuntime {
         socketId: parts.socketId,
         challenge: parts.challenge,
       });
-      this.socket.emit("auth:device", {
+      if (this.socket !== socket || !socket.connected) return;
+      socket.emit("auth:device", {
         deviceId: identity.deviceId,
         keyVersion: identity.keyVersion,
         signature,
@@ -2181,35 +2581,6 @@ export class CopyytServiceWorkerRuntime {
     } finally {
       this.challengeInFlight = false;
     }
-  }
-
-  private async recoverSocketAuthentication(socket: SocketLike): Promise<void> {
-    if (this.socket !== socket) return;
-    if (this.socketRecoveryTarget === socket && this.socketRecoveryInFlight) {
-      return this.socketRecoveryInFlight;
-    }
-    this.socketRecoveryTarget = socket;
-    this.socketRecoveryInFlight = (async () => {
-      try {
-        await this.refreshAccessToken();
-        if (!this.session || (this.socket !== null && this.socket !== socket))
-          return;
-        this.destroySocket(socket);
-        await this.ensureAccountInitialized();
-        this.connectSocket();
-      } catch {
-        if (this.session) {
-          this.setConnectionError(
-            "AUTH_REQUIRED",
-            "The Copyyt session could not be renewed",
-          );
-        }
-      } finally {
-        this.socketRecoveryInFlight = null;
-        this.socketRecoveryTarget = null;
-      }
-    })();
-    return this.socketRecoveryInFlight;
   }
 
   private async handleDeviceAuthenticationFailure(
@@ -2244,24 +2615,22 @@ export class CopyytServiceWorkerRuntime {
 
   private destroySocket(socket: SocketLike | null): void {
     if (!socket) return;
-    if (this.socket === socket) {
+    const isCurrent = this.socket === socket;
+    this.detachSocketListeners(socket);
+    if (isCurrent) {
       this.socket = null;
       this.socketAccountId = null;
       this.socketReady = false;
       this.challengeInFlight = false;
       this.challengeReceived = false;
-      if (
-        this.status.socket.connected ||
-        this.status.socket.deviceAuthenticated ||
-        this.status.syncReady
-      ) {
-        this.setStatus({
-          ...this.status,
-          connectionState: this.session ? "account-authenticated" : "signed-out",
-          socket: { connected: false, deviceAuthenticated: false },
-          syncReady: false,
-        });
-      }
+      this.pendingAutoObservation = null;
+      this.setStatus({
+        ...this.status,
+        connectionState: this.session ? "account-authenticated" : "signed-out",
+        socket: { connected: false, deviceAuthenticated: false },
+        syncReady: false,
+        clipboardWatch: "stopped",
+      });
     }
     try {
       socket.disconnect();
@@ -2269,6 +2638,20 @@ export class CopyytServiceWorkerRuntime {
       // A stale socket is best-effort cleanup during token replacement.
     }
   }
+
+  private markTransportDisconnected(message: string): void {
+    this.socketReady = false;
+    this.challengeInFlight = false;
+    this.pendingAutoObservation = null;
+    this.setConnectionRecovering("SOCKET_NOT_READY", message);
+  }
+
+  /*
+   * The old socket-authentication-specific recovery path was intentionally
+   * removed. Token refresh, socket replacement, membership refresh, and
+   * challenge authentication all go through reconcileConnectivity so there is
+   * one single-flight owner for recovery.
+   */
 
   private async fetchDeviceSnapshot(
     session: RuntimeSession,
@@ -2476,6 +2859,24 @@ export class CopyytServiceWorkerRuntime {
         connected: false,
         deviceAuthenticated: false,
       },
+      clipboardWatch: "stopped",
+      lastConnectionError: { code, message, at: this.now().toISOString() },
+    });
+  }
+
+  private setConnectionRecovering(
+    code: RuntimeErrorCode,
+    message: string,
+  ): void {
+    this.setStatus({
+      ...this.status,
+      connectionState: this.session ? "connecting" : "signed-out",
+      syncReady: false,
+      socket: {
+        connected: false,
+        deviceAuthenticated: false,
+      },
+      clipboardWatch: "stopped",
       lastConnectionError: { code, message, at: this.now().toISOString() },
     });
   }

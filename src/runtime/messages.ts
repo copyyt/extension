@@ -91,6 +91,9 @@ export interface RuntimeStatus {
     message: string;
     at: string;
   };
+  /** Diagnostic only: this is never used as protocol or trust authority. */
+  lastRecoveredAt?: string;
+  lastRecoveryReason?: string;
 }
 
 export interface AuthenticatedRuntimeResult {

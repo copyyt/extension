@@ -31,7 +31,8 @@
         "clipboardRead",
         "clipboardWrite",
         "offscreen",
-        "storage"
+        "storage",
+        "alarms"
     ],
     "host_permissions": [
         "https://api.copyyt.psami.com/*",

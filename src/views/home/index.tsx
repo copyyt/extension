@@ -232,7 +232,7 @@ function Home() {
         variant="primary"
         className="mt-3 w-full"
         onClick={sendCurrentClipboard}
-        disabled={sending || status?.connectionState !== "ready" || !status?.syncReady || !localDeviceTrusted}
+        disabled={sending || !status?.signedIn || !localDeviceTrusted}
       >
         {sending ? "Encrypting and sending…" : "Send current clipboard"}
       </Button>

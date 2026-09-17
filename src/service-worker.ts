@@ -14,6 +14,11 @@ import {
 } from "./runtime/service-worker-runtime.ts";
 import { createRuntimeMessageListener } from "./runtime/service-worker-bootstrap.ts";
 import { RUNTIME_ERROR_CODES, type RuntimeErrorCode } from "./runtime/errors.ts";
+import {
+  CONNECTIVITY_RECOVERY_ALARM_NAME,
+  CONNECTIVITY_RECOVERY_PERIOD_MINUTES,
+  isLateConnectivityRecoveryAlarm,
+} from "./runtime/connectivity-recovery.ts";
 import { SOCKET_URL } from "./utils/constants.ts";
 
 function socketFactory(url: string, options: SocketOptions): SocketLike {
@@ -33,6 +38,15 @@ const runtime = new CopyytServiceWorkerRuntime({
   socketFactory,
   broadcastStatus: (message) =>
     chrome.runtime.sendMessage(message).catch(() => undefined),
+  recoveryAlarm: {
+    ensure: () =>
+      chrome.alarms.create(CONNECTIVITY_RECOVERY_ALARM_NAME, {
+        periodInMinutes: CONNECTIVITY_RECOVERY_PERIOD_MINUTES,
+      }),
+    clear: async () => {
+      await chrome.alarms.clear(CONNECTIVITY_RECOVERY_ALARM_NAME);
+    },
+  },
 });
 
 let startupError: unknown = null;
@@ -61,6 +75,36 @@ const runtimeReady = runtime.start().then(
     );
   },
 );
+
+// Register synchronously during module evaluation. Alarms are wake events,
+// not a clipboard poller or a service-worker keepalive.
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== CONNECTIVITY_RECOVERY_ALARM_NAME) return;
+  const resumeDetected = isLateConnectivityRecoveryAlarm(alarm);
+  void runtimeReady
+    .then(async () => {
+      if (!runtime.hasAuthenticatedSession()) {
+        await Promise.resolve(
+          chrome.alarms.clear(CONNECTIVITY_RECOVERY_ALARM_NAME),
+        ).catch(() => undefined);
+        return;
+      }
+      await runtime.reconcileConnectivity(
+        resumeDetected ? "sleep-wake" : "recovery-alarm",
+        {
+          forceSocketRecycle: resumeDetected,
+        },
+      );
+    })
+    .catch((error: unknown) => {
+      // Connectivity failures are expected after wake and are represented in
+      // runtime status. Keep the alarm event free of rejected promises.
+      if (import.meta.env.DEV) {
+        const errorName = error instanceof Error ? error.name : "UnknownError";
+        console.info(`COPYyt recovery alarm deferred (${errorName})`);
+      }
+    });
+});
 
 // Register synchronously during module evaluation. The listener keeps the
 // channel open while the single startup promise restores the runtime.

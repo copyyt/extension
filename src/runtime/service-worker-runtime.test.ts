@@ -85,6 +85,9 @@ class FakeSocket implements SocketLike {
     this.emitConnectEventOnConnect = emitConnectEventOnConnect;
   }
   on(event: string, listener: (...args: unknown[]) => void): void { this.events.set(event, listener); }
+  off(event: string, listener: (...args: unknown[]) => void): void {
+    if (this.events.get(event) === listener) this.events.delete(event);
+  }
   connect(): void {
     this.connected = true;
     if (this.emitConnectEventOnConnect) this.events.get("connect")?.();
@@ -129,6 +132,9 @@ function makeRuntime(overrides: Partial<{
   identityLoader: (userId: string) => Promise<DeviceIdentity | null>;
   identityCreator: (userId: string) => Promise<DeviceIdentity>;
   registerDevice: RuntimeDependencies["registerDevice"];
+  socketFactory: RuntimeDependencies["socketFactory"];
+  signChallenge: RuntimeDependencies["signChallenge"];
+  recoveryAlarm: RuntimeDependencies["recoveryAlarm"];
 }> = {}) {
   const runtimeIdentity = overrides.identity ?? identity;
   const runtimeRegisteredDevice = overrides.registeredDevice ?? registeredDevice;
@@ -187,16 +193,17 @@ function makeRuntime(overrides: Partial<{
     processedItemStore: new InMemoryItemMetadataStore(),
     outboundItemStore: new InMemoryItemMetadataStore(),
     apiFactory: () => api,
-    socketFactory: (url: string, options: SocketOptions) => {
+    socketFactory: overrides.socketFactory ?? ((url: string, options: SocketOptions) => {
       void url;
       socketOptions = options;
       return socket;
-    },
+    }),
     identityLoader: overrides.identityLoader ?? (async () => runtimeIdentity),
     identityCreator: overrides.identityCreator ?? (async () => runtimeIdentity),
     registerDevice: overrides.registerDevice ?? (async () => ({ identity: runtimeIdentity, device: runtimeRegisteredDevice })),
-    signChallenge: async () => "signed-challenge",
+    signChallenge: overrides.signChallenge ?? (async () => "signed-challenge"),
     signApproval: overrides.signApproval,
+    recoveryAlarm: overrides.recoveryAlarm,
     encrypt: overrides.encrypt ?? (async (input) => ({
       itemId: "22222222-2222-4222-8222-222222222222",
       sourceDeviceId: input.identity.deviceId,
@@ -1704,4 +1711,202 @@ test("trusted and pending collections drive the complete restart-safe pairing ce
   assert.equal(pending.runtime.getStatus().device.trustState, "verified");
   assert.equal(pendingStore.records.get(`${user.id}:${pendingDevice.deviceId}`)?.trustState, "verified");
   assert.equal(pending.runtime.getStatus().socket.connected, true);
+});
+
+test("transient startup connectivity failure leaves a responsive runtime for later recovery", async () => {
+  let available = false;
+  const setup = makeRuntime({
+    localTrustState: "verified",
+    listDevices: async () => {
+      if (!available) throw new Error("network unavailable after wake");
+      return response([registeredDevice]);
+    },
+    listPendingDevices: async () => {
+      if (!available) throw new Error("network unavailable after wake");
+      return response([]);
+    },
+  });
+
+  await setup.runtime.start();
+  const status = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:get-status" }),
+  );
+  assert.equal(status.ok, true);
+  assert.equal(setup.runtime.getStatus().signedIn, true);
+  assert.notEqual(setup.runtime.getStatus().connectionState, "signed-out");
+
+  available = true;
+  await setup.runtime.reconcileConnectivity("network-restored");
+  assert.equal(setup.runtime.getStatus().socket.connected, true);
+  setup.socket.trigger("auth:challenge", {
+    socketId: "socket-1",
+    challenge: "recovery-challenge",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  setup.socket.trigger("auth:ready");
+  assert.equal(setup.runtime.getStatus().syncReady, true);
+});
+
+test("disconnect clears live auth state, stops watching, and re-authenticates a replacement socket", async () => {
+  const watchCalls: Array<{ type: "start" | "stop"; resetBaseline?: boolean }> = [];
+  let signatures = 0;
+  const setup = await startReady({
+    localTrustState: "verified",
+    clipboardAdapter: {
+      readText: async () => "baseline",
+      writeText: async () => undefined,
+      startWatching: async (options) => {
+        watchCalls.push({ type: "start", resetBaseline: options?.resetBaseline });
+      },
+      stopWatching: async () => {
+        watchCalls.push({ type: "stop" });
+      },
+    },
+    signChallenge: async () => {
+      signatures += 1;
+      return `signature-${signatures}`;
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(setup.runtime.getStatus().syncReady, true);
+
+  setup.socket.trigger("disconnect", "transport close");
+  assert.equal(setup.runtime.getStatus().socket.connected, false);
+  assert.equal(setup.runtime.getStatus().socket.deviceAuthenticated, false);
+  assert.equal(setup.runtime.getStatus().syncReady, false);
+  assert.equal(setup.runtime.getStatus().clipboardWatch, "stopped");
+
+  await setup.runtime.reconcileConnectivity("test-reconnect", {
+    forceSocketRecycle: true,
+  });
+  setup.socket.trigger("auth:challenge", {
+    socketId: "socket-1",
+    challenge: "reconnect-challenge",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  setup.socket.trigger("auth:ready");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(signatures, 1);
+  assert.equal(setup.runtime.getStatus().syncReady, true);
+  assert.deepEqual(watchCalls.filter((call) => call.type === "start"), [
+    { type: "start", resetBaseline: true },
+    { type: "start", resetBaseline: true },
+  ]);
+  assert.ok(watchCalls.some((call) => call.type === "stop"));
+});
+
+test("automatic observations received during a disconnect are not replayed after rebaseline", async () => {
+  const encryptedTexts: string[] = [];
+  const setup = await startReady({
+    localTrustState: "verified",
+    encrypt: async (input) => {
+      encryptedTexts.push(input.plaintext as string);
+      return {
+        itemId: `${encryptedTexts.length}`,
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: new Date().toISOString(),
+      };
+    },
+  });
+
+  setup.socket.trigger("disconnect", "transport close");
+  await setup.runtime.handleClipboardObservation(clipboardObservation("stale"));
+  await setup.runtime.reconcileConnectivity("test-wake", {
+    forceSocketRecycle: true,
+  });
+  setup.socket.trigger("auth:challenge", {
+    socketId: "socket-1",
+    challenge: "wake-challenge",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  setup.socket.trigger("auth:ready");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(encryptedTexts, []);
+  await setup.runtime.handleClipboardObservation(clipboardObservation("fresh"));
+  assert.deepEqual(encryptedTexts, ["fresh"]);
+});
+
+test("manual Send performs one bounded recovery before reading and publishing", async () => {
+  let available = false;
+  const setup = makeRuntime({
+    localTrustState: "verified",
+    listDevices: async () => {
+      if (!available) throw new Error("network unavailable");
+      return response([registeredDevice]);
+    },
+    listPendingDevices: async () => {
+      if (!available) throw new Error("network unavailable");
+      return response([]);
+    },
+  });
+  await setup.runtime.start();
+  available = true;
+
+  const send = setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:send-current-clipboard" }),
+  );
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    if (setup.runtime.getStatus().socket.connected) break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  setup.socket.trigger("auth:challenge", {
+    socketId: "socket-1",
+    challenge: "manual-recovery-challenge",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  setup.socket.trigger("auth:ready");
+
+  const result = await send;
+  assert.equal(result.ok, true);
+});
+
+test("repeated recovery calls use one socket and one listener set per live socket", async () => {
+  const sockets: FakeSocket[] = [];
+  const setup = makeRuntime({
+    localTrustState: "verified",
+    socketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+  });
+  await setup.runtime.start();
+  assert.equal(sockets.length, 1);
+
+  const firstRecovery = setup.runtime.reconcileConnectivity("first", {
+    forceSocketRecycle: true,
+  });
+  const secondRecovery = setup.runtime.reconcileConnectivity("second", {
+    forceSocketRecycle: true,
+  });
+  await Promise.all([firstRecovery, secondRecovery]);
+
+  assert.equal(sockets.length, 2);
+  assert.equal(sockets[1].events.size, 7);
+  await setup.runtime.reconcileConnectivity("third", {
+    forceSocketRecycle: true,
+  });
+  assert.equal(sockets.length, 3);
+  assert.equal(sockets[2].events.size, 7);
+});
+
+test("an on-time recovery probe preserves a healthy authenticated socket", async () => {
+  const setup = await startReady({ localTrustState: "verified" });
+  const before = setup.runtime.getStatus();
+  await setup.runtime.reconcileConnectivity("recovery-alarm");
+  const after = setup.runtime.getStatus();
+
+  assert.equal(after.socket.connected, true);
+  assert.equal(after.socket.deviceAuthenticated, true);
+  assert.equal(after.syncReady, true);
+  assert.equal(after.connectionState, before.connectionState);
 });
