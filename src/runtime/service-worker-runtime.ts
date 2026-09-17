@@ -37,6 +37,8 @@ import {
 } from "./errors.ts";
 import {
   envelopeFromSocketPayload,
+  isClipboardText,
+  isOffscreenClipboardObservation,
   isRuntimeRequest,
   POPUP_SOURCE,
   RUNTIME_SOURCE,
@@ -125,6 +127,7 @@ const DEFAULT_STATUS: RuntimeStatus = {
     deviceAuthenticated: false,
   },
   syncReady: false,
+  clipboardWatch: "stopped",
   onboarding: {
     state: "unknown",
     bootstrapEligible: false,
@@ -497,6 +500,15 @@ export class CopyytServiceWorkerRuntime {
   private socketRecoveryInFlight: Promise<void> | null = null;
   private socketRecoveryTarget: SocketLike | null = null;
   private readonly inboundInFlight = new Set<string>();
+  private clipboardWatchRunning = false;
+  private clipboardWatchDesired = false;
+  private clipboardWatchReconcileInFlight: Promise<void> | null = null;
+  private autoObservationSequence = 0;
+  private autoPublishInFlight: Promise<void> | null = null;
+  private pendingAutoObservation: {
+    text: string;
+    sequence: number;
+  } | null = null;
 
   constructor(dependencies: RuntimeDependencies) {
     this.dependencies = dependencies;
@@ -542,6 +554,12 @@ export class CopyytServiceWorkerRuntime {
             ...(persistedStatus.lastConnectionError
               ? { lastConnectionError: persistedStatus.lastConnectionError }
               : {}),
+            ...(persistedStatus.lastAutoSyncAt
+              ? { lastAutoSyncAt: persistedStatus.lastAutoSyncAt }
+              : {}),
+            ...(persistedStatus.lastAutoSyncError
+              ? { lastAutoSyncError: persistedStatus.lastAutoSyncError }
+              : {}),
           }
         : {}),
       connectionState: this.session ? "account-authenticated" : "signed-out",
@@ -549,11 +567,18 @@ export class CopyytServiceWorkerRuntime {
       user: this.session ? userFromSession(this.session) : undefined,
       socket: { connected: false, deviceAuthenticated: false },
       syncReady: false,
+      clipboardWatch: "stopped",
     };
     this.serverDeviceState = "unknown";
     this.socketReady = false;
     this.challengeInFlight = false;
     this.challengeReceived = false;
+    this.clipboardWatchDesired = false;
+    this.clipboardWatchRunning = false;
+    this.pendingAutoObservation = null;
+    if (this.dependencies.clipboardAdapter.stopWatching) {
+      await this.dependencies.clipboardAdapter.stopWatching().catch(() => undefined);
+    }
 
     if (!this.session) {
       this.setStatus({
@@ -610,6 +635,38 @@ export class CopyytServiceWorkerRuntime {
     return structuredClone(this.status);
   }
 
+  /** Handles a validated, fire-and-forget observation from the offscreen document. */
+  async handleClipboardObservation(message: unknown): Promise<void> {
+    if (
+      !isOffscreenClipboardObservation(message) ||
+      message.text.length === 0 ||
+      !isClipboardText(message.text) ||
+      !this.isAutomaticSyncEligible()
+    ) {
+      return;
+    }
+
+    const observation = {
+      text: message.text,
+      sequence: ++this.autoObservationSequence,
+    };
+    if (this.autoPublishInFlight) {
+      // Clipboard state is live, not history: retain only the newest value.
+      this.pendingAutoObservation = observation;
+      await this.autoPublishInFlight;
+      return;
+    }
+
+    const operation = this.drainAutoObservations(observation);
+    const trackedOperation = operation.finally(() => {
+      if (this.autoPublishInFlight === trackedOperation) {
+        this.autoPublishInFlight = null;
+      }
+    });
+    this.autoPublishInFlight = trackedOperation;
+    await trackedOperation;
+  }
+
   async handleMessage(message: unknown): Promise<RuntimeResponse> {
     if (!isRuntimeRequest(message)) {
       throw new RuntimeError("AUTH_REQUIRED", "The runtime message is invalid");
@@ -645,11 +702,80 @@ export class CopyytServiceWorkerRuntime {
     }
   }
 
+  private isAutomaticSyncEligible(requireWatcher = true): boolean {
+    const watcherReady =
+      !this.dependencies.clipboardAdapter.startWatching ||
+      this.clipboardWatchRunning;
+    return Boolean(
+      this.session &&
+        this.status.syncReady &&
+        this.status.device.registration === "registered" &&
+        typeof this.status.device.deviceId === "string" &&
+        typeof this.status.device.keyVersion === "number" &&
+        isLocallyVerifiedStatus(this.status) &&
+        this.serverDeviceState === "trusted" &&
+        this.socket &&
+        this.socket.connected &&
+        this.socketReady &&
+        this.status.socket.deviceAuthenticated &&
+        (!requireWatcher || watcherReady),
+    );
+  }
+
+  private async drainAutoObservations(first: {
+    text: string;
+    sequence: number;
+  }): Promise<void> {
+    let current = first;
+    while (true) {
+      if (!this.isAutomaticSyncEligible()) return;
+      try {
+        await this.publishClipboardText(current.text);
+        this.setStatus({
+          ...this.status,
+          lastAutoSyncAt: this.now().toISOString(),
+          lastAutoSyncError: undefined,
+        });
+      } catch (error) {
+        const runtimeError = asRuntimeError(
+          error,
+          "SOCKET_PUBLISH_FAILED",
+          "Automatic clipboard sync failed",
+        );
+        this.setStatus({
+          ...this.status,
+          lastAutoSyncError: {
+            code: runtimeError.code,
+            message: runtimeError.message,
+            at: this.now().toISOString(),
+          },
+        });
+        if (
+          runtimeError.code === "NO_VERIFIED_RECIPIENTS" ||
+          runtimeError.code === "DEVICE_NOT_LOCALLY_TRUSTED" ||
+          runtimeError.code === "DEVICE_NOT_REGISTERED" ||
+          runtimeError.code === "SOCKET_NOT_READY" ||
+          runtimeError.code === "AUTH_REQUIRED"
+        ) {
+          // These are eligibility failures, not transient publish failures.
+          // Never carry a newer plaintext value across them.
+          this.pendingAutoObservation = null;
+          return;
+        }
+      }
+
+      const pending = this.pendingAutoObservation;
+      this.pendingAutoObservation = null;
+      if (!pending || pending.sequence <= current.sequence) return;
+      current = pending;
+    }
+  }
+
   async publishClipboardText(text: string): Promise<{ itemId: string }> {
-    if (typeof text !== "string") {
+    if (!isClipboardText(text)) {
       throw new RuntimeError(
         "CLIPBOARD_READ_FAILED",
-        "The clipboard adapter returned non-text data",
+        "The clipboard adapter returned invalid text data",
       );
     }
     const session = this.requireSession();
@@ -992,6 +1118,9 @@ export class CopyytServiceWorkerRuntime {
   }
 
   private async logout(): Promise<void> {
+    // Stop live clipboard observation as soon as local logout begins, before
+    // waiting on the best-effort server logout request.
+    this.destroySocket(this.socket);
     if (this.session) {
       try {
         await this.dependencies
@@ -2121,6 +2250,18 @@ export class CopyytServiceWorkerRuntime {
       this.socketReady = false;
       this.challengeInFlight = false;
       this.challengeReceived = false;
+      if (
+        this.status.socket.connected ||
+        this.status.socket.deviceAuthenticated ||
+        this.status.syncReady
+      ) {
+        this.setStatus({
+          ...this.status,
+          connectionState: this.session ? "account-authenticated" : "signed-out",
+          socket: { connected: false, deviceAuthenticated: false },
+          syncReady: false,
+        });
+      }
     }
     try {
       socket.disconnect();
@@ -2241,6 +2382,64 @@ export class CopyytServiceWorkerRuntime {
     });
   }
 
+  private requestClipboardWatcherReconcile(): void {
+    this.clipboardWatchDesired = this.isAutomaticSyncEligible(false);
+    if (
+      !this.dependencies.clipboardAdapter.startWatching ||
+      !this.dependencies.clipboardAdapter.stopWatching
+    ) {
+      if (!this.clipboardWatchDesired && this.status.clipboardWatch !== "stopped") {
+        this.status = { ...this.status, clipboardWatch: "stopped" };
+      }
+      return;
+    }
+    if (this.clipboardWatchReconcileInFlight) return;
+    const operation = Promise.resolve().then(() =>
+      this.reconcileClipboardWatcher(),
+    );
+    this.clipboardWatchReconcileInFlight = operation;
+    void operation.then(undefined, () => undefined).then(() => {
+      if (this.clipboardWatchReconcileInFlight === operation) {
+        this.clipboardWatchReconcileInFlight = null;
+      }
+    });
+  }
+
+  private async reconcileClipboardWatcher(): Promise<void> {
+    const adapter = this.dependencies.clipboardAdapter;
+    if (!adapter.startWatching || !adapter.stopWatching) return;
+
+    while (true) {
+      const desired = this.clipboardWatchDesired;
+      if (desired && !this.clipboardWatchRunning) {
+        this.setStatus({ ...this.status, clipboardWatch: "starting" });
+        try {
+          await adapter.startWatching({ resetBaseline: true });
+          this.clipboardWatchRunning = true;
+          this.setStatus({ ...this.status, clipboardWatch: "watching" });
+        } catch {
+          this.clipboardWatchRunning = false;
+          this.setStatus({ ...this.status, clipboardWatch: "error" });
+          return;
+        }
+      }
+
+      if (!this.clipboardWatchDesired && this.clipboardWatchRunning) {
+        try {
+          await adapter.stopWatching();
+          this.clipboardWatchRunning = false;
+          this.setStatus({ ...this.status, clipboardWatch: "stopped" });
+        } catch {
+          this.clipboardWatchRunning = false;
+          this.setStatus({ ...this.status, clipboardWatch: "error" });
+          return;
+        }
+      }
+
+      if (desired === this.clipboardWatchDesired) break;
+    }
+  }
+
   private setStatus(next: RuntimeStatus): void {
     this.status = next;
     void this.dependencies.statusStore
@@ -2254,6 +2453,7 @@ export class CopyytServiceWorkerRuntime {
         status: this.getStatus(),
       });
     }
+    this.requestClipboardWatcherReconcile();
   }
 
   private setOnboarding(onboarding: RuntimeStatus["onboarding"]): void {

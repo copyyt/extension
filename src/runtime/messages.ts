@@ -6,6 +6,12 @@ export const RUNTIME_SOURCE = "service-worker" as const;
 export const POPUP_SOURCE = "popup" as const;
 export const OFFSCREEN_SOURCE = "offscreen" as const;
 
+// Transport guard for plaintext crossing the extension messaging boundary.
+// This does not add a field to the encrypted Copyyt protocol.
+export const MAX_CLIPBOARD_TEXT_BYTES = 1024 * 1024;
+
+export type ClipboardWatchState = "stopped" | "starting" | "watching" | "error";
+
 export type RuntimeConnectionState =
   | "signed-out"
   | "connecting"
@@ -59,6 +65,13 @@ export interface RuntimeStatus {
   };
   /** Transport authentication is separate from permission to sync clipboard data. */
   syncReady: boolean;
+  clipboardWatch?: ClipboardWatchState;
+  lastAutoSyncAt?: string;
+  lastAutoSyncError?: {
+    code: RuntimeErrorCode;
+    message: string;
+    at: string;
+  };
   onboarding: {
     state: OnboardingState;
     bootstrapEligible: boolean;
@@ -146,20 +159,42 @@ export interface OffscreenRequest {
   source: typeof RUNTIME_SOURCE;
   target: typeof OFFSCREEN_SOURCE;
   requestId: string;
-  type: "READ_TEXT" | "WRITE_TEXT" | "PING";
+  type: "READ_TEXT" | "WRITE_TEXT" | "WATCH_START" | "WATCH_STOP" | "PING";
   text?: string;
+  resetBaseline?: boolean;
 }
 
 export interface OffscreenResponse {
   source: typeof OFFSCREEN_SOURCE;
   target: typeof RUNTIME_SOURCE;
   requestId: string;
-  type: "READ_TEXT_RESULT" | "WRITE_TEXT_RESULT" | "PONG" | "ERROR";
+  type:
+    | "READ_TEXT_RESULT"
+    | "WRITE_TEXT_RESULT"
+    | "WATCH_START_RESULT"
+    | "WATCH_STOP_RESULT"
+    | "PONG"
+    | "ERROR";
   text?: string;
   error?: {
     code: "CLIPBOARD_READ_FAILED" | "CLIPBOARD_WRITE_FAILED";
     message: string;
   };
+}
+
+export interface OffscreenClipboardObservation {
+  source: typeof OFFSCREEN_SOURCE;
+  target: typeof RUNTIME_SOURCE;
+  type: "CLIPBOARD_CHANGED";
+  text: string;
+}
+
+function isClipboardTextWithinLimit(value: string): boolean {
+  return new TextEncoder().encode(value).byteLength <= MAX_CLIPBOARD_TEXT_BYTES;
+}
+
+export function isClipboardText(value: unknown): value is string {
+  return typeof value === "string" && isClipboardTextWithinLimit(value);
 }
 
 export function isRuntimeRequest(value: unknown): value is RuntimeRequest {
@@ -186,7 +221,26 @@ export function isOffscreenRequest(value: unknown): value is OffscreenRequest {
     typeof candidate.requestId === "string" &&
     (candidate.type === "READ_TEXT" ||
       candidate.type === "WRITE_TEXT" ||
-      candidate.type === "PING")
+      candidate.type === "WATCH_START" ||
+      candidate.type === "WATCH_STOP" ||
+      candidate.type === "PING") &&
+    (candidate.type !== "WRITE_TEXT" || isClipboardText(candidate.text)) &&
+    (candidate.type !== "WATCH_START" ||
+      candidate.resetBaseline === undefined ||
+      typeof candidate.resetBaseline === "boolean")
+  );
+}
+
+export function isOffscreenClipboardObservation(
+  value: unknown,
+): value is OffscreenClipboardObservation {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<OffscreenClipboardObservation>;
+  return (
+    candidate.source === OFFSCREEN_SOURCE &&
+    candidate.target === RUNTIME_SOURCE &&
+    candidate.type === "CLIPBOARD_CHANGED" &&
+    isClipboardText(candidate.text)
   );
 }
 

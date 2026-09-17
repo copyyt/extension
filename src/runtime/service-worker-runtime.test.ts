@@ -1380,6 +1380,151 @@ test("publishing intersects local recipients with active server-trusted devices"
   assert.deepEqual(recipientIds, [pendingDevice.deviceId]);
 });
 
+function clipboardObservation(text: string) {
+  return {
+    source: "offscreen" as const,
+    target: "service-worker" as const,
+    type: "CLIPBOARD_CHANGED" as const,
+    text,
+  };
+}
+
+test("automatic observations use the same publish path as manual Send", async () => {
+  const watchCalls: Array<{ type: "start" | "stop"; resetBaseline?: boolean }> = [];
+  const encryptedTexts: string[] = [];
+  const clipboardAdapter: ClipboardAdapter = {
+    readText: async () => "manual text",
+    writeText: async () => undefined,
+    startWatching: async (options) => {
+      watchCalls.push({ type: "start", resetBaseline: options?.resetBaseline });
+    },
+    stopWatching: async () => {
+      watchCalls.push({ type: "stop" });
+    },
+  };
+  const setup = await startReady({
+    localTrustState: "verified",
+    clipboardAdapter,
+    encrypt: async (input) => {
+      encryptedTexts.push(input.plaintext as string);
+      return {
+        itemId: `${encryptedTexts.length}`,
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: new Date().toISOString(),
+      };
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(setup.runtime.getStatus().clipboardWatch, "watching");
+  assert.deepEqual(watchCalls, [
+    { type: "stop" },
+    { type: "start", resetBaseline: true },
+  ]);
+
+  const manual = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:send-current-clipboard" }),
+  );
+  assert.equal(manual.ok, true);
+  await setup.runtime.handleClipboardObservation(clipboardObservation("automatic text"));
+  assert.deepEqual(encryptedTexts, ["manual text", "automatic text"]);
+  assert.equal(typeof setup.runtime.getStatus().lastAutoSyncAt, "string");
+});
+
+test("automatic observations are dropped while sync is not ready and are not queued", async () => {
+  let encryptions = 0;
+  const setup = makeRuntime({
+    localTrustState: "unverified",
+    encrypt: async (input) => {
+      encryptions += 1;
+      return {
+        itemId: "automatic-item",
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: new Date().toISOString(),
+      };
+    },
+  });
+  await setup.runtime.start();
+  setup.socket.trigger("auth:ready");
+  await setup.runtime.handleClipboardObservation(clipboardObservation("stale"));
+  assert.equal(encryptions, 0);
+  assert.equal(setup.runtime.getStatus().lastAutoSyncAt, undefined);
+});
+
+test("automatic publishing is single-flight and latest-wins", async () => {
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const encryptedTexts: string[] = [];
+  const setup = await startReady({
+    localTrustState: "verified",
+    encrypt: async (input) => {
+      encryptedTexts.push(input.plaintext as string);
+      if (encryptedTexts.length === 1) await firstGate;
+      return {
+        itemId: `${encryptedTexts.length}`,
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: new Date().toISOString(),
+      };
+    },
+  });
+
+  const first = setup.runtime.handleClipboardObservation(clipboardObservation("first"));
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = setup.runtime.handleClipboardObservation(clipboardObservation("second"));
+  const third = setup.runtime.handleClipboardObservation(clipboardObservation("latest"));
+  releaseFirst();
+  await Promise.all([first, second, third]);
+  assert.deepEqual(encryptedTexts, ["first", "latest"]);
+});
+
+test("a locally revoked device cannot auto-publish", async () => {
+  let encryptions = 0;
+  const setup = makeRuntime({
+    localTrustState: "revoked",
+    encrypt: async (input) => {
+      encryptions += 1;
+      return {
+        itemId: "revoked-item",
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: new Date().toISOString(),
+      };
+    },
+  });
+  await setup.runtime.start();
+  setup.socket.trigger("auth:ready");
+  await setup.runtime.handleClipboardObservation(clipboardObservation("revoked"));
+  assert.equal(encryptions, 0);
+});
+
 test("trusted and pending collections drive the complete restart-safe pairing ceremony", async () => {
   const pendingIdentity = {
     ...identity,

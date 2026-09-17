@@ -1,10 +1,15 @@
 import {
+  isClipboardText,
   isOffscreenRequest,
   OFFSCREEN_SOURCE,
   RUNTIME_SOURCE,
   type OffscreenRequest,
+  type OffscreenClipboardObservation,
   type OffscreenResponse,
 } from "./runtime/messages.ts";
+import { ClipboardWatcher } from "./runtime/clipboard-watcher.ts";
+
+export const CLIPBOARD_WATCH_INTERVAL_MS = 800;
 
 function response(
   request: OffscreenRequest,
@@ -69,6 +74,27 @@ function writeClipboardText(text: string): void {
   }
 }
 
+const clipboardWatcher = new ClipboardWatcher({
+  readText: readClipboardText,
+  intervalMs: CLIPBOARD_WATCH_INTERVAL_MS,
+  onChanged: (text) => {
+    const observation: OffscreenClipboardObservation = {
+      source: OFFSCREEN_SOURCE,
+      target: RUNTIME_SOURCE,
+      type: "CLIPBOARD_CHANGED",
+      text,
+    };
+    // An observation is intentionally fire-and-forget. The service worker
+    // validates it and waits for its startup promise before handling it.
+    void chrome.runtime.sendMessage(observation).catch(() => undefined);
+  },
+  onError: (error) => {
+    // Clipboard polling failures are transient and must not expose clipboard
+    // content or create extension-error noise.
+    void error;
+  },
+});
+
 chrome.runtime.onMessage.addListener(
   (message: unknown, sender, sendResponse) => {
     if (!isOffscreenRequest(message) || sender.id !== chrome.runtime.id) {
@@ -83,7 +109,7 @@ chrome.runtime.onMessage.addListener(
       }
 
       if (request.type === "WRITE_TEXT") {
-        if (typeof request.text !== "string") {
+        if (!isClipboardText(request.text)) {
           return response(request, "ERROR", {
             error: {
               code: "CLIPBOARD_WRITE_FAILED",
@@ -94,6 +120,9 @@ chrome.runtime.onMessage.addListener(
 
         try {
           writeClipboardText(request.text);
+          // This update is in the same synchronous handler turn as the
+          // successful OS write, so the next sample cannot echo it outward.
+          clipboardWatcher.noteExternalWrite(request.text);
           return response(request, "WRITE_TEXT_RESULT");
         } catch (error) {
           console.error("COPYyt offscreen clipboard write failed", error);
@@ -108,6 +137,16 @@ chrome.runtime.onMessage.addListener(
             },
           });
         }
+      }
+
+      if (request.type === "WATCH_START") {
+        clipboardWatcher.start({ resetBaseline: request.resetBaseline === true });
+        return response(request, "WATCH_START_RESULT");
+      }
+
+      if (request.type === "WATCH_STOP") {
+        clipboardWatcher.stop();
+        return response(request, "WATCH_STOP_RESULT");
       }
 
       try {

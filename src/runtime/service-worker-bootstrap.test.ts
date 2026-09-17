@@ -126,3 +126,85 @@ test("concurrent messages share one startup promise", async () => {
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(responses, 2);
 });
+
+test("offscreen clipboard observations wait for startup and use the packaged sender context", async () => {
+  let releaseStartup!: () => void;
+  const runtimeReady = new Promise<void>((resolve) => {
+    releaseStartup = resolve;
+  });
+  const observations: unknown[] = [];
+  const listener = createRuntimeMessageListener({
+    runtime: {
+      handleMessage: async () => response(request({ type: "runtime:get-status" })),
+      handleClipboardObservation: async (message) => {
+        observations.push(message);
+      },
+    },
+    runtimeReady,
+    getStartupError: () => null,
+    runtimeId: "extension-id",
+    extensionUrl: "chrome-extension://extension-id/",
+  });
+  const observation = {
+    source: "offscreen" as const,
+    target: "service-worker" as const,
+    type: "CLIPBOARD_CHANGED" as const,
+    text: "clipboard value",
+  };
+
+  assert.equal(
+    listener(
+      observation,
+      { id: "extension-id", url: "chrome-extension://extension-id/offscreen.html" },
+      () => undefined,
+    ),
+    true,
+  );
+  await Promise.resolve();
+  assert.deepEqual(observations, []);
+  releaseStartup();
+  await runtimeReady;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(observations, [observation]);
+});
+
+test("offscreen observations from another extension page or id are rejected", async () => {
+  const observations: unknown[] = [];
+  const listener = createRuntimeMessageListener({
+    runtime: {
+      handleMessage: async () => response(request({ type: "runtime:get-status" })),
+      handleClipboardObservation: (message) => {
+        observations.push(message);
+      },
+    },
+    runtimeReady: Promise.resolve(),
+    getStartupError: () => null,
+    runtimeId: "extension-id",
+    extensionUrl: "chrome-extension://extension-id/",
+  });
+  const observation = {
+    source: "offscreen" as const,
+    target: "service-worker" as const,
+    type: "CLIPBOARD_CHANGED" as const,
+    text: "must not dispatch",
+  };
+
+  assert.equal(
+    listener(
+      observation,
+      { id: "extension-id", url: "chrome-extension://extension-id/popup.html" },
+      () => undefined,
+    ),
+    false,
+  );
+  assert.equal(
+    listener(
+      observation,
+      { id: "different-extension", url: "chrome-extension://extension-id/offscreen.html" },
+      () => undefined,
+    ),
+    false,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(observations, []);
+});

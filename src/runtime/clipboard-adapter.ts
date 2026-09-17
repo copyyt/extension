@@ -1,5 +1,6 @@
 import { RuntimeError } from "./errors.ts";
 import {
+  isClipboardText,
   isOffscreenRequest,
   OFFSCREEN_SOURCE,
   RUNTIME_SOURCE,
@@ -12,6 +13,8 @@ export interface ClipboardAdapter {
   readText(): Promise<string>;
   writeText(text: string): Promise<void>;
   ping?(): Promise<void>;
+  startWatching?(options?: { resetBaseline?: boolean }): Promise<void>;
+  stopWatching?(): Promise<void>;
 }
 
 interface RuntimeMessagingApi {
@@ -31,6 +34,8 @@ function isResponse(value: unknown): value is OffscreenResponse {
     typeof candidate.requestId === "string" &&
     (candidate.type === "READ_TEXT_RESULT" ||
       candidate.type === "WRITE_TEXT_RESULT" ||
+      candidate.type === "WATCH_START_RESULT" ||
+      candidate.type === "WATCH_STOP_RESULT" ||
       candidate.type === "PONG" ||
       candidate.type === "ERROR")
   );
@@ -62,7 +67,7 @@ export class OffscreenClipboardAdapter implements ClipboardAdapter {
     }
     if (
       response.type !== "READ_TEXT_RESULT" ||
-      typeof response.text !== "string"
+      !isClipboardText(response.text)
     ) {
       throw new RuntimeError(
         "CLIPBOARD_READ_FAILED",
@@ -73,7 +78,7 @@ export class OffscreenClipboardAdapter implements ClipboardAdapter {
   }
 
   async writeText(text: string): Promise<void> {
-    if (typeof text !== "string") {
+    if (!isClipboardText(text)) {
       throw new RuntimeError(
         "CLIPBOARD_WRITE_FAILED",
         "Clipboard text must be a string",
@@ -103,6 +108,44 @@ export class OffscreenClipboardAdapter implements ClipboardAdapter {
     }
   }
 
+  async startWatching(options: { resetBaseline?: boolean } = {}): Promise<void> {
+    let response: OffscreenResponse;
+    try {
+      response = await this.send({
+        type: "WATCH_START",
+        resetBaseline: options.resetBaseline === true,
+      });
+    } catch {
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The Copyyt clipboard watcher did not respond",
+      );
+    }
+    if (response.type !== "WATCH_START_RESULT") {
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The clipboard watcher returned an invalid response",
+      );
+    }
+  }
+
+  async stopWatching(): Promise<void> {
+    let response: OffscreenResponse;
+    try {
+      // Stopping should not create an offscreen document just to discover that
+      // there was no watcher to stop.
+      response = await this.send({ type: "WATCH_STOP" }, false);
+    } catch {
+      return;
+    }
+    if (response.type !== "WATCH_STOP_RESULT") {
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The clipboard watcher returned an invalid response",
+      );
+    }
+  }
+
   async ping(): Promise<void> {
     let response: OffscreenResponse;
     try {
@@ -122,9 +165,10 @@ export class OffscreenClipboardAdapter implements ClipboardAdapter {
   }
 
   private async send(
-    input: Pick<OffscreenRequest, "type" | "text">,
+    input: Pick<OffscreenRequest, "type" | "text" | "resetBaseline">,
+    ensureDocument = true,
   ): Promise<OffscreenResponse> {
-    await this.ensureDocument();
+    if (ensureDocument) await this.ensureDocument();
     const message: OffscreenRequest = {
       source: RUNTIME_SOURCE,
       target: OFFSCREEN_SOURCE,
