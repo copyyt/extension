@@ -9,6 +9,17 @@ import Logo from "@/vectors/logo";
 import LogoutIcon from "@/vectors/logout";
 import { useState } from "react";
 
+type ClipboardSyncMode = "both" | "send-only" | "receive-only" | "off";
+
+function clipboardSyncMode(status: RuntimeStatus): ClipboardSyncMode {
+  if (status.syncPreferences.sendEnabled && status.syncPreferences.receiveEnabled) {
+    return "both";
+  }
+  if (status.syncPreferences.sendEnabled) return "send-only";
+  if (status.syncPreferences.receiveEnabled) return "receive-only";
+  return "off";
+}
+
 function statusLabel(status: RuntimeStatus): string {
   switch (status.connectionState) {
     case "ready":
@@ -33,6 +44,7 @@ function Home() {
   const [sending, setSending] = useState(false);
   const [trusting, setTrusting] = useState(false);
   const [pairingBusy, setPairingBusy] = useState(false);
+  const [syncPreferencesBusy, setSyncPreferencesBusy] = useState(false);
   const [confirmedFingerprint, setConfirmedFingerprint] = useState("");
   const [message, setMessage] = useState<string | null>(null);
 
@@ -112,9 +124,42 @@ function Home() {
     }
   };
 
+  const updateClipboardSync = async (mode: ClipboardSyncMode) => {
+    const preferences = {
+      both: { sendEnabled: true, receiveEnabled: true },
+      "send-only": { sendEnabled: true, receiveEnabled: false },
+      "receive-only": { sendEnabled: false, receiveEnabled: true },
+      off: { sendEnabled: false, receiveEnabled: false },
+    }[mode];
+    setSyncPreferencesBusy(true);
+    setMessage(null);
+    try {
+      await sendRuntimeCommand<RuntimeStatus>({
+        type: "runtime:set-sync-preferences",
+        ...preferences,
+      });
+      await reload();
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Unable to update clipboard sync preferences",
+      );
+    } finally {
+      setSyncPreferencesBusy(false);
+    }
+  };
+
   const localDeviceTrusted =
     status?.device.trustState === "root" || status?.device.trustState === "verified";
   const pairing = status?.onboarding?.pairing;
+  const selectedSyncMode = status ? clipboardSyncMode(status) : "both";
+  const syncModes: Array<{ mode: ClipboardSyncMode; label: string }> = [
+    { mode: "both", label: "Both" },
+    { mode: "send-only", label: "Send only" },
+    { mode: "receive-only", label: "Receive only" },
+    { mode: "off", label: "Off" },
+  ];
 
   return (
     <section className="flex h-full flex-col sm:block">
@@ -158,6 +203,30 @@ function Home() {
         <div className="flex justify-between gap-4">
           <span className="text-[#4B5563]">Socket</span>
           <span>{status ? statusLabel(status) : "Loading"}</span>
+        </div>
+      </div>
+
+      <div className="mt-3 rounded-lg border border-[#D1D5DB] p-4">
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-sm font-semibold">Clipboard Sync</span>
+          {syncPreferencesBusy ? (
+            <span className="text-xs text-[#4B5563]">Updating…</span>
+          ) : null}
+        </div>
+        <div className="mt-3 grid grid-cols-2 gap-2" role="radiogroup" aria-label="Clipboard Sync">
+          {syncModes.map(({ mode, label }) => (
+            <Button
+              key={mode}
+              variant={selectedSyncMode === mode ? "primary" : "outlined"}
+              className="!rounded-lg px-2 text-xs"
+              onClick={() => void updateClipboardSync(mode)}
+              disabled={syncPreferencesBusy || !status}
+              aria-checked={selectedSyncMode === mode}
+              role="radio"
+            >
+              {label}
+            </Button>
+          ))}
         </div>
       </div>
 
@@ -232,7 +301,12 @@ function Home() {
         variant="primary"
         className="mt-3 w-full"
         onClick={sendCurrentClipboard}
-        disabled={sending || !status?.signedIn || !localDeviceTrusted}
+        disabled={
+          sending ||
+          !status?.signedIn ||
+          !localDeviceTrusted ||
+          !status.syncPreferences.sendEnabled
+        }
       >
         {sending ? "Encrypting and sending…" : "Send current clipboard"}
       </Button>

@@ -22,6 +22,10 @@ import {
   type SocketOptions,
 } from "./service-worker-runtime.ts";
 import type { RuntimeCommand, RuntimeStatus } from "./messages.ts";
+import {
+  InMemorySyncPreferencesStore,
+  type SyncPreferencesStore,
+} from "./sync-preferences.ts";
 
 const user: IUser = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -135,6 +139,10 @@ function makeRuntime(overrides: Partial<{
   socketFactory: RuntimeDependencies["socketFactory"];
   signChallenge: RuntimeDependencies["signChallenge"];
   recoveryAlarm: RuntimeDependencies["recoveryAlarm"];
+  syncPreferencesStore: SyncPreferencesStore;
+  processedItemStore: RuntimeDependencies["processedItemStore"];
+  outboundItemStore: RuntimeDependencies["outboundItemStore"];
+  now: () => Date;
 }> = {}) {
   const runtimeIdentity = overrides.identity ?? identity;
   const runtimeRegisteredDevice = overrides.registeredDevice ?? registeredDevice;
@@ -143,6 +151,9 @@ function makeRuntime(overrides: Partial<{
     : overrides.initialSession;
   const sessionStore = overrides.sessionStore ?? new MemorySessionStore(initialSession);
   const statusStore = overrides.statusStore ?? new MemoryStatusStore();
+  const syncPreferencesStore = overrides.syncPreferencesStore ?? new InMemorySyncPreferencesStore();
+  const processedItemStore = overrides.processedItemStore ?? new InMemoryItemMetadataStore();
+  const outboundItemStore = overrides.outboundItemStore ?? new InMemoryItemMetadataStore();
   const socket = overrides.socket ?? new FakeSocket();
   const clipboardAdapter = overrides.clipboardAdapter ?? {
     readText: async () => "secret plaintext",
@@ -190,8 +201,9 @@ function makeRuntime(overrides: Partial<{
     statusStore,
     trustStore,
     clipboardAdapter,
-    processedItemStore: new InMemoryItemMetadataStore(),
-    outboundItemStore: new InMemoryItemMetadataStore(),
+    processedItemStore,
+    outboundItemStore,
+    syncPreferencesStore,
     apiFactory: () => api,
     socketFactory: overrides.socketFactory ?? ((url: string, options: SocketOptions) => {
       void url;
@@ -204,6 +216,7 @@ function makeRuntime(overrides: Partial<{
     signChallenge: overrides.signChallenge ?? (async () => "signed-challenge"),
     signApproval: overrides.signApproval,
     recoveryAlarm: overrides.recoveryAlarm,
+    now: overrides.now,
     encrypt: overrides.encrypt ?? (async (input) => ({
       itemId: "22222222-2222-4222-8222-222222222222",
       sourceDeviceId: input.identity.deviceId,
@@ -214,11 +227,21 @@ function makeRuntime(overrides: Partial<{
       ciphertext: "ciphertext",
       nonce: "nonce",
       recipients: [],
-      expiresAt: new Date().toISOString(),
+      expiresAt: input.expiresAt,
     })),
     decrypt: overrides.decrypt ?? (async () => ({ plaintext: "decrypted plaintext", plaintextBytes: new Uint8Array() })),
   });
-  return { runtime, socket, sessionStore, statusStore, trustStore, clipboardAdapter, getSocketOptions: () => socketOptions };
+  return {
+    runtime,
+    socket,
+    sessionStore,
+    statusStore,
+    trustStore,
+    clipboardAdapter,
+    syncPreferencesStore,
+    processedItemStore,
+    getSocketOptions: () => socketOptions,
+  };
 }
 
 test("runtime start is single-flight and worker recreation restores session without stale readiness", async () => {
@@ -343,7 +366,7 @@ test("a verified inbound envelope is written once and duplicates are ignored", a
     ciphertext: "ciphertext",
     nonce: "nonce",
     recipients: [{ deviceId: identity.deviceId, deviceKeyVersion: 1, wrapNonce: "nonce", wrappedContentKey: "wrapped" }],
-    expiresAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
   };
   await runtime.receiveClipboardItem(envelope);
   await runtime.receiveClipboardItem(envelope);
@@ -377,6 +400,500 @@ function runtimeMessage(command: RuntimeCommand, requestId = crypto.randomUUID()
     command,
   };
 }
+
+function futureExpiry(offsetMs = 60_000): string {
+  return new Date(Date.now() + offsetMs).toISOString();
+}
+
+function inboundEnvelope(
+  itemId: string,
+  expiresAt = futureExpiry(),
+) {
+  return {
+    itemId,
+    sourceDeviceId: identity.deviceId,
+    sourceKeyVersion: 1,
+    sourceSignature: "signature",
+    protocolVersion: 1 as const,
+    contentType: "text/plain",
+    ciphertext: "ciphertext",
+    nonce: "nonce",
+    recipients: [
+      {
+        deviceId: identity.deviceId,
+        deviceKeyVersion: 1,
+        wrapNonce: "nonce",
+        wrappedContentKey: "wrapped",
+      },
+    ],
+    expiresAt,
+  };
+}
+
+const flushRuntimeWork = (): Promise<void> =>
+  new Promise((resolve) => setImmediate(resolve));
+
+test("sync preferences default to Both and survive worker recreation", async () => {
+  const syncPreferencesStore = new InMemorySyncPreferencesStore();
+  const first = makeRuntime({
+    localTrustState: "verified",
+    syncPreferencesStore,
+  });
+  await first.runtime.start();
+  assert.deepEqual(first.runtime.getStatus().syncPreferences, {
+    schemaVersion: 1,
+    sendEnabled: true,
+    receiveEnabled: true,
+  });
+
+  const update = await first.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: true,
+      receiveEnabled: false,
+    }),
+  );
+  assert.equal(update.ok, true);
+  assert.deepEqual(await syncPreferencesStore.get(), {
+    schemaVersion: 1,
+    sendEnabled: true,
+    receiveEnabled: false,
+  });
+
+  const recreated = makeRuntime({
+    localTrustState: "verified",
+    syncPreferencesStore,
+    sessionStore: first.sessionStore,
+    trustStore: first.trustStore,
+  });
+  await recreated.runtime.start();
+  assert.deepEqual(recreated.runtime.getStatus().syncPreferences, {
+    schemaVersion: 1,
+    sendEnabled: true,
+    receiveEnabled: false,
+  });
+});
+
+test("all four sync preference modes persist exact send and receive behavior", async () => {
+  const syncPreferencesStore = new InMemorySyncPreferencesStore();
+  const setup = makeRuntime({ syncPreferencesStore });
+  await setup.runtime.start();
+  const modes = [
+    [true, true],
+    [true, false],
+    [false, true],
+    [false, false],
+  ] as const;
+  for (const [sendEnabled, receiveEnabled] of modes) {
+    const result = await setup.runtime.handleMessage(
+      runtimeMessage({
+        type: "runtime:set-sync-preferences",
+        sendEnabled,
+        receiveEnabled,
+      }),
+    );
+    assert.equal(result.ok, true);
+    assert.deepEqual(setup.runtime.getStatus().syncPreferences, {
+      schemaVersion: 1,
+      sendEnabled,
+      receiveEnabled,
+    });
+    assert.deepEqual(await syncPreferencesStore.get(), {
+      schemaVersion: 1,
+      sendEnabled,
+      receiveEnabled,
+    });
+  }
+});
+
+test("malformed preference commands fail closed", async () => {
+  const setup = makeRuntime();
+  await setup.runtime.start();
+  const result = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: "yes",
+      receiveEnabled: true,
+    } as unknown as RuntimeCommand),
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "SYNC_PREFERENCES_INVALID");
+  assert.deepEqual(setup.runtime.getStatus().syncPreferences, {
+    schemaVersion: 1,
+    sendEnabled: true,
+    receiveEnabled: true,
+  });
+});
+
+test("send disabled stops the watcher, drops pending auto work, and rejects manual Send", async () => {
+  const watchCalls: Array<{ type: "start" | "stop"; resetBaseline?: boolean }> = [];
+  let releasePublish!: () => void;
+  const publishGate = new Promise<void>((resolve) => {
+    releasePublish = resolve;
+  });
+  const encryptedTexts: string[] = [];
+  const setup = await startReady({
+    localTrustState: "verified",
+    clipboardAdapter: {
+      readText: async () => "manual",
+      writeText: async () => undefined,
+      startWatching: async (options) => {
+        watchCalls.push({ type: "start", resetBaseline: options?.resetBaseline });
+      },
+      stopWatching: async () => {
+        watchCalls.push({ type: "stop" });
+      },
+    },
+    encrypt: async (input) => {
+      encryptedTexts.push(input.plaintext as string);
+      if (encryptedTexts.length === 1) await publishGate;
+      return {
+        itemId: `${encryptedTexts.length}`,
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+  await flushRuntimeWork();
+
+  const first = setup.runtime.handleClipboardObservation(
+    clipboardObservation("first"),
+  );
+  await flushRuntimeWork();
+  const pending = setup.runtime.handleClipboardObservation(
+    clipboardObservation("pending"),
+  );
+  await flushRuntimeWork();
+  const disabled = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: false,
+      receiveEnabled: true,
+    }),
+  );
+  assert.equal(disabled.ok, true);
+  releasePublish();
+  await Promise.all([first, pending]);
+  await flushRuntimeWork();
+  assert.deepEqual(encryptedTexts, ["first"]);
+  assert.ok(watchCalls.some((call) => call.type === "stop"));
+
+  let reads = 0;
+  const manualSetup = makeRuntime({
+    localTrustState: "verified",
+    syncPreferencesStore: setup.syncPreferencesStore,
+    clipboardAdapter: {
+      readText: async () => {
+        reads += 1;
+        return "should not be read";
+      },
+      writeText: async () => undefined,
+    },
+  });
+  await manualSetup.runtime.start();
+  const result = await manualSetup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:send-current-clipboard" }),
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "CLIPBOARD_SEND_DISABLED");
+  assert.equal(reads, 0);
+});
+
+test("enabling send always rebaselines without publishing the existing clipboard", async () => {
+  const syncPreferencesStore = new InMemorySyncPreferencesStore();
+  await syncPreferencesStore.set({
+    schemaVersion: 1,
+    sendEnabled: false,
+    receiveEnabled: true,
+  });
+  const watchCalls: Array<{ type: "start" | "stop"; resetBaseline?: boolean }> = [];
+  let encryptions = 0;
+  const setup = await startReady({
+    localTrustState: "verified",
+    syncPreferencesStore,
+    clipboardAdapter: {
+      readText: async () => "already on clipboard",
+      writeText: async () => undefined,
+      startWatching: async (options) => {
+        watchCalls.push({ type: "start", resetBaseline: options?.resetBaseline });
+      },
+      stopWatching: async () => {
+        watchCalls.push({ type: "stop" });
+      },
+    },
+    encrypt: async (input) => {
+      encryptions += 1;
+      return {
+        itemId: `${encryptions}`,
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+  await flushRuntimeWork();
+  assert.equal(watchCalls.some((call) => call.type === "start"), false);
+
+  const enabled = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: true,
+      receiveEnabled: true,
+    }),
+  );
+  assert.equal(enabled.ok, true);
+  await flushRuntimeWork();
+  assert.deepEqual(watchCalls[watchCalls.length - 1], {
+    type: "start",
+    resetBaseline: true,
+  });
+  assert.equal(encryptions, 0);
+});
+
+test("receive disabled consumes an item without decrypting and never replays it", async () => {
+  const syncPreferencesStore = new InMemorySyncPreferencesStore();
+  await syncPreferencesStore.set({
+    schemaVersion: 1,
+    sendEnabled: true,
+    receiveEnabled: false,
+  });
+  let writes = 0;
+  let decryptions = 0;
+  const setup = await startReady({
+    localTrustState: "verified",
+    syncPreferencesStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async () => {
+        writes += 1;
+      },
+    },
+    decrypt: async () => {
+      decryptions += 1;
+      return { plaintext: "secret", plaintextBytes: new Uint8Array() };
+    },
+  });
+  const envelope = inboundEnvelope("receive-disabled-item");
+  await setup.runtime.receiveClipboardItem(envelope);
+  assert.equal(writes, 0);
+  assert.equal(decryptions, 0);
+  assert.equal(
+    await setup.processedItemStore.has(user.id, envelope.itemId),
+    true,
+  );
+
+  await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: true,
+      receiveEnabled: true,
+    }),
+  );
+  await setup.runtime.receiveClipboardItem(envelope);
+  assert.equal(writes, 0);
+  assert.equal(decryptions, 0);
+});
+
+test("Receive only never starts the watcher and Off keeps the socket ready", async () => {
+  const receiveOnlyStore = new InMemorySyncPreferencesStore();
+  await receiveOnlyStore.set({
+    schemaVersion: 1,
+    sendEnabled: false,
+    receiveEnabled: true,
+  });
+  const receiveOnlyStarts: unknown[] = [];
+  const receiveOnly = await startReady({
+    localTrustState: "verified",
+    syncPreferencesStore: receiveOnlyStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async () => undefined,
+      startWatching: async (options) => {
+        receiveOnlyStarts.push(options);
+      },
+      stopWatching: async () => undefined,
+    },
+  });
+  await flushRuntimeWork();
+  assert.equal(receiveOnly.runtime.getStatus().syncReady, true);
+  assert.deepEqual(receiveOnlyStarts, []);
+
+  const offStore = new InMemorySyncPreferencesStore();
+  await offStore.set({
+    schemaVersion: 1,
+    sendEnabled: false,
+    receiveEnabled: false,
+  });
+  let writes = 0;
+  const off = await startReady({
+    localTrustState: "verified",
+    syncPreferencesStore: offStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async () => {
+        writes += 1;
+      },
+    },
+  });
+  assert.equal(off.runtime.getStatus().socket.connected, true);
+  assert.equal(off.runtime.getStatus().syncReady, true);
+  await off.runtime.receiveClipboardItem(inboundEnvelope("off-item"));
+  assert.equal(writes, 0);
+  assert.equal(
+    await off.processedItemStore.has(user.id, "off-item"),
+    true,
+  );
+  const manual = await off.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:send-current-clipboard" }),
+  );
+  assert.equal(manual.ok, false);
+  assert.equal(manual.error?.code, "CLIPBOARD_SEND_DISABLED");
+  assert.equal(off.runtime.getStatus().socket.connected, true);
+});
+
+test("Send only keeps automatic publishing enabled while receive writes stay disabled", async () => {
+  const syncPreferencesStore = new InMemorySyncPreferencesStore();
+  await syncPreferencesStore.set({
+    schemaVersion: 1,
+    sendEnabled: true,
+    receiveEnabled: false,
+  });
+  const encryptedTexts: string[] = [];
+  const setup = await startReady({
+    localTrustState: "verified",
+    syncPreferencesStore,
+    encrypt: async (input) => {
+      encryptedTexts.push(input.plaintext as string);
+      return {
+        itemId: "send-only-item",
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+  await setup.runtime.handleClipboardObservation(
+    clipboardObservation("send-only text"),
+  );
+  assert.deepEqual(encryptedTexts, ["send-only text"]);
+  assert.equal(setup.runtime.getStatus().syncPreferences.receiveEnabled, false);
+});
+
+test("Receive only preference survives reconnect without starting the watcher", async () => {
+  const syncPreferencesStore = new InMemorySyncPreferencesStore();
+  await syncPreferencesStore.set({
+    schemaVersion: 1,
+    sendEnabled: false,
+    receiveEnabled: true,
+  });
+  const starts: unknown[] = [];
+  const setup = await startReady({
+    localTrustState: "verified",
+    syncPreferencesStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async () => undefined,
+      startWatching: async (options) => {
+        starts.push(options);
+      },
+      stopWatching: async () => undefined,
+    },
+  });
+  await flushRuntimeWork();
+  setup.socket.trigger("disconnect", "sleep-wake");
+  await setup.runtime.reconcileConnectivity("sleep-wake", {
+    forceSocketRecycle: true,
+  });
+  setup.socket.trigger("auth:ready");
+  await flushRuntimeWork();
+  assert.deepEqual(starts, []);
+  assert.deepEqual(setup.runtime.getStatus().syncPreferences, {
+    schemaVersion: 1,
+    sendEnabled: false,
+    receiveEnabled: true,
+  });
+});
+
+test("expired inbound items are consumed before decryption and do not report crypto failure", async () => {
+  const processedItemStore = new InMemoryItemMetadataStore();
+  let decryptions = 0;
+  let writes = 0;
+  const setup = await startReady({
+    localTrustState: "verified",
+    processedItemStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async () => {
+        writes += 1;
+      },
+    },
+    decrypt: async () => {
+      decryptions += 1;
+      throw new Error("must not decrypt stale data");
+    },
+  });
+  await setup.runtime.receiveClipboardItem(
+    inboundEnvelope("expired-item", new Date(Date.now() - 1).toISOString()),
+  );
+  assert.equal(decryptions, 0);
+  assert.equal(writes, 0);
+  assert.equal(await processedItemStore.has(user.id, "expired-item"), true);
+  assert.equal(setup.runtime.getStatus().lastSyncError, undefined);
+});
+
+test("manual and automatic publish paths use the shared 60 second live TTL", async () => {
+  const now = new Date("2030-01-01T00:00:00.000Z");
+  const expiries: Array<Date | string> = [];
+  const setup = await startReady({
+    localTrustState: "verified",
+    now: () => now,
+    encrypt: async (input) => {
+      expiries.push(input.expiresAt);
+      return {
+        itemId: `${expiries.length}`,
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+  await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:send-current-clipboard" }),
+  );
+  await setup.runtime.handleClipboardObservation(
+    clipboardObservation("automatic"),
+  );
+  assert.equal(expiries.length, 2);
+  assert.deepEqual(
+    expiries.map((expiry) => new Date(expiry).getTime()),
+    [now.getTime() + 60_000, now.getTime() + 60_000],
+  );
+});
 
 test("Google authentication saves its response as the normal runtime session", async () => {
   const setup = makeRuntime({
@@ -489,7 +1006,7 @@ test("invalid envelopes and bad source signatures do not demote a ready socket",
     ciphertext: "ciphertext",
     nonce: "nonce",
     recipients: [{ deviceId: identity.deviceId, deviceKeyVersion: 1, wrapNonce: "nonce", wrappedContentKey: "wrapped" }],
-    expiresAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
   });
   assert.equal(badSignature.runtime.getStatus().connectionState, "ready");
   assert.equal(badSignature.runtime.getStatus().socket.deviceAuthenticated, true);

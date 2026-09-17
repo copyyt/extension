@@ -41,6 +41,7 @@ import {
   envelopeFromSocketPayload,
   isClipboardText,
   isOffscreenClipboardObservation,
+  isSyncPreferencesCommand,
   isRuntimeRequest,
   POPUP_SOURCE,
   RUNTIME_SOURCE,
@@ -52,6 +53,13 @@ import {
 } from "./messages.ts";
 import type { ClipboardAdapter } from "./clipboard-adapter.ts";
 import type { OutboundItemStore, ProcessedItemStore } from "./runtime-db.ts";
+import {
+  DEFAULT_SYNC_PREFERENCES,
+  OFF_SYNC_PREFERENCES,
+  isSyncPreferences,
+  type SyncPreferences,
+  type SyncPreferencesStore,
+} from "./sync-preferences.ts";
 import type {
   RuntimeSession,
   SessionStore,
@@ -118,6 +126,7 @@ export interface RuntimeDependencies {
   clipboardAdapter: ClipboardAdapter;
   processedItemStore: ProcessedItemStore;
   outboundItemStore: OutboundItemStore;
+  syncPreferencesStore: SyncPreferencesStore;
   apiFactory: (accessToken: string) => RuntimeApi;
   socketFactory: (url: string, options: SocketOptions) => SocketLike;
   identityLoader?: (userId: string) => Promise<DeviceIdentity | null>;
@@ -147,6 +156,7 @@ const DEFAULT_STATUS: RuntimeStatus = {
     deviceAuthenticated: false,
   },
   syncReady: false,
+  syncPreferences: { ...DEFAULT_SYNC_PREFERENCES },
   clipboardWatch: "stopped",
   onboarding: {
     state: "unknown",
@@ -158,6 +168,23 @@ const TOKEN_REFRESH_SKEW_MS = 60_000;
 const STARTUP_CONNECTIVITY_KICK_TIMEOUT_MS = 250;
 const CONNECTIVITY_RECONCILIATION_TIMEOUT_MS = 15_000;
 const MAX_CONNECTIVITY_RECONCILIATION_FOLLOW_UPS = 2;
+
+export const LIVE_CLIPBOARD_TTL_MS = 60_000;
+export const MAX_CLOCK_SKEW_MS = 5 * 60_000;
+
+function parseStrictExpiry(value: string): number | null {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return null;
+  try {
+    return new Date(parsed).toISOString() === value ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function isLiveExpiryWithinPolicy(expiresAt: number, now: number): boolean {
+  return expiresAt <= now + LIVE_CLIPBOARD_TTL_MS + MAX_CLOCK_SKEW_MS;
+}
 
 function userFromSession(session: RuntimeSession): IUser {
   return { ...session.user };
@@ -487,6 +514,8 @@ function challengeParts(
 
 function commandFallbackErrorCode(command: RuntimeCommand): RuntimeErrorCode {
   switch (command.type) {
+    case "runtime:set-sync-preferences":
+      return "SYNC_PREFERENCES_INVALID";
     case "runtime:send-current-clipboard":
       return "SOCKET_PUBLISH_FAILED";
     case "runtime:test-clipboard":
@@ -541,6 +570,7 @@ export class CopyytServiceWorkerRuntime {
   private readonly inboundInFlight = new Set<string>();
   private clipboardWatchRunning = false;
   private clipboardWatchDesired = false;
+  private clipboardWatchResetRequested = false;
   private clipboardWatchReconcileInFlight: Promise<void> | null = null;
   private autoObservationSequence = 0;
   private autoPublishInFlight: Promise<void> | null = null;
@@ -909,6 +939,17 @@ export class CopyytServiceWorkerRuntime {
       .get()
       .catch(() => null);
     this.session = await this.dependencies.sessionStore.get();
+    let syncPreferences: SyncPreferences;
+    try {
+      const storedPreferences = await this.dependencies.syncPreferencesStore.get();
+      syncPreferences = isSyncPreferences(storedPreferences)
+        ? storedPreferences
+        : { ...OFF_SYNC_PREFERENCES };
+    } catch {
+      // A preference read failure must never turn into accidental clipboard
+      // participation. The control plane can still recover in Off mode.
+      syncPreferences = { ...OFF_SYNC_PREFERENCES };
+    }
 
     // Persisted status is useful context for the UI, but it is not live
     // authority. In particular, a worker recreation cannot inherit socket or
@@ -947,6 +988,7 @@ export class CopyytServiceWorkerRuntime {
       user: this.session ? userFromSession(this.session) : undefined,
       socket: { connected: false, deviceAuthenticated: false },
       syncReady: false,
+      syncPreferences: { ...syncPreferences },
       clipboardWatch: "stopped",
     };
     this.serverDeviceState = "unknown";
@@ -955,6 +997,7 @@ export class CopyytServiceWorkerRuntime {
     this.challengeReceived = false;
     this.clipboardWatchDesired = false;
     this.clipboardWatchRunning = false;
+    this.clipboardWatchResetRequested = false;
     this.pendingAutoObservation = null;
     if (this.dependencies.clipboardAdapter.stopWatching) {
       await this.dependencies.clipboardAdapter.stopWatching().catch(() => undefined);
@@ -1021,6 +1064,13 @@ export class CopyytServiceWorkerRuntime {
       return;
     }
     if (!isClipboardText(message.text)) return;
+    if (!this.status.syncPreferences.sendEnabled) {
+      // Do not retain an observation while sending is disabled. The next
+      // enable operation starts a fresh baseline instead of publishing the
+      // value that was already on the clipboard.
+      this.pendingAutoObservation = null;
+      return;
+    }
     if (!this.isAutomaticSyncEligible()) {
       // The observation is intentionally not retained. It may wake a dormant
       // runtime, but only a later clipboard change after a fresh baseline can
@@ -1105,6 +1155,7 @@ export class CopyytServiceWorkerRuntime {
         this.socket.connected &&
         this.socketReady &&
         this.status.socket.deviceAuthenticated &&
+        this.status.syncPreferences.sendEnabled &&
         (!requireWatcher || watcherReady),
     );
   }
@@ -1142,7 +1193,8 @@ export class CopyytServiceWorkerRuntime {
           runtimeError.code === "DEVICE_NOT_LOCALLY_TRUSTED" ||
           runtimeError.code === "DEVICE_NOT_REGISTERED" ||
           runtimeError.code === "SOCKET_NOT_READY" ||
-          runtimeError.code === "AUTH_REQUIRED"
+          runtimeError.code === "AUTH_REQUIRED" ||
+          runtimeError.code === "CLIPBOARD_SEND_DISABLED"
         ) {
           // These are eligibility failures, not transient publish failures.
           // Never carry a newer plaintext value across them.
@@ -1159,6 +1211,12 @@ export class CopyytServiceWorkerRuntime {
   }
 
   async publishClipboardText(text: string): Promise<{ itemId: string }> {
+    if (!this.status.syncPreferences.sendEnabled) {
+      throw new RuntimeError(
+        "CLIPBOARD_SEND_DISABLED",
+        "Clipboard sending is disabled for this device",
+      );
+    }
     if (!isClipboardText(text)) {
       throw new RuntimeError(
         "CLIPBOARD_READ_FAILED",
@@ -1235,7 +1293,9 @@ export class CopyytServiceWorkerRuntime {
         identity,
         plaintext: text,
         contentType: "text/plain",
-        expiresAt: new Date(this.now().getTime() + 24 * 60 * 60 * 1000),
+        expiresAt: new Date(
+          this.now().getTime() + LIVE_CLIPBOARD_TTL_MS,
+        ),
         recipients,
       });
     } catch {
@@ -1269,10 +1329,6 @@ export class CopyytServiceWorkerRuntime {
     const session = this.session;
     const key = `${session.user.id}:${envelope.itemId}`;
     if (this.inboundInFlight.has(key)) return;
-    const locallyPublished = await this.dependencies.outboundItemStore.has(
-      session.user.id,
-      envelope.itemId,
-    );
     if (
       await this.dependencies.processedItemStore.has(
         session.user.id,
@@ -1282,6 +1338,44 @@ export class CopyytServiceWorkerRuntime {
       return;
     this.inboundInFlight.add(key);
     try {
+      const now = this.now().getTime();
+      const expiresAt = parseStrictExpiry(envelope.expiresAt as string);
+      if (
+        expiresAt === null ||
+        now >= expiresAt ||
+        !isLiveExpiryWithinPolicy(expiresAt, now)
+      ) {
+        // Expired or otherwise non-live envelopes are expected stale data.
+        // Consume them without decrypting so they cannot overwrite the OS
+        // clipboard or surface as a cryptographic failure.
+        await this.dependencies.processedItemStore.mark({
+          userId: session.user.id,
+          itemId: envelope.itemId,
+          processedAt: this.now().toISOString(),
+          sourceDeviceId: envelope.sourceDeviceId,
+          disposition: "stale",
+        });
+        return;
+      }
+
+      if (!this.status.syncPreferences.receiveEnabled) {
+        // Receive-disabled is a deliberate local policy decision. The
+        // envelope is consumed before decryption and is never replayed after
+        // the preference changes.
+        await this.dependencies.processedItemStore.mark({
+          userId: session.user.id,
+          itemId: envelope.itemId,
+          processedAt: this.now().toISOString(),
+          sourceDeviceId: envelope.sourceDeviceId,
+          disposition: "receive-disabled",
+        });
+        return;
+      }
+
+      const locallyPublished = await this.dependencies.outboundItemStore.has(
+        session.user.id,
+        envelope.itemId,
+      );
       const identity = await this.identityLoader(session.user.id);
       if (!identity || identity.keyVersion === null) {
         throw new RuntimeError(
@@ -1315,7 +1409,16 @@ export class CopyytServiceWorkerRuntime {
           "Clipboard decryption or verification failed",
         );
       }
-      if (selfEcho) return;
+      if (selfEcho) {
+        await this.dependencies.processedItemStore.mark({
+          userId: session.user.id,
+          itemId: envelope.itemId,
+          processedAt: this.now().toISOString(),
+          sourceDeviceId: envelope.sourceDeviceId,
+          disposition: "self-echo",
+        });
+        return;
+      }
       await this.dependencies.clipboardAdapter
         .writeText(decrypted.plaintext)
         .catch(() => {
@@ -1329,6 +1432,7 @@ export class CopyytServiceWorkerRuntime {
         itemId: envelope.itemId,
         processedAt: this.now().toISOString(),
         sourceDeviceId: envelope.sourceDeviceId,
+        disposition: "applied",
       });
     } catch (error) {
       const runtimeError = asRuntimeError(
@@ -1351,8 +1455,26 @@ export class CopyytServiceWorkerRuntime {
           void this.reconcileConnectivity("status").catch(() => undefined);
         }
         return this.getStatus();
+      case "runtime:set-sync-preferences":
+        if (!isSyncPreferencesCommand(command)) {
+          throw new RuntimeError(
+            "SYNC_PREFERENCES_INVALID",
+            "Clipboard sync preferences must use boolean values",
+          );
+        }
+        return this.setSyncPreferences({
+          schemaVersion: 1,
+          sendEnabled: command.sendEnabled,
+          receiveEnabled: command.receiveEnabled,
+        });
       case "runtime:send-current-clipboard": {
         this.requireSession();
+        if (!this.status.syncPreferences.sendEnabled) {
+          throw new RuntimeError(
+            "CLIPBOARD_SEND_DISABLED",
+            "Clipboard sending is disabled for this device",
+          );
+        }
         if (!this.isSocketTransportReady()) {
           await this.reconcileConnectivity("manual-send", {
             waitForReady: true,
@@ -1450,6 +1572,36 @@ export class CopyytServiceWorkerRuntime {
     }
   }
 
+  private async setSyncPreferences(
+    preferences: SyncPreferences,
+  ): Promise<RuntimeStatus> {
+    if (!isSyncPreferences(preferences)) {
+      throw new RuntimeError(
+        "SYNC_PREFERENCES_INVALID",
+        "Clipboard sync preferences must use boolean values",
+      );
+    }
+
+    const previous = this.status.syncPreferences;
+    if (!preferences.sendEnabled) {
+      // Clear the latest-wins slot before persistence completes so a pending
+      // observation cannot cross a successful disable transition.
+      this.pendingAutoObservation = null;
+    }
+    await this.dependencies.syncPreferencesStore.set({ ...preferences });
+
+    if (!previous.sendEnabled && preferences.sendEnabled) {
+      this.clipboardWatchResetRequested = true;
+      this.pendingAutoObservation = null;
+    }
+    this.setStatus({
+      ...this.status,
+      syncPreferences: { ...preferences },
+      ...(preferences.sendEnabled ? {} : { clipboardWatch: "stopped" }),
+    });
+    return this.getStatus();
+  }
+
   private async authenticate(
     request: () => Promise<AxiosResponse<SignInResponse>>,
   ): Promise<AuthenticatedRuntimeResult> {
@@ -1543,6 +1695,7 @@ export class CopyytServiceWorkerRuntime {
       connectionState: "account-authenticated",
       signedIn: true,
       user: userFromSession(session),
+      syncPreferences: { ...this.status.syncPreferences },
     });
     await this.ensureRecoveryAlarm();
   }
@@ -1569,7 +1722,11 @@ export class CopyytServiceWorkerRuntime {
     this.session = null;
     this.serverDeviceState = "unknown";
     await this.dependencies.sessionStore.clear();
-    this.setStatus({ ...DEFAULT_STATUS, connectionState: "signed-out" });
+    this.setStatus({
+      ...DEFAULT_STATUS,
+      connectionState: "signed-out",
+      syncPreferences: { ...this.status.syncPreferences },
+    });
     await this.ensureRecoveryAlarm();
   }
 
@@ -2420,6 +2577,7 @@ export class CopyytServiceWorkerRuntime {
   private setAccountAuthenticatedWithoutSocket(): void {
     if (!this.session) return;
     this.socketReady = false;
+    this.clipboardWatchResetRequested = true;
     this.setStatus({
       ...this.status,
       connectionState: "account-authenticated",
@@ -2768,6 +2926,7 @@ export class CopyytServiceWorkerRuntime {
       this.challengeInFlight = false;
       this.challengeReceived = false;
       this.pendingAutoObservation = null;
+      this.clipboardWatchResetRequested = true;
       this.setStatus({
         ...this.status,
         connectionState: this.session ? "account-authenticated" : "signed-out",
@@ -2787,6 +2946,7 @@ export class CopyytServiceWorkerRuntime {
     this.socketReady = false;
     this.challengeInFlight = false;
     this.pendingAutoObservation = null;
+    this.clipboardWatchResetRequested = true;
     this.setConnectionRecovering("SOCKET_NOT_READY", message);
   }
 
@@ -2938,11 +3098,19 @@ export class CopyytServiceWorkerRuntime {
 
     while (true) {
       const desired = this.clipboardWatchDesired;
-      if (desired && !this.clipboardWatchRunning) {
+      if (
+        desired &&
+        (!this.clipboardWatchRunning || this.clipboardWatchResetRequested)
+      ) {
         this.setStatus({ ...this.status, clipboardWatch: "starting" });
         try {
+          if (this.clipboardWatchRunning) {
+            await adapter.stopWatching();
+            this.clipboardWatchRunning = false;
+          }
           await adapter.startWatching({ resetBaseline: true });
           this.clipboardWatchRunning = true;
+          this.clipboardWatchResetRequested = false;
           this.setStatus({ ...this.status, clipboardWatch: "watching" });
         } catch {
           this.clipboardWatchRunning = false;
@@ -2968,6 +3136,19 @@ export class CopyytServiceWorkerRuntime {
   }
 
   private setStatus(next: RuntimeStatus): void {
+    if (
+      next.syncPreferences.sendEnabled &&
+      !this.status.syncPreferences.sendEnabled
+    ) {
+      this.clipboardWatchResetRequested = true;
+    }
+    if (
+      next.clipboardWatch === "stopped" &&
+      this.status.clipboardWatch !== "stopped" &&
+      this.clipboardWatchRunning
+    ) {
+      this.clipboardWatchResetRequested = true;
+    }
     this.status = next;
     void this.dependencies.statusStore
       .set(this.getStatus())
@@ -2995,6 +3176,7 @@ export class CopyytServiceWorkerRuntime {
   }
 
   private setConnectionError(code: RuntimeErrorCode, message: string): void {
+    this.clipboardWatchResetRequested = true;
     this.setStatus({
       ...this.status,
       connectionState: "error",
@@ -3012,6 +3194,7 @@ export class CopyytServiceWorkerRuntime {
     code: RuntimeErrorCode,
     message: string,
   ): void {
+    this.clipboardWatchResetRequested = true;
     this.setStatus({
       ...this.status,
       connectionState: this.session ? "connecting" : "signed-out",
@@ -3036,7 +3219,9 @@ export class CopyytServiceWorkerRuntime {
       code === "SOCKET_PUBLISH_FAILED" ||
       code === "PAIRING_FAILED" ||
       code === "DEVICE_NOT_LOCALLY_TRUSTED" ||
-      code === "DEVICE_NOT_REGISTERED"
+      code === "DEVICE_NOT_REGISTERED" ||
+      code === "CLIPBOARD_SEND_DISABLED" ||
+      code === "SYNC_PREFERENCES_INVALID"
     ) {
       this.recordSyncError(code, message);
     } else {

@@ -1,6 +1,7 @@
 import type { IUser } from "../interfaces/user.interface.ts";
 import type { ClipboardItemEnvelope } from "../crypto/crypto-core.ts";
 import type { RuntimeErrorCode } from "./errors.ts";
+import type { SyncPreferences } from "./sync-preferences.ts";
 
 export const RUNTIME_SOURCE = "service-worker" as const;
 export const POPUP_SOURCE = "popup" as const;
@@ -65,6 +66,8 @@ export interface RuntimeStatus {
   };
   /** Transport authentication is separate from permission to sync clipboard data. */
   syncReady: boolean;
+  /** Device-local clipboard participation preferences. */
+  syncPreferences: SyncPreferences;
   clipboardWatch?: ClipboardWatchState;
   lastAutoSyncAt?: string;
   lastAutoSyncError?: {
@@ -103,6 +106,11 @@ export interface AuthenticatedRuntimeResult {
 
 export type RuntimeCommand =
   | { type: "runtime:get-status" }
+  | {
+      type: "runtime:set-sync-preferences";
+      sendEnabled: boolean;
+      receiveEnabled: boolean;
+    }
   | { type: "runtime:send-current-clipboard" }
   | { type: "runtime:bootstrap-trust-anchor" }
   | { type: "runtime:refresh-onboarding" }
@@ -156,6 +164,22 @@ export interface RuntimeStatusBroadcast {
   target: typeof POPUP_SOURCE;
   type: "runtime:status";
   status: RuntimeStatus;
+}
+
+export function isSyncPreferencesCommand(
+  value: unknown,
+): value is Extract<RuntimeCommand, { type: "runtime:set-sync-preferences" }> {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as {
+    type?: unknown;
+    sendEnabled?: unknown;
+    receiveEnabled?: unknown;
+  };
+  return (
+    candidate.type === "runtime:set-sync-preferences" &&
+    typeof candidate.sendEnabled === "boolean" &&
+    typeof candidate.receiveEnabled === "boolean"
+  );
 }
 
 export interface OffscreenRequest {

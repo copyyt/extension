@@ -28,6 +28,11 @@ function status(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
       deviceAuthenticated: false,
     },
     syncReady: false,
+    syncPreferences: {
+      schemaVersion: 1,
+      sendEnabled: true,
+      receiveEnabled: true,
+    },
     onboarding: {
       state: "unknown",
       bootstrapEligible: false,

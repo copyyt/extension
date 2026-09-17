@@ -3,6 +3,12 @@ export const RUNTIME_DATABASE_VERSION = 1;
 export const PROCESSED_ITEM_STORE = "processed-items";
 export const OUTBOUND_ITEM_STORE = "outbound-items";
 
+export type ProcessedItemDisposition =
+  | "applied"
+  | "self-echo"
+  | "receive-disabled"
+  | "stale";
+
 const MAX_ITEM_AGE_MS = 24 * 60 * 60 * 1000;
 const MAX_ITEM_COUNT = 500;
 
@@ -12,6 +18,7 @@ export interface ProcessedItemRecord {
   itemId: string;
   processedAt: string;
   sourceDeviceId: string;
+  disposition?: ProcessedItemDisposition;
 }
 
 export interface OutboundItemRecord {

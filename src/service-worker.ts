@@ -7,6 +7,7 @@ import {
   ChromeSessionStore,
   ChromeStatusStore,
 } from "./runtime/session-store.ts";
+import { ChromeSyncPreferencesStore } from "./runtime/sync-preferences.ts";
 import {
   CopyytServiceWorkerRuntime,
   type SocketLike,
@@ -34,6 +35,7 @@ const runtime = new CopyytServiceWorkerRuntime({
   clipboardAdapter: new OffscreenClipboardAdapter(),
   processedItemStore: new IndexedDBProcessedItemStore(),
   outboundItemStore: new IndexedDBOutboundItemStore(),
+  syncPreferencesStore: new ChromeSyncPreferencesStore(),
   apiFactory: createRuntimeApi,
   socketFactory,
   broadcastStatus: (message) =>

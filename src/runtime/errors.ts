@@ -17,6 +17,8 @@ export const RUNTIME_ERROR_CODES = [
   "SOURCE_UNTRUSTED",
   "SOCKET_PUBLISH_FAILED",
   "PAIRING_FAILED",
+  "CLIPBOARD_SEND_DISABLED",
+  "SYNC_PREFERENCES_INVALID",
 ] as const;
 
 export type RuntimeErrorCode = (typeof RUNTIME_ERROR_CODES)[number];
