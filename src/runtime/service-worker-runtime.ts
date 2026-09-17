@@ -582,6 +582,9 @@ export class CopyytServiceWorkerRuntime {
   private readonly signApproval: typeof signDeviceApproval;
   private readonly now: () => Date;
   private status: RuntimeStatus = DEFAULT_STATUS;
+  private lastPersistedSyncPreferences: SyncPreferences = {
+    ...DEFAULT_SYNC_PREFERENCES,
+  };
   private sendPolicyRevision = 0;
   private receivePolicyRevision = 0;
   private syncPreferencesTransitionRevision = 0;
@@ -996,6 +999,7 @@ export class CopyytServiceWorkerRuntime {
       // participation. The control plane can still recover in Off mode.
       syncPreferences = { ...OFF_SYNC_PREFERENCES };
     }
+    this.lastPersistedSyncPreferences = { ...syncPreferences };
 
     // Persisted status is useful context for the UI, but it is not live
     // authority. In particular, a worker recreation cannot inherit socket or
@@ -1680,9 +1684,10 @@ export class CopyytServiceWorkerRuntime {
 
     // Serialize preference writes so rapid mode changes cannot leave storage
     // in an older state than the in-memory barrier that accepted them.
+    const persistedPreferences = { ...preferences };
     const persistence = this.syncPreferencesWriteInFlight.then(
-      () => this.dependencies.syncPreferencesStore.set({ ...preferences }),
-      () => this.dependencies.syncPreferencesStore.set({ ...preferences }),
+      () => this.dependencies.syncPreferencesStore.set(persistedPreferences),
+      () => this.dependencies.syncPreferencesStore.set(persistedPreferences),
     );
     this.syncPreferencesWriteInFlight = persistence.then(
       () => undefined,
@@ -1690,12 +1695,17 @@ export class CopyytServiceWorkerRuntime {
     );
     try {
       await persistence;
+      this.lastPersistedSyncPreferences = { ...persistedPreferences };
     } catch {
       if (transitionRevision === this.syncPreferencesTransitionRevision) {
         // The failed transition is still the live state. Roll it back through
         // the same policy barrier so work that observed the failed mode can
-        // never become valid again when the previous mode is restored.
-        this.applySyncPreferences(this.status.syncPreferences, previous, true);
+        // never become valid again when the durable mode is restored.
+        this.applySyncPreferences(
+          this.status.syncPreferences,
+          this.lastPersistedSyncPreferences,
+          true,
+        );
       }
       throw new RuntimeError(
         "SYNC_PREFERENCES_INVALID",
@@ -1936,13 +1946,14 @@ export class CopyytServiceWorkerRuntime {
       : undefined;
 
     // clearSession() invalidates the live session synchronously before it
-    // awaits durable cleanup. Capture the token first, then let revocation run
-    // independently so backend/network failure cannot delay local logout.
+    // awaits durable cleanup. Capture the token first, then start revocation
+    // in parallel so the runtime remains alive for its bounded attempt.
     const localLogout = this.clearSession();
-    if (session) {
-      void this.bestEffortBackendLogout(session.accessToken, refreshToken);
-    }
+    const remoteLogout = session
+      ? this.bestEffortBackendLogout(session.accessToken, refreshToken)
+      : Promise.resolve();
     await localLogout;
+    await remoteLogout;
   }
 
   private async bestEffortBackendLogout(

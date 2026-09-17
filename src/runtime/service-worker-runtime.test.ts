@@ -222,6 +222,60 @@ function firstWriteFailsSyncPreferencesStore(): {
   };
 }
 
+function scriptedSyncPreferencesStore(
+  outcomes: readonly ("succeed" | "fail")[],
+): {
+  store: SyncPreferencesStore;
+  setStarted: (index: number) => Promise<void>;
+  releaseSet: (index: number) => void;
+  getStored: () => Promise<{
+    schemaVersion: 1;
+    sendEnabled: boolean;
+    receiveEnabled: boolean;
+  }>;
+} {
+  let stored = {
+    schemaVersion: 1 as const,
+    sendEnabled: true,
+    receiveEnabled: true,
+  };
+  let setCount = 0;
+  const startedResolvers: Array<() => void> = [];
+  const started = outcomes.map(
+    () =>
+      new Promise<void>((resolve) => {
+        startedResolvers.push(resolve);
+      }),
+  );
+  const releaseResolvers: Array<() => void> = [];
+  const gates = outcomes.map(
+    () =>
+      new Promise<void>((resolve) => {
+        releaseResolvers.push(resolve);
+      }),
+  );
+
+  return {
+    store: {
+      get: async () => ({ ...stored }),
+      set: async (preferences) => {
+        const index = setCount++;
+        const outcome = outcomes[index];
+        if (!outcome) throw new Error("unexpected preference write");
+        startedResolvers[index]();
+        await gates[index];
+        if (outcome === "fail") {
+          throw new Error("preference storage unavailable");
+        }
+        stored = { ...preferences };
+      },
+    },
+    setStarted: (index) => started[index],
+    releaseSet: (index) => releaseResolvers[index](),
+    getStored: async () => ({ ...stored }),
+  };
+}
+
 function makeRuntime(overrides: Partial<{
   trustStore: ClientTrustStore;
   clipboardAdapter: ClipboardAdapter;
@@ -830,6 +884,159 @@ test("a failed older preference write cannot roll back a newer Receive-only tran
     schemaVersion: 1,
     sendEnabled: false,
     receiveEnabled: true,
+  });
+});
+
+test("failed preference writes roll back to durable Both after superseded writes fail", async () => {
+  const preferences = scriptedSyncPreferencesStore(["fail", "fail"]);
+  const watchCalls: Array<{ type: "start" | "stop"; resetBaseline?: boolean }> = [];
+  let releaseEncryption!: () => void;
+  let markEncryptionStarted!: () => void;
+  const encryptionStarted = new Promise<void>((resolve) => {
+    markEncryptionStarted = resolve;
+  });
+  const encryptionGate = new Promise<void>((resolve) => {
+    releaseEncryption = resolve;
+  });
+  const setup = await startReady({
+    localTrustState: "verified",
+    syncPreferencesStore: preferences.store,
+    clipboardAdapter: {
+      readText: async () => "old clipboard value",
+      writeText: async () => undefined,
+      startWatching: async (options) => {
+        watchCalls.push({ type: "start", resetBaseline: options?.resetBaseline });
+      },
+      stopWatching: async () => {
+        watchCalls.push({ type: "stop" });
+      },
+    },
+    encrypt: async (input) => {
+      markEncryptionStarted();
+      await encryptionGate;
+      return {
+        itemId: "durable-rollback-observation",
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+  await flushRuntimeWork();
+  const startsBeforeTransition = watchCalls.filter((call) => call.type === "start").length;
+
+  const oldObservation = setup.runtime.handleClipboardObservation(
+    clipboardObservation("old clipboard value"),
+  );
+  await encryptionStarted;
+
+  const off = setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: false,
+      receiveEnabled: false,
+    }),
+  );
+  await preferences.setStarted(0);
+  const receiveOnly = setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: false,
+      receiveEnabled: true,
+    }),
+  );
+  assert.deepEqual(setup.runtime.getStatus().syncPreferences, {
+    schemaVersion: 1,
+    sendEnabled: false,
+    receiveEnabled: true,
+  });
+
+  preferences.releaseSet(0);
+  const offResult = await off;
+  assert.equal(offResult.ok, false);
+  await preferences.setStarted(1);
+  preferences.releaseSet(1);
+  const receiveOnlyResult = await receiveOnly;
+  assert.equal(receiveOnlyResult.ok, false);
+
+  assert.deepEqual(setup.runtime.getStatus().syncPreferences, {
+    schemaVersion: 1,
+    sendEnabled: true,
+    receiveEnabled: true,
+  });
+  assert.deepEqual(await preferences.getStored(), {
+    schemaVersion: 1,
+    sendEnabled: true,
+    receiveEnabled: true,
+  });
+
+  releaseEncryption();
+  await oldObservation;
+  await flushRuntimeWork();
+  await flushRuntimeWork();
+  assert.equal(
+    setup.socket.emissions.some((item) => item.event === "clipboard:publish"),
+    false,
+  );
+  assert.ok(watchCalls.filter((call) => call.type === "start").length > startsBeforeTransition);
+  assert.deepEqual(watchCalls[watchCalls.length - 1], {
+    type: "start",
+    resetBaseline: true,
+  });
+});
+
+test("newest preference write failure rolls back to the last durable Off mode", async () => {
+  const preferences = scriptedSyncPreferencesStore(["succeed", "fail"]);
+  const setup = await startReady({ syncPreferencesStore: preferences.store });
+
+  const off = setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: false,
+      receiveEnabled: false,
+    }),
+  );
+  await preferences.setStarted(0);
+  preferences.releaseSet(0);
+  assert.equal((await off).ok, true);
+  assert.deepEqual(await preferences.getStored(), {
+    schemaVersion: 1,
+    sendEnabled: false,
+    receiveEnabled: false,
+  });
+
+  const receiveOnly = setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: false,
+      receiveEnabled: true,
+    }),
+  );
+  await preferences.setStarted(1);
+  assert.deepEqual(setup.runtime.getStatus().syncPreferences, {
+    schemaVersion: 1,
+    sendEnabled: false,
+    receiveEnabled: true,
+  });
+  preferences.releaseSet(1);
+
+  const result = await receiveOnly;
+  assert.equal(result.ok, false);
+  assert.deepEqual(setup.runtime.getStatus().syncPreferences, {
+    schemaVersion: 1,
+    sendEnabled: false,
+    receiveEnabled: false,
+  });
+  assert.deepEqual(await preferences.getStored(), {
+    schemaVersion: 1,
+    sendEnabled: false,
+    receiveEnabled: false,
   });
 });
 
@@ -1721,7 +1928,7 @@ test("runtime logout sends the v2 refresh token and always clears local session"
   assert.equal(setup.runtime.getStatus().signedIn, false);
 });
 
-test("runtime logout clears local session before backend revocation settles", async () => {
+test("runtime logout waits for backend revocation after clearing local session", async () => {
   let markLogoutStarted!: () => void;
   const logoutStarted = new Promise<void>((resolve) => {
     markLogoutStarted = resolve;
@@ -1751,9 +1958,109 @@ test("runtime logout clears local session before backend revocation settles", as
   await logoutStarted;
   assert.equal(await setup.sessionStore.get(), null);
   assert.equal(setup.runtime.getStatus().signedIn, false);
+  assert.equal(setup.runtime.getStatus().connectionState, "signed-out");
 
-  assert.equal((await pendingLogout).ok, true);
+  let responseSettled = false;
+  const logoutResponse = pendingLogout.then((result) => {
+    responseSettled = true;
+    return result;
+  });
+  await flushRuntimeWork();
+  assert.equal(responseSettled, false);
+
   releaseLogout();
+  assert.equal((await logoutResponse).ok, true);
+});
+
+test("runtime logout succeeds locally when backend revocation times out", async (t) => {
+  let markLogoutStarted!: () => void;
+  const logoutStarted = new Promise<void>((resolve) => {
+    markLogoutStarted = resolve;
+  });
+  let releaseLogout!: () => void;
+  const logoutGate = new Promise<void>((resolve) => {
+    releaseLogout = resolve;
+  });
+  const setup = makeRuntime({
+    initialSession: {
+      schemaVersion: 2,
+      accessToken: "access-token",
+      refreshToken: "refresh-token",
+      user,
+    },
+    logout: async () => {
+      markLogoutStarted();
+      await logoutGate;
+      return response(undefined);
+    },
+  });
+
+  await setup.runtime.start();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const pendingLogout = setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:logout" }),
+  );
+  await logoutStarted;
+  assert.equal(await setup.sessionStore.get(), null);
+  assert.equal(setup.runtime.getStatus().signedIn, false);
+
+  let responseSettled = false;
+  const responsePromise = pendingLogout.then((result) => {
+    responseSettled = true;
+    return result;
+  });
+  await flushRuntimeWork();
+  assert.equal(responseSettled, false);
+
+  t.mock.timers.runAll();
+  assert.equal((await responsePromise).ok, true);
+  assert.equal(await setup.sessionStore.get(), null);
+  assert.equal(setup.runtime.getStatus().signedIn, false);
+  releaseLogout();
+});
+
+test("runtime logout cannot resurrect a session during an in-flight refresh", async () => {
+  let markRefreshStarted!: () => void;
+  const refreshStarted = new Promise<void>((resolve) => {
+    markRefreshStarted = resolve;
+  });
+  let releaseRefresh!: () => void;
+  const refreshGate = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const setup = makeRuntime({
+    initialSession: {
+      schemaVersion: 2,
+      accessToken: "access-token",
+      refreshToken: "refresh-token",
+      user,
+    },
+    refreshTokens: async () => {
+      markRefreshStarted();
+      await refreshGate;
+      return response(refreshedSession("refreshed-access-token"));
+    },
+  });
+
+  await setup.runtime.start();
+  const refresh = setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:auth-refresh" }),
+  );
+  await refreshStarted;
+
+  const logout = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:logout" }),
+  );
+  assert.equal(logout.ok, true);
+  assert.equal(await setup.sessionStore.get(), null);
+  assert.equal(setup.runtime.getStatus().signedIn, false);
+
+  releaseRefresh();
+  const refreshResult = await refresh;
+  assert.equal(refreshResult.ok, false);
+  assert.equal(refreshResult.error?.code, "AUTH_REQUIRED");
+  assert.equal(await setup.sessionStore.get(), null);
+  assert.equal(setup.runtime.getStatus().signedIn, false);
 });
 
 async function startReady(overrides: Parameters<typeof makeRuntime>[0] = {}) {
