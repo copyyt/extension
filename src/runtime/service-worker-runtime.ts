@@ -169,6 +169,7 @@ const TOKEN_REFRESH_SKEW_MS = 60_000;
 const STARTUP_CONNECTIVITY_KICK_TIMEOUT_MS = 250;
 const CONNECTIVITY_RECONCILIATION_TIMEOUT_MS = 15_000;
 const MAX_CONNECTIVITY_RECONCILIATION_FOLLOW_UPS = 2;
+const LOGOUT_REQUEST_TIMEOUT_MS = 5_000;
 
 export const LIVE_CLIPBOARD_TTL_MS = 60_000;
 export const MAX_CLOCK_SKEW_MS = 5 * 60_000;
@@ -583,6 +584,7 @@ export class CopyytServiceWorkerRuntime {
   private status: RuntimeStatus = DEFAULT_STATUS;
   private sendPolicyRevision = 0;
   private receivePolicyRevision = 0;
+  private syncPreferencesTransitionRevision = 0;
   private session: RuntimeSession | null = null;
   private socket: SocketLike | null = null;
   private socketAccountId: string | null = null;
@@ -1669,31 +1671,12 @@ export class CopyytServiceWorkerRuntime {
       );
     }
 
-    const previous = this.status.syncPreferences;
+    const previous = { ...this.status.syncPreferences };
+    const transitionRevision = ++this.syncPreferencesTransitionRevision;
     // Advance the in-memory barriers before awaiting durable persistence. A
     // clipboard operation can already be between awaits when this command is
     // accepted, so storage ordering cannot be the policy authority.
-    if (previous.sendEnabled !== preferences.sendEnabled) {
-      this.sendPolicyRevision += 1;
-    }
-    if (previous.receiveEnabled !== preferences.receiveEnabled) {
-      this.receivePolicyRevision += 1;
-    }
-    if (!preferences.sendEnabled) {
-      // Clear the latest-wins slot before persistence completes so a pending
-      // observation cannot cross the disable barrier.
-      this.pendingAutoObservation = null;
-    }
-
-    if (!previous.sendEnabled && preferences.sendEnabled) {
-      this.clipboardWatchResetRequested = true;
-      this.pendingAutoObservation = null;
-    }
-    this.setStatus({
-      ...this.status,
-      syncPreferences: { ...preferences },
-      ...(preferences.sendEnabled ? {} : { clipboardWatch: "stopped" }),
-    });
+    this.applySyncPreferences(previous, preferences);
 
     // Serialize preference writes so rapid mode changes cannot leave storage
     // in an older state than the in-memory barrier that accepted them.
@@ -1708,12 +1691,52 @@ export class CopyytServiceWorkerRuntime {
     try {
       await persistence;
     } catch {
+      if (transitionRevision === this.syncPreferencesTransitionRevision) {
+        // The failed transition is still the live state. Roll it back through
+        // the same policy barrier so work that observed the failed mode can
+        // never become valid again when the previous mode is restored.
+        this.applySyncPreferences(this.status.syncPreferences, previous, true);
+      }
       throw new RuntimeError(
         "SYNC_PREFERENCES_INVALID",
         "Clipboard sync preferences could not be saved",
       );
     }
     return this.getStatus();
+  }
+
+  private applySyncPreferences(
+    previous: SyncPreferences,
+    preferences: SyncPreferences,
+    discardPendingAutoObservation = false,
+  ): void {
+    if (previous.sendEnabled !== preferences.sendEnabled) {
+      this.sendPolicyRevision += 1;
+    }
+    if (previous.receiveEnabled !== preferences.receiveEnabled) {
+      this.receivePolicyRevision += 1;
+    }
+    if (
+      discardPendingAutoObservation ||
+      !preferences.sendEnabled ||
+      (!previous.sendEnabled && preferences.sendEnabled)
+    ) {
+      // Clear the latest-wins slot before persistence completes so a pending
+      // observation cannot cross a policy barrier. Rollback explicitly clears
+      // it even when the Send bit itself did not change.
+      this.pendingAutoObservation = null;
+    }
+
+    if (!previous.sendEnabled && preferences.sendEnabled) {
+      // Re-enable starts a fresh clipboard baseline. In particular, a failed
+      // Off transition must not publish a value observed before the rollback.
+      this.clipboardWatchResetRequested = true;
+    }
+    this.setStatus({
+      ...this.status,
+      syncPreferences: { ...preferences },
+      ...(preferences.sendEnabled ? {} : { clipboardWatch: "stopped" }),
+    });
   }
 
   private requireSendPolicy(revision: number): void {
@@ -1907,26 +1930,43 @@ export class CopyytServiceWorkerRuntime {
   }
 
   private async logout(): Promise<void> {
-    // Stop live clipboard observation as soon as local logout begins. The
-    // backend request is deliberately fire-and-forget so an unavailable
-    // backend cannot delay clearing the durable local credentials.
-    this.destroySocket(this.socket);
-    if (this.session) {
-      const session = this.session;
-      const refreshToken = isRuntimeSessionV2(this.session)
-        ? this.session.refreshToken
-        : undefined;
-      try {
-        void Promise.resolve(
-          this.dependencies
-            .apiFactory(session.accessToken)
-            .auth.logout(refreshToken),
-        ).catch(() => undefined);
-      } catch {
-        // Local logout still completes if constructing the request fails.
-      }
+    const session = this.session;
+    const refreshToken = session && isRuntimeSessionV2(session)
+      ? session.refreshToken
+      : undefined;
+
+    // clearSession() invalidates the live session synchronously before it
+    // awaits durable cleanup. Capture the token first, then let revocation run
+    // independently so backend/network failure cannot delay local logout.
+    const localLogout = this.clearSession();
+    if (session) {
+      void this.bestEffortBackendLogout(session.accessToken, refreshToken);
     }
-    await this.clearSession();
+    await localLogout;
+  }
+
+  private async bestEffortBackendLogout(
+    accessToken: string,
+    refreshToken?: string,
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.resolve()
+          .then(() =>
+            this.dependencies
+              .apiFactory(accessToken)
+              .auth.logout(refreshToken),
+          )
+          .then(() => undefined)
+          .catch(() => undefined),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, LOGOUT_REQUEST_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   private async clearSession(): Promise<void> {
@@ -1935,14 +1975,14 @@ export class CopyytServiceWorkerRuntime {
     this.destroySocket(this.socket);
     this.pendingConnectivityIntent = null;
     this.serverDeviceState = "unknown";
-    await this.enqueueSessionMutation(() =>
-      this.dependencies.sessionStore.clear(),
-    );
     this.setStatus({
       ...DEFAULT_STATUS,
       connectionState: "signed-out",
       syncPreferences: { ...this.status.syncPreferences },
     });
+    await this.enqueueSessionMutation(() =>
+      this.dependencies.sessionStore.clear(),
+    );
     await this.ensureRecoveryAlarm();
   }
 

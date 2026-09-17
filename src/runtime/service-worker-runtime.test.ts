@@ -172,6 +172,56 @@ function gatedSyncPreferencesStore(): {
   };
 }
 
+function firstWriteFailsSyncPreferencesStore(): {
+  store: SyncPreferencesStore;
+  firstSetStarted: Promise<void>;
+  releaseFirstSet: () => void;
+  secondSetStarted: Promise<void>;
+  getStored: () => Promise<{
+    schemaVersion: 1;
+    sendEnabled: boolean;
+    receiveEnabled: boolean;
+  }>;
+} {
+  let stored = {
+    schemaVersion: 1 as const,
+    sendEnabled: true,
+    receiveEnabled: true,
+  };
+  let setCount = 0;
+  let markFirstSetStarted!: () => void;
+  const firstSetStarted = new Promise<void>((resolve) => {
+    markFirstSetStarted = resolve;
+  });
+  let releaseFirstSet!: () => void;
+  const firstSetGate = new Promise<void>((resolve) => {
+    releaseFirstSet = resolve;
+  });
+  let markSecondSetStarted!: () => void;
+  const secondSetStarted = new Promise<void>((resolve) => {
+    markSecondSetStarted = resolve;
+  });
+  return {
+    store: {
+      get: async () => ({ ...stored }),
+      set: async (preferences) => {
+        setCount += 1;
+        if (setCount === 1) {
+          markFirstSetStarted();
+          await firstSetGate;
+          throw new Error("preference storage unavailable");
+        }
+        stored = { ...preferences };
+        markSecondSetStarted();
+      },
+    },
+    firstSetStarted,
+    releaseFirstSet,
+    secondSetStarted,
+    getStored: async () => ({ ...stored }),
+  };
+}
+
 function makeRuntime(overrides: Partial<{
   trustStore: ClientTrustStore;
   clipboardAdapter: ClipboardAdapter;
@@ -643,6 +693,242 @@ test("Send disable becomes a barrier before its storage write completes", async 
   preferences.releaseSet();
   assert.equal((await disabling).ok, true);
   assert.equal((await preferences.getStored()).sendEnabled, false);
+});
+
+test("failed Off transition restores Both, rebaselines the watcher, and drops old observations", async () => {
+  const preferences = firstWriteFailsSyncPreferencesStore();
+  const watchCalls: Array<{ type: "start" | "stop"; resetBaseline?: boolean }> = [];
+  let releaseEncryption!: () => void;
+  let markEncryptionStarted!: () => void;
+  const encryptionStarted = new Promise<void>((resolve) => {
+    markEncryptionStarted = resolve;
+  });
+  const encryptionGate = new Promise<void>((resolve) => {
+    releaseEncryption = resolve;
+  });
+  const setup = await startReady({
+    localTrustState: "verified",
+    syncPreferencesStore: preferences.store,
+    clipboardAdapter: {
+      readText: async () => "old clipboard value",
+      writeText: async () => undefined,
+      startWatching: async (options) => {
+        watchCalls.push({ type: "start", resetBaseline: options?.resetBaseline });
+      },
+      stopWatching: async () => {
+        watchCalls.push({ type: "stop" });
+      },
+    },
+    encrypt: async (input) => {
+      markEncryptionStarted();
+      await encryptionGate;
+      return {
+        itemId: "failed-off-observation",
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+  await flushRuntimeWork();
+  const startsBeforeTransition = watchCalls.filter((call) => call.type === "start").length;
+
+  const oldObservation = setup.runtime.handleClipboardObservation(
+    clipboardObservation("old clipboard value"),
+  );
+  await encryptionStarted;
+  const queuedOldObservation = setup.runtime.handleClipboardObservation(
+    clipboardObservation("queued old clipboard value"),
+  );
+  await flushRuntimeWork();
+
+  const disabling = setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: false,
+      receiveEnabled: false,
+    }),
+  );
+  await preferences.firstSetStarted;
+  assert.deepEqual(setup.runtime.getStatus().syncPreferences, {
+    schemaVersion: 1,
+    sendEnabled: false,
+    receiveEnabled: false,
+  });
+
+  preferences.releaseFirstSet();
+  const result = await disabling;
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.code, "SYNC_PREFERENCES_INVALID");
+  assert.deepEqual(setup.runtime.getStatus().syncPreferences, {
+    schemaVersion: 1,
+    sendEnabled: true,
+    receiveEnabled: true,
+  });
+
+  releaseEncryption();
+  await Promise.all([oldObservation, queuedOldObservation]);
+  await flushRuntimeWork();
+  assert.equal(
+    setup.socket.emissions.some((item) => item.event === "clipboard:publish"),
+    false,
+  );
+  assert.ok(watchCalls.filter((call) => call.type === "start").length > startsBeforeTransition);
+  assert.deepEqual(watchCalls[watchCalls.length - 1], {
+    type: "start",
+    resetBaseline: true,
+  });
+});
+
+test("a failed older preference write cannot roll back a newer Receive-only transition", async () => {
+  const preferences = firstWriteFailsSyncPreferencesStore();
+  const setup = await startReady({
+    syncPreferencesStore: preferences.store,
+  });
+
+  const first = setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: false,
+      receiveEnabled: false,
+    }),
+  );
+  await preferences.firstSetStarted;
+
+  const second = setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: false,
+      receiveEnabled: true,
+    }),
+  );
+  assert.deepEqual(setup.runtime.getStatus().syncPreferences, {
+    schemaVersion: 1,
+    sendEnabled: false,
+    receiveEnabled: true,
+  });
+
+  preferences.releaseFirstSet();
+  const firstResult = await first;
+  assert.equal(firstResult.ok, false);
+  assert.equal(firstResult.error?.code, "SYNC_PREFERENCES_INVALID");
+  await preferences.secondSetStarted;
+  const secondResult = await second;
+  assert.equal(secondResult.ok, true);
+  assert.deepEqual(setup.runtime.getStatus().syncPreferences, {
+    schemaVersion: 1,
+    sendEnabled: false,
+    receiveEnabled: true,
+  });
+  assert.deepEqual(await preferences.getStored(), {
+    schemaVersion: 1,
+    sendEnabled: false,
+    receiveEnabled: true,
+  });
+});
+
+test("failed Off rollback keeps Send and Receive operations invalidated", async () => {
+  const preferences = firstWriteFailsSyncPreferencesStore();
+  const processedItemStore = new RecordingProcessedItemStore();
+  let markProcessedHasStarted!: () => void;
+  const processedHasStarted = new Promise<void>((resolve) => {
+    markProcessedHasStarted = resolve;
+  });
+  let releaseProcessedHas!: () => void;
+  const processedHasGate = new Promise<void>((resolve) => {
+    releaseProcessedHas = resolve;
+  });
+  const originalHas = processedItemStore.has.bind(processedItemStore);
+  processedItemStore.has = async (userId, itemId) => {
+    markProcessedHasStarted();
+    await processedHasGate;
+    return originalHas(userId, itemId);
+  };
+
+  let releaseEncryption!: () => void;
+  let markEncryptionStarted!: () => void;
+  const encryptionStarted = new Promise<void>((resolve) => {
+    markEncryptionStarted = resolve;
+  });
+  const encryptionGate = new Promise<void>((resolve) => {
+    releaseEncryption = resolve;
+  });
+  let writes = 0;
+  const setup = await startReady({
+    localTrustState: "verified",
+    syncPreferencesStore: preferences.store,
+    processedItemStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async () => {
+        writes += 1;
+      },
+    },
+    encrypt: async (input) => {
+      markEncryptionStarted();
+      await encryptionGate;
+      return {
+        itemId: "failed-off-send",
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+
+  const send = setup.runtime.publishClipboardText("pre-Off send");
+  await encryptionStarted;
+  const disabling = setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: false,
+      receiveEnabled: false,
+    }),
+  );
+  await preferences.firstSetStarted;
+
+  const envelope = inboundEnvelope("failed-off-receive");
+  const receive = setup.runtime.receiveClipboardItem(envelope);
+  await processedHasStarted;
+
+  preferences.releaseFirstSet();
+  const disablingResult = await disabling;
+  assert.equal(disablingResult.ok, false);
+  assert.deepEqual(setup.runtime.getStatus().syncPreferences, {
+    schemaVersion: 1,
+    sendEnabled: true,
+    receiveEnabled: true,
+  });
+
+  releaseEncryption();
+  releaseProcessedHas();
+  await assert.rejects(
+    send,
+    (error: unknown) =>
+      error instanceof RuntimeError && error.code === "CLIPBOARD_SEND_DISABLED",
+  );
+  await receive;
+  assert.equal(writes, 0);
+  assert.equal(
+    processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition,
+    "receive-disabled",
+  );
+  assert.equal(
+    setup.socket.emissions.some((item) => item.event === "clipboard:publish"),
+    false,
+  );
 });
 
 test("popup status fallback treats a legacy status without syncPreferences as Both", () => {
@@ -1433,6 +1719,41 @@ test("runtime logout sends the v2 refresh token and always clears local session"
   assert.equal(logoutRefreshToken, "refresh-token");
   assert.equal(await setup.sessionStore.get(), null);
   assert.equal(setup.runtime.getStatus().signedIn, false);
+});
+
+test("runtime logout clears local session before backend revocation settles", async () => {
+  let markLogoutStarted!: () => void;
+  const logoutStarted = new Promise<void>((resolve) => {
+    markLogoutStarted = resolve;
+  });
+  let releaseLogout!: () => void;
+  const logoutGate = new Promise<void>((resolve) => {
+    releaseLogout = resolve;
+  });
+  const setup = makeRuntime({
+    initialSession: {
+      schemaVersion: 2,
+      accessToken: "access-token",
+      refreshToken: "refresh-token",
+      user,
+    },
+    logout: async () => {
+      markLogoutStarted();
+      await logoutGate;
+      return response(undefined);
+    },
+  });
+
+  await setup.runtime.start();
+  const pendingLogout = setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:logout" }),
+  );
+  await logoutStarted;
+  assert.equal(await setup.sessionStore.get(), null);
+  assert.equal(setup.runtime.getStatus().signedIn, false);
+
+  assert.equal((await pendingLogout).ok, true);
+  releaseLogout();
 });
 
 async function startReady(overrides: Parameters<typeof makeRuntime>[0] = {}) {
