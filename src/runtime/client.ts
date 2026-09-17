@@ -10,8 +10,6 @@ import { RuntimeError } from "./errors.ts";
 
 const TRANSIENT_RETRY_COMMANDS = new Set<RuntimeCommand["type"]>([
   "runtime:get-status",
-  "runtime:auth-passwordless",
-  "runtime:auth-refresh",
 ]);
 
 const TRANSIENT_RETRY_DELAY_MS = 75;

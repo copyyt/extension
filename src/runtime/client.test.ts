@@ -27,7 +27,7 @@ function okResponse(message: RuntimeRequest): RuntimeResponse {
   };
 }
 
-test("safe runtime commands get one retry after a transient worker restart error", async () => {
+test("runtime status gets one retry after a transient worker restart error", async () => {
   let calls = 0;
   installSendMessage(async (message) => {
     calls += 1;
@@ -37,9 +37,38 @@ test("safe runtime commands get one retry after a transient worker restart error
     return okResponse(message);
   });
 
-  const result = await sendRuntimeCommand({ type: "runtime:auth-passwordless", email: "test@example.com" });
+  const result = await sendRuntimeCommand({ type: "runtime:get-status" });
   assert.deepEqual(result, { ok: true });
   assert.equal(calls, 2);
+});
+
+test("passwordless auth is never retried after a transient worker restart error", async () => {
+  let calls = 0;
+  installSendMessage(async () => {
+    calls += 1;
+    throw new Error("Could not establish connection. Receiving end does not exist.");
+  });
+
+  await assert.rejects(
+    sendRuntimeCommand({
+      type: "runtime:auth-passwordless",
+      email: "test@example.com",
+    }),
+  );
+  assert.equal(calls, 1);
+});
+
+test("token refresh is never retried after a transient worker restart error", async () => {
+  let calls = 0;
+  installSendMessage(async () => {
+    calls += 1;
+    throw new Error("Could not establish connection. Receiving end does not exist.");
+  });
+
+  await assert.rejects(
+    sendRuntimeCommand({ type: "runtime:auth-refresh" }),
+  );
+  assert.equal(calls, 1);
 });
 
 test("OTP verification is never retried after a transient worker restart error", async () => {

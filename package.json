@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node scripts/build-extension-worker.mjs",
     "build:extension": "VITE_APP_TYPE=extension yarn build",
     "lint": "eslint .",
     "test:crypto": "node --experimental-strip-types --test \"src/crypto/*.test.ts\"",
@@ -29,6 +29,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",
+    "acorn": "^8.14.0",
     "@types/chrome": "^0.0.299",
     "@types/node": "^24.10.0",
     "@types/react": "^18.3.18",

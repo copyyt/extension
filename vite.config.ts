@@ -7,6 +7,15 @@ import { VitePWA } from "vite-plugin-pwa";
 const env = loadEnv("", process.cwd(), "");
 const target = env.VITE_APP_TYPE || "extension";
 const isPWA = target === "web";
+const isExtensionWorkerBuild = env.VITE_EXTENSION_BUILD === "worker";
+const isExtension = target === "extension";
+
+const extensionInputs = isExtensionWorkerBuild
+  ? "./src/service-worker.ts"
+  : {
+      main: "./index.html",
+      ...(isExtension ? { offscreen: "./src/offscreen.ts" } : {}),
+    };
 
 // https://vite.dev/config/
 export default defineConfig({
@@ -39,18 +48,15 @@ export default defineConfig({
   },
   build: {
     outDir: target === "extension" ? "build-extension" : "build",
+    emptyOutDir: !isExtensionWorkerBuild,
     rollupOptions: {
-      input: {
+      input: isPWA || isExtensionWorkerBuild ? extensionInputs : {
         main: "./index.html",
-        ...(isPWA
-          ? {}
-          : {
-              "service-worker": "./src/service-worker.ts",
-              offscreen: "./src/offscreen.ts",
-            }),
+        offscreen: "./src/offscreen.ts",
       },
       output: {
         entryFileNames: "assets/[name].js",
+        ...(isExtensionWorkerBuild ? { inlineDynamicImports: true } : {}),
       },
     },
   },
