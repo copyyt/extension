@@ -8,6 +8,35 @@ import type {
 import { POPUP_SOURCE, RUNTIME_SOURCE } from "./messages.ts";
 import { RuntimeError } from "./errors.ts";
 
+const TRANSIENT_RETRY_COMMANDS = new Set<RuntimeCommand["type"]>([
+  "runtime:get-status",
+  "runtime:auth-passwordless",
+  "runtime:auth-refresh",
+]);
+
+const TRANSIENT_RETRY_DELAY_MS = 75;
+
+function isTransientWorkerSendError(error: unknown): boolean {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : error && typeof error === "object" && "message" in error &&
+            typeof error.message === "string"
+          ? error.message
+          : "";
+  return /receiving end does not exist|message port closed|extension context invalidated|service worker.+(?:restart|start|unavailable)|could not establish connection/i.test(
+    message,
+  );
+}
+
+function waitForWorkerRestart(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, TRANSIENT_RETRY_DELAY_MS);
+  });
+}
+
 function requestId(): string {
   return globalThis.crypto.randomUUID();
 }
@@ -22,8 +51,26 @@ export async function sendRuntimeCommand<T>(command: RuntimeCommand): Promise<T>
   let response: unknown;
   try {
     response = await chrome.runtime.sendMessage(message);
-  } catch {
-    throw new RuntimeError("AUTH_REQUIRED", "The Copyyt service worker did not respond");
+  } catch (error) {
+    if (
+      TRANSIENT_RETRY_COMMANDS.has(command.type) &&
+      isTransientWorkerSendError(error)
+    ) {
+      await waitForWorkerRestart();
+      try {
+        response = await chrome.runtime.sendMessage(message);
+      } catch {
+        throw new RuntimeError(
+          "AUTH_REQUIRED",
+          "The Copyyt service worker did not respond",
+        );
+      }
+    } else {
+      throw new RuntimeError(
+        "AUTH_REQUIRED",
+        "The Copyyt service worker did not respond",
+      );
+    }
   }
   if (!response || typeof response !== "object") {
     throw new RuntimeError("AUTH_REQUIRED", "The Copyyt service worker returned no response");

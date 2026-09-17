@@ -491,6 +491,7 @@ export class CopyytServiceWorkerRuntime {
   private challengeInFlight = false;
   private challengeReceived = false;
   private serverDeviceState: ServerDeviceState = "unknown";
+  private startup: Promise<void> | null = null;
   private initialization: Promise<void> | null = null;
   private refreshInFlight: Promise<RuntimeSession> | null = null;
   private socketRecoveryInFlight: Promise<void> | null = null;
@@ -511,31 +512,60 @@ export class CopyytServiceWorkerRuntime {
   }
 
   async start(): Promise<void> {
+    if (!this.startup) {
+      this.startup = this.startInternal();
+    }
+    return this.startup;
+  }
+
+  private async startInternal(): Promise<void> {
     const persistedStatus = await this.dependencies.statusStore
       .get()
       .catch(() => null);
-    if (persistedStatus) {
-      this.status = {
-        ...DEFAULT_STATUS,
-        ...persistedStatus,
-        device: { ...DEFAULT_STATUS.device, ...persistedStatus.device },
-        socket: { ...DEFAULT_STATUS.socket, ...persistedStatus.socket },
-        onboarding: {
-          ...DEFAULT_STATUS.onboarding,
-          ...persistedStatus.onboarding,
-        },
-      };
-    }
     this.session = await this.dependencies.sessionStore.get();
+
+    // Persisted status is useful context for the UI, but it is not live
+    // authority. In particular, a worker recreation cannot inherit socket or
+    // sync readiness from the previous worker instance.
+    this.status = {
+      ...DEFAULT_STATUS,
+      ...(persistedStatus
+        ? {
+            device: { ...DEFAULT_STATUS.device, ...persistedStatus.device },
+            onboarding: {
+              ...DEFAULT_STATUS.onboarding,
+              ...persistedStatus.onboarding,
+            },
+            ...(persistedStatus.lastSyncError
+              ? { lastSyncError: persistedStatus.lastSyncError }
+              : {}),
+            ...(persistedStatus.lastConnectionError
+              ? { lastConnectionError: persistedStatus.lastConnectionError }
+              : {}),
+          }
+        : {}),
+      connectionState: this.session ? "account-authenticated" : "signed-out",
+      signedIn: this.session !== null,
+      user: this.session ? userFromSession(this.session) : undefined,
+      socket: { connected: false, deviceAuthenticated: false },
+      syncReady: false,
+    };
+    this.serverDeviceState = "unknown";
+    this.socketReady = false;
+    this.challengeInFlight = false;
+    this.challengeReceived = false;
+
     if (!this.session) {
       this.setStatus({
-        ...DEFAULT_STATUS,
+        ...this.status,
         connectionState: "signed-out",
+        signedIn: false,
+        user: undefined,
       });
       return;
     }
     this.setStatus({
-      ...DEFAULT_STATUS,
+      ...this.status,
       connectionState: "account-authenticated",
       signedIn: true,
       user: userFromSession(this.session),

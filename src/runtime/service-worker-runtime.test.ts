@@ -77,8 +77,15 @@ class FakeSocket implements SocketLike {
   connected = false;
   readonly events = new Map<string, (...args: unknown[]) => void>();
   readonly emissions: Array<{ event: string; args: unknown[] }> = [];
+  private readonly emitConnectEventOnConnect: boolean;
+  constructor(emitConnectEventOnConnect = true) {
+    this.emitConnectEventOnConnect = emitConnectEventOnConnect;
+  }
   on(event: string, listener: (...args: unknown[]) => void): void { this.events.set(event, listener); }
-  connect(): void { this.connected = true; this.events.get("connect")?.(); }
+  connect(): void {
+    this.connected = true;
+    if (this.emitConnectEventOnConnect) this.events.get("connect")?.();
+  }
   disconnect(): void { this.connected = false; this.events.get("disconnect")?.(); }
   emit(event: string, ...args: unknown[]): void {
     this.emissions.push({ event, args });
@@ -114,14 +121,19 @@ function makeRuntime(overrides: Partial<{
   encrypt: RuntimeDependencies["encrypt"];
   identity: DeviceIdentity;
   registeredDevice: typeof registeredDevice;
+  sessionStore: SessionStore;
+  statusStore: StatusStore<RuntimeStatus>;
+  identityLoader: (userId: string) => Promise<DeviceIdentity | null>;
+  identityCreator: (userId: string) => Promise<DeviceIdentity>;
+  registerDevice: RuntimeDependencies["registerDevice"];
 }> = {}) {
   const runtimeIdentity = overrides.identity ?? identity;
   const runtimeRegisteredDevice = overrides.registeredDevice ?? registeredDevice;
   const initialSession: RuntimeSession | null = overrides.initialSession === undefined
     ? { schemaVersion: 1, accessToken: overrides.accessToken ?? "access-token", user }
     : overrides.initialSession;
-  const sessionStore = new MemorySessionStore(initialSession);
-  const statusStore = new MemoryStatusStore();
+  const sessionStore = overrides.sessionStore ?? new MemorySessionStore(initialSession);
+  const statusStore = overrides.statusStore ?? new MemoryStatusStore();
   const socket = overrides.socket ?? new FakeSocket();
   const clipboardAdapter = overrides.clipboardAdapter ?? {
     readText: async () => "secret plaintext",
@@ -177,9 +189,9 @@ function makeRuntime(overrides: Partial<{
       socketOptions = options;
       return socket;
     },
-    identityLoader: async () => runtimeIdentity,
-    identityCreator: async () => runtimeIdentity,
-    registerDevice: async () => ({ identity: runtimeIdentity, device: runtimeRegisteredDevice }),
+    identityLoader: overrides.identityLoader ?? (async () => runtimeIdentity),
+    identityCreator: overrides.identityCreator ?? (async () => runtimeIdentity),
+    registerDevice: overrides.registerDevice ?? (async () => ({ identity: runtimeIdentity, device: runtimeRegisteredDevice })),
     signChallenge: async () => "signed-challenge",
     signApproval: overrides.signApproval,
     encrypt: overrides.encrypt ?? (async (input) => ({
@@ -198,6 +210,62 @@ function makeRuntime(overrides: Partial<{
   });
   return { runtime, socket, sessionStore, statusStore, trustStore, clipboardAdapter, getSocketOptions: () => socketOptions };
 }
+
+test("runtime start is single-flight and worker recreation restores session without stale readiness", async () => {
+  const sessionStore = new MemorySessionStore({ schemaVersion: 1, accessToken: "durable-token", user });
+  const statusStore = new MemoryStatusStore();
+  let identityCreations = 0;
+  let registrations = 0;
+  const identityLoader = async (): Promise<DeviceIdentity> => identity;
+  const identityCreator = async (): Promise<DeviceIdentity> => {
+    identityCreations += 1;
+    return identity;
+  };
+  const registerDevice: RuntimeDependencies["registerDevice"] = async () => {
+    registrations += 1;
+    return { identity, device: registeredDevice };
+  };
+
+  const first = makeRuntime({
+    localTrustState: "verified",
+    sessionStore,
+    statusStore,
+    identityLoader,
+    identityCreator,
+    registerDevice,
+  });
+  await Promise.all([first.runtime.start(), first.runtime.start()]);
+  assert.equal(registrations, 1);
+  assert.equal(identityCreations, 0);
+  first.socket.trigger("auth:ready");
+  assert.equal(first.runtime.getStatus().socket.deviceAuthenticated, true);
+
+  const recreatedSocket = new FakeSocket(false);
+  const recreated = makeRuntime({
+    localTrustState: "verified",
+    sessionStore,
+    statusStore,
+    trustStore: first.trustStore,
+    socket: recreatedSocket,
+    identityLoader,
+    identityCreator,
+    registerDevice,
+  });
+  await recreated.runtime.start();
+
+  assert.equal((await sessionStore.get())?.accessToken, "durable-token");
+  assert.equal(recreated.runtime.getStatus().signedIn, true);
+  assert.equal(recreated.runtime.getStatus().device.deviceId, identity.deviceId);
+  assert.equal(recreated.runtime.getStatus().socket.connected, false);
+  assert.equal(recreated.runtime.getStatus().socket.deviceAuthenticated, false);
+  assert.equal(recreated.runtime.getStatus().syncReady, false);
+  assert.equal(registrations, 2);
+  assert.equal(identityCreations, 0);
+
+  recreatedSocket.trigger("auth:ready");
+  assert.equal(recreated.runtime.getStatus().socket.deviceAuthenticated, true);
+  assert.equal(recreated.runtime.getStatus().syncReady, true);
+});
 
 test("socket uses handshake auth token and device auth waits for challenge", async () => {
   const { runtime, socket, getSocketOptions } = makeRuntime();

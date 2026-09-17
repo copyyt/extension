@@ -12,7 +12,8 @@ import {
   type SocketLike,
   type SocketOptions,
 } from "./runtime/service-worker-runtime.ts";
-import { isRuntimeRequest, RUNTIME_SOURCE, POPUP_SOURCE, type RuntimeRequest } from "./runtime/messages.ts";
+import { createRuntimeMessageListener } from "./runtime/service-worker-bootstrap.ts";
+import { RUNTIME_ERROR_CODES, type RuntimeErrorCode } from "./runtime/errors.ts";
 import { SOCKET_URL } from "./utils/constants.ts";
 
 function socketFactory(url: string, options: SocketOptions): SocketLike {
@@ -34,25 +35,41 @@ const runtime = new CopyytServiceWorkerRuntime({
     chrome.runtime.sendMessage(message).catch(() => undefined),
 });
 
-chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
-  if (
-    !isRuntimeRequest(message) ||
-    sender.id !== chrome.runtime.id ||
-    (sender.url !== undefined && !sender.url.startsWith(chrome.runtime.getURL("")))
-  ) {
-    return false;
-  }
-  void runtime.handleMessage(message).then(sendResponse).catch((error: unknown) => {
-    sendResponse({
-      source: RUNTIME_SOURCE,
-      target: POPUP_SOURCE,
-      requestId: (message as RuntimeRequest).requestId,
-      ok: false,
-      error: { code: "AUTH_REQUIRED", message: "The runtime operation failed" },
-    });
-    void error;
-  });
-  return true;
-});
+let startupError: unknown = null;
 
-void runtime.start();
+if (import.meta.env.DEV) {
+  console.info("COPYyt service worker starting");
+}
+
+const runtimeReady = runtime.start().then(
+  () => {
+    if (import.meta.env.DEV) {
+      console.info("COPYyt service worker ready");
+    }
+  },
+  (error: unknown) => {
+    startupError = error;
+    const errorName = error instanceof Error ? error.name : "UnknownError";
+    const errorCode =
+      error && typeof error === "object" && "code" in error &&
+      typeof error.code === "string" &&
+      RUNTIME_ERROR_CODES.includes(error.code as RuntimeErrorCode)
+        ? ` (${error.code})`
+        : "";
+    console.error(
+      `COPYyt service worker startup failed ${errorName}${errorCode}`,
+    );
+  },
+);
+
+// Register synchronously during module evaluation. The listener keeps the
+// channel open while the single startup promise restores the runtime.
+chrome.runtime.onMessage.addListener(
+  createRuntimeMessageListener({
+    runtime,
+    runtimeReady,
+    getStartupError: () => startupError,
+    runtimeId: chrome.runtime.id,
+    extensionUrl: chrome.runtime.getURL(""),
+  }),
+);
