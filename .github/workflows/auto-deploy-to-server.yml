@@ -2,9 +2,6 @@ name: Deploy to Server
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 jobs:
   build:
@@ -18,7 +15,8 @@ jobs:
         with:
           envkey_VITE_API_URL: ${{ secrets.VITE_API_URL }}
           envkey_VITE_SOCKET_URL: ${{ secrets.VITE_SOCKET_URL }}
-          envkey_VITE_APP_TYPE: ${{ secrets.VITE_APP_TYPE }}
+          envkey_VITE_APP_TYPE: web
+          envkey_VITE_WEB_APP_PAUSED: true
           envkey_VITE_GOOGLE_CLIENT_ID_WEB: ${{ secrets.VITE_GOOGLE_CLIENT_ID_WEB }}
 
           file_name: .env
@@ -38,7 +36,7 @@ jobs:
 
       - name: Build the application
         run: |
-          yarn build
+          VITE_APP_TYPE=web VITE_WEB_APP_PAUSED=true yarn build
 
       - name: Extract build files
         run: |

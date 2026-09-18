@@ -1,5 +1,24 @@
 # Copyyt Chrome extension
 
+## Product status
+
+- Copyyt Chrome extension: active primary client.
+- Copyyt Web/PWA: paused. Its source is retained for possible future
+  dashboard/manual-client work.
+- Copyyt marketing/privacy website: active.
+
+The retained web client is selected with `VITE_APP_TYPE=web`. Production and
+manual PWA deployments explicitly set `VITE_WEB_APP_PAUSED=true`, which serves
+an inert paused page instead of mounting the legacy clipboard/account client.
+For intentional local work on that retained client, use
+`VITE_APP_TYPE=web VITE_WEB_APP_PAUSED=false`.
+
+The PWA build keeps VitePWA's normal `autoUpdate` service-worker behavior.
+After the paused build is manually deployed once, existing installations can
+receive the paused shell through the normal service-worker update flow. Future
+Chrome extension releases do not deploy the PWA because the server workflow is
+manual-only.
+
 The extension’s Phase 1D crypto core is framework-independent and uses Chrome
 137+ WebCrypto primitives: Ed25519 device signatures, X25519 key agreement,
 HKDF-SHA-256, and AES-256-GCM. Plaintext clipboard contents and private keys
