@@ -1,4 +1,4 @@
-name: Deploy to Server
+name: Deploy Paused Web App
 
 on:
   workflow_dispatch:
