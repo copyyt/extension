@@ -383,6 +383,13 @@ function refreshFailureIsDefinitive(error: unknown): boolean {
   );
 }
 
+function isAccessTokenRejection(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const response = (error as { response?: unknown }).response;
+  if (!response || typeof response !== "object") return false;
+  return (response as { status?: unknown }).status === 401;
+}
+
 function isRefreshTokenNotFound(error: unknown): boolean {
   return backendErrorCode(error) === "refresh_token_not_found";
 }
@@ -622,6 +629,7 @@ export class CopyytServiceWorkerRuntime {
   private clipboardWatchReconcileInFlight: Promise<void> | null = null;
   private autoObservationSequence = 0;
   private autoPublishInFlight: Promise<void> | null = null;
+  private automaticPublishAuthRecoveryInFlight = false;
   private pendingAutoObservation: {
     text: string;
     sequence: number;
@@ -1123,6 +1131,22 @@ export class CopyytServiceWorkerRuntime {
       return;
     }
     if (!this.isAutomaticSyncEligible()) {
+      if (
+        this.autoPublishInFlight &&
+        this.isAutomaticPublishAuthRecoveryActive()
+      ) {
+        // An auth recovery temporarily replaces the ready socket after the
+        // access token rotates. Keep the existing latest-wins slot alive for
+        // this bounded publish retry; ordinary socket recovery still drops
+        // observations and establishes a fresh clipboard baseline.
+        const observation = {
+          text: message.text,
+          sequence: ++this.autoObservationSequence,
+        };
+        this.pendingAutoObservation = observation;
+        await this.autoPublishInFlight;
+        return;
+      }
       // The observation is intentionally not retained. It may wake a dormant
       // runtime, but only a later clipboard change after a fresh baseline can
       // be published.
@@ -1216,9 +1240,12 @@ export class CopyytServiceWorkerRuntime {
     sequence: number;
   }): Promise<void> {
     let current = first;
+    const sendPolicyRevision = this.sendPolicyRevision;
+    let authRecoveryAttempted = false;
     while (true) {
       if (!this.isAutomaticSyncEligible()) return;
       try {
+        this.requireSendPolicy(sendPolicyRevision);
         await this.publishClipboardText(current.text);
         this.setStatus({
           ...this.status,
@@ -1239,6 +1266,53 @@ export class CopyytServiceWorkerRuntime {
             at: this.now().toISOString(),
           },
         });
+        if (isAccessTokenRejection(error) && !authRecoveryAttempted) {
+          authRecoveryAttempted = true;
+          try {
+            // Keep the recovery behind the same Send-policy barrier as the
+            // original observation. This prevents Off -> On from replaying
+            // plaintext that was observed before the policy transition.
+            this.requireSendPolicy(sendPolicyRevision);
+            this.automaticPublishAuthRecoveryInFlight = true;
+            try {
+              await this.reconcileConnectivity(
+                "automatic-publish-auth-recovery",
+                {
+                  forceTokenRefresh: true,
+                  waitForReady: true,
+                },
+              );
+            } finally {
+              this.automaticPublishAuthRecoveryInFlight = false;
+            }
+            // The retry must pass through requireSendPolicy even when the
+            // recovery itself completed successfully.
+            this.requireSendPolicy(sendPolicyRevision);
+          } catch (recoveryError) {
+            const recoveryRuntimeError = asRuntimeError(
+              recoveryError,
+              "SOCKET_PUBLISH_FAILED",
+              "Automatic clipboard sync recovery failed",
+            );
+            this.setStatus({
+              ...this.status,
+              lastAutoSyncError: {
+                code: recoveryRuntimeError.code,
+                message: recoveryRuntimeError.message,
+                at: this.now().toISOString(),
+              },
+            });
+            this.pendingAutoObservation = null;
+            return;
+          }
+
+          const pending = this.pendingAutoObservation;
+          this.pendingAutoObservation = null;
+          if (pending && pending.sequence > current.sequence) {
+            current = pending;
+          }
+          continue;
+        }
         if (
           runtimeError.code === "NO_VERIFIED_RECIPIENTS" ||
           runtimeError.code === "DEVICE_NOT_LOCALLY_TRUSTED" ||
@@ -3193,7 +3267,9 @@ export class CopyytServiceWorkerRuntime {
       this.socketReady = false;
       this.challengeInFlight = false;
       this.challengeReceived = false;
-      this.pendingAutoObservation = null;
+      if (!this.isAutomaticPublishAuthRecoveryActive()) {
+        this.pendingAutoObservation = null;
+      }
       this.clipboardWatchResetRequested = true;
       this.setStatus({
         ...this.status,
@@ -3208,6 +3284,10 @@ export class CopyytServiceWorkerRuntime {
     } catch {
       // A stale socket is best-effort cleanup during token replacement.
     }
+  }
+
+  private isAutomaticPublishAuthRecoveryActive(): boolean {
+    return this.automaticPublishAuthRecoveryInFlight;
   }
 
   private markTransportDisconnected(message: string): void {
