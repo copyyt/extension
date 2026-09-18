@@ -4,6 +4,13 @@ import { checkJwtExpiry } from "@/utils";
 import { useViewStore } from "@/hooks/view-store.hook";
 import ViewLoader from "@/components/loader";
 import { useRefreshTokens } from "@/hooks/auth.hook";
+import { APP_TYPE } from "@/utils/constants";
+import { useUserStore } from "@/hooks/user-store.hook";
+import { getRuntimeStatus } from "@/runtime/client";
+import {
+  bootstrapExtensionAuth,
+  shouldRefreshWebAuth,
+} from "./auth-bootstrap";
 
 export default function withAuth<T>(Component: React.FC<T>) {
   return function IsAuth(props: T & React.JSX.IntrinsicAttributes) {
@@ -11,11 +18,29 @@ export default function withAuth<T>(Component: React.FC<T>) {
       null,
     );
     const { setCurrentView } = useViewStore();
+    const { setUser } = useUserStore();
     const refreshTokens = useRefreshTokens();
 
     useEffect(() => {
-      const auth = checkJwtExpiry(localStorage.getItem("accessToken")!);
-      if (!auth) {
+      if (APP_TYPE === "extension") {
+        bootstrapExtensionAuth(getRuntimeStatus)
+          .then((result) => {
+            if (result.authenticated) {
+              setUser(result.user);
+              setIsAuthenticated(true);
+              return;
+            }
+
+            setIsAuthenticated(false);
+            setCurrentView(result.view);
+          })
+          .catch(() => {
+            setIsAuthenticated(false);
+            setCurrentView("sign-in");
+          });
+        return;
+      }
+      if (shouldRefreshWebAuth(localStorage.getItem("accessToken"), checkJwtExpiry)) {
         refreshTokens.mutate(undefined, {
           onSuccess: () => {
             return setIsAuthenticated(true);
@@ -27,7 +52,7 @@ export default function withAuth<T>(Component: React.FC<T>) {
           },
         });
       } else {
-        setIsAuthenticated(auth);
+        setIsAuthenticated(true);
       }
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
 

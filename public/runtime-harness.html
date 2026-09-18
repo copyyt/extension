@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Copyyt MV3 runtime harness</title>
+<pre id="output">RUNNING</pre>
+<script type="module">
+  const output = document.querySelector("#output");
+  const request = (command) =>
+    chrome.runtime.sendMessage({
+      source: "popup",
+      target: "service-worker",
+      requestId: crypto.randomUUID(),
+      command,
+    });
+
+  try {
+    const status = await request({ type: "runtime:get-status" });
+    if (!status?.ok) throw new Error(status?.error?.message || "status request failed");
+    const marker = `copyyt-harness-${crypto.randomUUID()}`;
+    const clipboard = await request({ type: "runtime:test-clipboard", marker });
+    if (!clipboard?.ok) {
+      throw new Error(`${clipboard?.error?.code || "CLIPBOARD_TEST_FAILED"}: ${clipboard?.error?.message || "clipboard test failed"}`);
+    }
+    const after = await request({ type: "runtime:get-status" });
+    if (!after?.ok) throw new Error(after?.error?.message || "post-test status request failed");
+    output.textContent = clipboard.data?.ping && clipboard.data?.readText && clipboard.data?.writeText
+      ? "PASS\nservice worker → offscreen PING/READ_TEXT/WRITE_TEXT → OS clipboard"
+      : "FAIL clipboard adapter returned an unsuccessful result";
+  } catch (error) {
+    output.textContent = `FAIL ${error instanceof Error ? error.message : String(error)}`;
+  }
+</script>

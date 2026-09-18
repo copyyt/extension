@@ -1,68 +1,161 @@
-import withAuth from "@/hocs/with-auth.hoc";
 import Button from "@/components/button";
+import withAuth from "@/hocs/with-auth.hoc";
+import { sendRuntimeCommand } from "@/runtime/client";
+import type { RuntimeStatus } from "@/runtime/messages";
+import { useRuntimeStatus } from "@/hooks/runtime-status.hook";
 import { useLogout } from "@/hooks/auth.hook";
 import { useUserStore } from "@/hooks/user-store.hook";
 import Logo from "@/vectors/logo";
-import { useEffect, useState } from "react";
-import { useSocket } from "@/hooks/socket.hook";
-import useDebounce from "@/hooks/debounce.hook";
-import { useGetLastMessage } from "@/hooks/user.hook";
-import { useViewLoader } from "@/hooks/loader.hook";
 import LogoutIcon from "@/vectors/logout";
-import PasteIcon from "@/vectors/paste";
-import CopyIcon from "@/vectors/copy-icon";
+import { useState } from "react";
+import {
+  clipboardSyncMode,
+  syncPreferencesForStatus,
+  type ClipboardSyncMode,
+} from "./sync-preferences";
 
-const Home = () => {
+function statusLabel(status: RuntimeStatus): string {
+  switch (status.connectionState) {
+    case "ready":
+      return status.syncReady ? "Ready" : "Connected; pairing required";
+    case "device-authenticating":
+      return "Authenticating device";
+    case "connecting":
+      return "Connecting";
+    case "account-authenticated":
+      return "Signed in; connecting device";
+    case "error":
+      return status.lastConnectionError?.message ?? status.lastSyncError?.message ?? "Connection error";
+    default:
+      return "Signed out";
+  }
+}
+
+function Home() {
   const { user } = useUserStore();
   const logout = useLogout();
+  const { status, reload } = useRuntimeStatus();
+  const [sending, setSending] = useState(false);
+  const [trusting, setTrusting] = useState(false);
+  const [pairingBusy, setPairingBusy] = useState(false);
+  const [syncPreferencesBusy, setSyncPreferencesBusy] = useState(false);
+  const [confirmedFingerprint, setConfirmedFingerprint] = useState("");
+  const [message, setMessage] = useState<string | null>(null);
 
-  const [text, setText] = useState("");
-
-  const lastMessageQuery = useGetLastMessage();
-  const lastMessage = lastMessageQuery.data?.data?.data;
-
-  const onMessage = (value: string) => {
-    if (value !== text) {
-      setText(value);
+  const sendCurrentClipboard = async () => {
+    setSending(true);
+    setMessage(null);
+    try {
+      const result = await sendRuntimeCommand<{ itemId: string }>({
+        type: "runtime:send-current-clipboard",
+      });
+      setMessage(`Encrypted item accepted: ${result.itemId}`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to send clipboard");
+    } finally {
+      setSending(false);
+      void reload();
     }
   };
 
-  useEffect(() => {
-    if (lastMessage) {
-      setText(lastMessage);
-    }
-  }, [lastMessage]);
-
-  const { socket, isConnected } = useSocket(onMessage);
-
-  const pasteClipboard = async () => {
+  const refreshOnboarding = async () => {
+    setPairingBusy(true);
+    setMessage(null);
     try {
-      const clipboardContents = await navigator.clipboard.readText();
-      setText(clipboardContents);
+      await sendRuntimeCommand<RuntimeStatus>({ type: "runtime:refresh-onboarding" });
+      await reload();
     } catch (error) {
-      console.error(error);
+      setMessage(error instanceof Error ? error.message : "Unable to refresh pairing state");
+    } finally {
+      setPairingBusy(false);
     }
   };
 
-  async function writeClipboardText() {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch (error) {
-      console.error(error);
+  const completePairing = async () => {
+    const pairing = status?.onboarding?.pairing;
+    if (!pairing || !confirmedFingerprint.trim()) {
+      setMessage("Enter the fingerprint shown on both devices.");
+      return;
     }
-  }
-
-  useDebounce(
-    () => {
-      if (text && isConnected) {
-        socket.emit("message", text);
+    setPairingBusy(true);
+    setMessage(null);
+    try {
+      if (pairing.role === "approver") {
+        await sendRuntimeCommand<RuntimeStatus>({
+          type: "runtime:approve-pending-device",
+          pendingDeviceId: pairing.pendingDeviceId,
+          confirmedFingerprint: confirmedFingerprint.trim().toUpperCase(),
+        });
+        setMessage("Device approved. Confirm the same fingerprint on the other device.");
+      } else {
+        await sendRuntimeCommand<RuntimeStatus>({
+          type: "runtime:confirm-paired-approver",
+          approverDeviceId: pairing.approverDeviceId,
+          confirmedFingerprint: confirmedFingerprint.trim().toUpperCase(),
+        });
+        setMessage("Pairing confirmation recorded.");
       }
-    },
-    1000,
-    [text],
-  );
+      setConfirmedFingerprint("");
+      await reload();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to complete pairing");
+    } finally {
+      setPairingBusy(false);
+    }
+  };
 
-  useViewLoader([lastMessageQuery.isLoading]);
+  const trustThisDevice = async () => {
+    setTrusting(true);
+    setMessage(null);
+    try {
+      await sendRuntimeCommand<RuntimeStatus>({ type: "runtime:bootstrap-trust-anchor" });
+      setMessage("This device is now locally trusted.");
+      await reload();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to trust this device");
+    } finally {
+      setTrusting(false);
+    }
+  };
+
+  const updateClipboardSync = async (mode: ClipboardSyncMode) => {
+    const preferences = {
+      both: { sendEnabled: true, receiveEnabled: true },
+      "send-only": { sendEnabled: true, receiveEnabled: false },
+      "receive-only": { sendEnabled: false, receiveEnabled: true },
+      off: { sendEnabled: false, receiveEnabled: false },
+    }[mode];
+    setSyncPreferencesBusy(true);
+    setMessage(null);
+    try {
+      await sendRuntimeCommand<RuntimeStatus>({
+        type: "runtime:set-sync-preferences",
+        ...preferences,
+      });
+      await reload();
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Unable to update clipboard sync preferences",
+      );
+    } finally {
+      setSyncPreferencesBusy(false);
+    }
+  };
+
+  const localDeviceTrusted =
+    status?.device.trustState === "root" || status?.device.trustState === "verified";
+  const pairing = status?.onboarding?.pairing;
+  const syncPreferences = syncPreferencesForStatus(status);
+  const selectedSyncMode = clipboardSyncMode(syncPreferences);
+  const syncModes: Array<{ mode: ClipboardSyncMode; label: string }> = [
+    { mode: "both", label: "Both" },
+    { mode: "send-only", label: "Send only" },
+    { mode: "receive-only", label: "Receive only" },
+    { mode: "off", label: "Off" },
+  ];
+
   return (
     <section className="flex h-full flex-col sm:block">
       <div className="flex items-center justify-between">
@@ -79,43 +172,147 @@ const Home = () => {
             Logout
           </Button>
           <div className="relative flex h-10 w-10 items-center justify-center rounded-full bg-[#1E6892] font-semibold text-white uppercase">
-            {(user?.name ?? "o").slice(0, 1)}
+            {(user?.name ?? status?.user?.name ?? "o").slice(0, 1)}
           </div>
         </div>
       </div>
 
       <p className="font-work mt-4 text-sm text-[#4B5563]">
-        This extension helps you copy text across various computers using the
-        the extension. Just paste here and pick up there.
+        Copyyt sends clipboard text as an encrypted device-to-device envelope.
+        The server never receives the plaintext.
       </p>
 
-      <textarea
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        className="mt-7 h-[200px] w-full flex-1 resize-none rounded-lg border border-[#D1D5DB] p-2 text-xs outline-none"
-      />
+      <div className="mt-7 space-y-3 rounded-lg border border-[#D1D5DB] p-4 text-xs">
+        <div className="flex justify-between gap-4">
+          <span className="text-[#4B5563]">Account</span>
+          <span>{status?.signedIn ? "Signed in" : "Signed out"}</span>
+        </div>
+        <div className="flex justify-between gap-4">
+          <span className="text-[#4B5563]">Device</span>
+          <span>{status?.device.registration ?? "unknown"}</span>
+        </div>
+        <div className="flex justify-between gap-4">
+          <span className="text-[#4B5563]">Local trust</span>
+          <span>{status?.device.trustState ?? "unknown"}</span>
+        </div>
+        <div className="flex justify-between gap-4">
+          <span className="text-[#4B5563]">Socket</span>
+          <span>{status ? statusLabel(status) : "Loading"}</span>
+        </div>
+      </div>
 
-      <div className="mt-2 flex justify-end gap-2">
+      <div className="mt-3 rounded-lg border border-[#D1D5DB] p-4">
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-sm font-semibold">Clipboard Sync</span>
+          {syncPreferencesBusy ? (
+            <span className="text-xs text-[#4B5563]">Updating…</span>
+          ) : null}
+        </div>
+        <div className="mt-3 grid grid-cols-2 gap-2" role="radiogroup" aria-label="Clipboard Sync">
+          {syncModes.map(({ mode, label }) => (
+            <Button
+              key={mode}
+              variant={selectedSyncMode === mode ? "primary" : "outlined"}
+              className="!rounded-lg px-2 text-xs"
+              onClick={() => void updateClipboardSync(mode)}
+              disabled={syncPreferencesBusy || !status}
+              aria-checked={selectedSyncMode === mode}
+              role="radio"
+            >
+              {label}
+            </Button>
+          ))}
+        </div>
+      </div>
+
+      {status?.onboarding?.bootstrapEligible === true ? (
         <Button
           variant="outlined"
-          className="flex items-center gap-2"
-          onClick={pasteClipboard}
+          className="mt-3 w-full"
+          onClick={trustThisDevice}
+          disabled={trusting}
         >
-          <PasteIcon />
-          Paste
+          {trusting ? "Trusting device…" : "Trust this device (first setup)"}
         </Button>
-        <Button
-          variant="primary"
-          className="flex items-center gap-2"
-          onClick={writeClipboardText}
-        >
-          <CopyIcon />
-          Copy
+      ) : null}
+
+      {status?.onboarding?.state === "pairing-required" ? (
+        <div className="mt-3 rounded-lg border border-[#D1D5DB] p-3 text-xs">
+          <p className="font-semibold">Pair this device with an existing Copyyt device.</p>
+          <p className="mt-2 text-[#4B5563]">
+            {status.onboarding.error?.message ??
+              (status.device.trustState === "verified"
+                ? "New device approval is waiting on your account root device."
+                : "Confirm the account root fingerprint on this device to continue.")}
+          </p>
+          <Button variant="outlined" className="mt-3 w-full" onClick={refreshOnboarding} disabled={pairingBusy}>
+            {pairingBusy ? "Refreshing…" : "Refresh pairing"}
+          </Button>
+        </div>
+      ) : null}
+
+      {pairing ? (
+        <div className="mt-3 rounded-lg border border-[#D1D5DB] p-3 text-xs">
+          <p className="font-semibold">
+            {pairing.role === "approver" ? "Approve a pending device" : "Confirm this device pairing"}
+          </p>
+          <p className="mt-2 text-[#4B5563]">
+            {pairing.pendingDeviceName ?? "Pending device"}
+            {pairing.pendingPlatform ? ` · ${pairing.pendingPlatform}` : ""}
+          </p>
+          <p className="mt-1 break-all font-mono text-[11px] text-[#4B5563]">
+            Device ID: {pairing.pendingDeviceId}
+          </p>
+          <p className="mt-2 break-all font-mono text-sm tracking-wide">{pairing.fingerprint}</p>
+          {status.onboarding.state === "waiting-for-approval" ? (
+            <p className="mt-2 text-[#4B5563]">Waiting for approval on the other device.</p>
+          ) : (
+            <>
+              <input
+                className="mt-3 w-full rounded border border-[#D1D5DB] px-2 py-2 font-mono text-xs uppercase"
+                value={confirmedFingerprint}
+                onChange={(event) => setConfirmedFingerprint(event.target.value)}
+                placeholder="XXXX-XXXX-…"
+                aria-label="Confirmed pairing fingerprint"
+              />
+              <Button variant="outlined" className="mt-3 w-full" onClick={completePairing} disabled={pairingBusy}>
+                {pairingBusy ? "Working…" : pairing.role === "approver" ? "Approve device" : "Confirm and pair"}
+              </Button>
+            </>
+          )}
+          <Button variant="outlined" className="mt-2 w-full" onClick={refreshOnboarding} disabled={pairingBusy}>
+            Refresh pairing
+          </Button>
+        </div>
+      ) : null}
+
+      {!pairing && status?.signedIn ? (
+        <Button variant="outlined" className="mt-3 w-full" onClick={refreshOnboarding} disabled={pairingBusy}>
+          {pairingBusy ? "Refreshing…" : "Refresh onboarding"}
         </Button>
-      </div>
+      ) : null}
+
+      <Button
+        variant="primary"
+        className="mt-3 w-full"
+        onClick={sendCurrentClipboard}
+        disabled={
+          sending ||
+          !status?.signedIn ||
+          !localDeviceTrusted ||
+          !syncPreferences.sendEnabled
+        }
+      >
+        {sending ? "Encrypting and sending…" : "Send current clipboard"}
+      </Button>
+
+      {status?.lastSyncError ? (
+        <p className="mt-3 text-xs text-[#FF2635]">{status.lastSyncError.message}</p>
+      ) : null}
+      {message ? <p className="mt-3 break-all text-xs text-[#4B5563]">{message}</p> : null}
     </section>
   );
-};
+}
 
 const HomeWithAuth = withAuth(Home);
 

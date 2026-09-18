@@ -24,6 +24,7 @@ dist-ssr
 *.sw?
 build
 build-extension
+build-extension-store
 .env
 
 .yarn/*

@@ -5,6 +5,12 @@ import {
   IVerifyEmail,
   ILoginResponse,
 } from "../interfaces/auth.interface";
+import type {
+  DeviceRegistrationRequest,
+  ApproveDeviceRequest,
+  RegisteredDeviceResponse,
+  RegisteredDeviceListResponse,
+} from "../crypto/device-registration";
 
 export const getApis = (axiosInstance: AxiosInstance) => ({
   auth: {
@@ -18,18 +24,33 @@ export const getApis = (axiosInstance: AxiosInstance) => ({
       ),
     verifyEmail: async (data: IVerifyEmail) =>
       axiosInstance.post<SignInResponse>("/auth/verify-email", data),
-    refreshTokens: async () =>
-      axiosInstance.post<SignInResponse>("/auth/refresh-tokens", null, {
-        withCredentials: true,
-      }),
-    logout: async () =>
-      axiosInstance.post("/auth/logout", null, {
-        withCredentials: true,
-      }),
+    refreshTokens: async (refreshToken?: string) =>
+      axiosInstance.post<SignInResponse>(
+        "/auth/refresh-tokens",
+        refreshToken === undefined ? null : { refreshToken },
+        {
+          withCredentials: true,
+        },
+      ),
+    logout: async (refreshToken?: string) =>
+      axiosInstance.post(
+        "/auth/logout",
+        refreshToken === undefined ? null : { refreshToken },
+        {
+          withCredentials: true,
+        },
+      ),
     resendEmailOtp: async (email: string) =>
       axiosInstance.post("/auth/resend-email-otp", { email }),
   },
-  user: {
-    lastMessage: async () => axiosInstance.get("/user/last-message"),
+  devices: {
+    registerDevice: async (data: DeviceRegistrationRequest) =>
+      axiosInstance.post<RegisteredDeviceResponse>("/devices", data),
+    listDevices: async () =>
+      axiosInstance.get<RegisteredDeviceListResponse>("/devices"),
+    listPendingDevices: async () =>
+      axiosInstance.get<RegisteredDeviceListResponse>("/devices/pending"),
+    approveDevice: async (data: ApproveDeviceRequest) =>
+      axiosInstance.post<RegisteredDeviceResponse>("/devices/approve", data),
   },
 });

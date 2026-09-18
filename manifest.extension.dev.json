@@ -1,8 +1,13 @@
 {
     "name": "Copyyt",
-    "description": "App for copying stuff",
-    "version": "1.2",
+    "description": "Securely sync copied text across your trusted devices with end-to-end encryption.",
+    "version": "2.0.0",
     "manifest_version": 3,
+    "minimum_chrome_version": "137",
+    "background": {
+        "service_worker": "assets/service-worker.js",
+        "type": "module"
+    },
     "action": {
         "default_popup": "index.html",
         "default_icon": "copyyt.png"
@@ -24,6 +29,18 @@
     "permissions": [
         "identity",
         "clipboardRead",
-        "clipboardWrite"
+        "clipboardWrite",
+        "offscreen",
+        "storage",
+        "alarms"
+    ],
+    "host_permissions": [
+        "https://api.copyyt.psami.com/*",
+        "http://localhost:8000/*",
+        "http://localhost:8001/*",
+        "http://127.0.0.1:8000/*",
+        "http://127.0.0.1:8001/*",
+        "http://192.168.0.121:8000/*",
+        "http://192.168.0.121:8001/*"
     ]
 }

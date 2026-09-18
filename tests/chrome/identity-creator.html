@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8" />
+<script type="module">
+  const userId = new URLSearchParams(location.search).get("userId");
+  try {
+    const { getOrCreateDeviceIdentity } = await import("/src/crypto/key-store.ts");
+    const identity = await getOrCreateDeviceIdentity(userId);
+    parent.postMessage(
+      {
+        type: "identity-created",
+        userId,
+        deviceId: identity.deviceId,
+        signingPublicKey: identity.signingPublicKeyBase64,
+        encryptionPublicKey: identity.encryptionPublicKeyBase64,
+      },
+      location.origin,
+    );
+  } catch (error) {
+    parent.postMessage(
+      { type: "identity-created", error: String(error) },
+      location.origin,
+    );
+  }
+</script>

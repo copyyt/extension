@@ -1,7 +1,7 @@
 {
   "short_name": "Copyyt",
   "id": "copyyt_web_app",
-  "name": "Copyyt: App for copying stuff",
+  "name": "Copyyt Web",
   "icons": [
     {
       "src": "icon-16x16.png",

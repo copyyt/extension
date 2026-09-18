@@ -2,7 +2,9 @@ import { GOOGLE_CLIENT_ID_WEB } from "@/utils/constants";
 import { useEffect, useState } from "react";
 
 const useGoogleAuthWeb = () => {
-  const [client, setClient] = useState<any>(null);
+  const [client, setClient] = useState<google.accounts.oauth2.TokenClient | null>(
+    null,
+  );
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -31,7 +33,7 @@ const useGoogleAuthWeb = () => {
       }
 
       // override callback to resolve when token is received
-      client.callback = (tokenResponse: any) => {
+      client.callback = (tokenResponse: google.accounts.oauth2.TokenResponse) => {
         if (tokenResponse?.access_token) {
           resolve(tokenResponse.access_token);
         } else {
