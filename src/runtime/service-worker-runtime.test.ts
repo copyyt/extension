@@ -3983,16 +3983,29 @@ test("near-expiry recovery refreshes auth before automatic clipboard sync", asyn
   );
 });
 
-function automaticAuthRecoveryFixture(blockRefresh = false) {
+function automaticAuthRecoveryFixture(
+  blockRefresh = false,
+  blockWatcherRestart = false,
+) {
   const initialToken = "rejected-access-token";
   const freshToken = "recovered-access-token";
   const sockets: FakeSocket[] = [];
   const socketOptions: SocketOptions[] = [];
+  const watchCalls: Array<{ type: "start" | "stop"; resetBaseline?: boolean }> = [];
   const membershipAccessTokens: string[] = [];
   const membershipAccessTokensAfterRefresh: string[] = [];
   const encryptedTexts: string[] = [];
   let rejectNextMembership = false;
   let refreshCalls = 0;
+  let watchStartCount = 0;
+  let markWatcherRestartStarted!: () => void;
+  const watcherRestartStarted = new Promise<void>((resolve) => {
+    markWatcherRestartStarted = resolve;
+  });
+  let releaseWatcherRestart = (): void => undefined;
+  const watcherRestartGate = new Promise<void>((resolve) => {
+    releaseWatcherRestart = resolve;
+  });
   let markRefreshStarted!: () => void;
   const refreshStarted = new Promise<void>((resolve) => {
     markRefreshStarted = resolve;
@@ -4047,6 +4060,24 @@ function automaticAuthRecoveryFixture(blockRefresh = false) {
       sockets.push(socket);
       return socket;
     },
+    clipboardAdapter: {
+      readText: async () => "pre-recovery clipboard baseline",
+      writeText: async () => undefined,
+      startWatching: async (options) => {
+        watchStartCount += 1;
+        watchCalls.push({
+          type: "start",
+          resetBaseline: options?.resetBaseline,
+        });
+        if (blockWatcherRestart && watchStartCount === 2) {
+          markWatcherRestartStarted();
+          await watcherRestartGate;
+        }
+      },
+      stopWatching: async () => {
+        watchCalls.push({ type: "stop" });
+      },
+    },
     encrypt: async (input) => {
       encryptedTexts.push(input.plaintext as string);
       return {
@@ -4068,11 +4099,14 @@ function automaticAuthRecoveryFixture(blockRefresh = false) {
     setup,
     sockets,
     socketOptions,
+    watchCalls,
     membershipAccessTokens,
     membershipAccessTokensAfterRefresh,
     encryptedTexts,
     refreshStarted,
     releaseRefresh,
+    watcherRestartStarted,
+    releaseWatcherRestart,
     getRefreshCalls: () => refreshCalls,
     rejectNextMembership: () => {
       rejectNextMembership = true;
@@ -4087,8 +4121,10 @@ async function startAutomaticAuthRecoveryFixture(
   await fixture.setup.runtime.start();
   fixture.sockets[0].trigger("auth:ready");
   await waitForRuntimeCondition(
-    () => fixture.setup.runtime.getStatus().syncReady,
-    "initial socket did not become sync-ready",
+    () =>
+      fixture.setup.runtime.getStatus().syncReady &&
+      fixture.setup.runtime.getStatus().clipboardWatch === "watching",
+    "initial socket and clipboard watcher did not become ready",
   );
   await flushRuntimeWork();
 }
@@ -4104,7 +4140,7 @@ async function readyReplacementSocket(
 }
 
 test("automatic publish recovers once from a membership HTTP 401", async () => {
-  const fixture = automaticAuthRecoveryFixture();
+  const fixture = automaticAuthRecoveryFixture(false, true);
   await startAutomaticAuthRecoveryFixture(fixture);
   const membershipCallsBeforeFailure = fixture.membershipAccessTokens.length;
   fixture.rejectNextMembership();
@@ -4113,7 +4149,16 @@ test("automatic publish recovers once from a membership HTTP 401", async () => {
     clipboardObservation("auth-recovered clipboard"),
   );
   await readyReplacementSocket(fixture);
+  await fixture.watcherRestartStarted;
   await observation;
+
+  assert.deepEqual(fixture.encryptedTexts, ["auth-recovered clipboard"]);
+  assert.equal(fixture.setup.runtime.getStatus().clipboardWatch, "starting");
+  fixture.releaseWatcherRestart();
+  await waitForRuntimeCondition(
+    () => fixture.setup.runtime.getStatus().clipboardWatch === "watching",
+    "replacement clipboard watcher did not become ready",
+  );
 
   assert.equal(fixture.getRefreshCalls(), 1);
   assert.deepEqual(await fixture.setup.sessionStore.get(), {
@@ -4122,8 +4167,14 @@ test("automatic publish recovers once from a membership HTTP 401", async () => {
     refreshToken: "rotated-refresh-token",
     user,
   });
-  assert.deepEqual(fixture.encryptedTexts, ["auth-recovered clipboard"]);
   assert.equal(fixture.setup.runtime.getStatus().syncReady, true);
+  assert.deepEqual(
+    fixture.watchCalls.filter((call) => call.type === "start"),
+    [
+      { type: "start", resetBaseline: true },
+      { type: "start", resetBaseline: true },
+    ],
+  );
   assert.deepEqual(fixture.socketOptions[1].auth, { token: fixture.freshToken });
   assert.ok(
     fixture.membershipAccessTokens.length > membershipCallsBeforeFailure,
@@ -4143,7 +4194,7 @@ test("automatic publish recovers once from a membership HTTP 401", async () => {
 });
 
 test("automatic auth recovery keeps only the latest rapid observation", async () => {
-  const fixture = automaticAuthRecoveryFixture(true);
+  const fixture = automaticAuthRecoveryFixture(true, true);
   await startAutomaticAuthRecoveryFixture(fixture);
   fixture.rejectNextMembership();
 
@@ -4158,9 +4209,16 @@ test("automatic auth recovery keeps only the latest rapid observation", async ()
 
   fixture.releaseRefresh();
   await readyReplacementSocket(fixture);
+  await fixture.watcherRestartStarted;
   await Promise.all([first, second]);
 
   assert.deepEqual(fixture.encryptedTexts, ["B"]);
+  fixture.releaseWatcherRestart();
+  await waitForRuntimeCondition(
+    () => fixture.setup.runtime.getStatus().clipboardWatch === "watching",
+    "replacement clipboard watcher did not become ready",
+  );
+
   assert.equal(
     fixture.sockets[1].emissions.filter(
       (emission) => emission.event === "clipboard:publish",
@@ -4228,14 +4286,17 @@ test("automatic publish does not refresh for non-auth HTTP 403", async () => {
 });
 
 test("Send Off during automatic auth recovery prevents publish and replay after re-enable", async () => {
-  const fixture = automaticAuthRecoveryFixture(true);
+  const fixture = automaticAuthRecoveryFixture(true, true);
   await startAutomaticAuthRecoveryFixture(fixture);
   fixture.rejectNextMembership();
 
   const observation = fixture.setup.runtime.handleClipboardObservation(
-    clipboardObservation("must-not-publish"),
+    clipboardObservation("A"),
   );
   await fixture.refreshStarted;
+  const latestObservation = fixture.setup.runtime.handleClipboardObservation(
+    clipboardObservation("B"),
+  );
   const disabled = await fixture.setup.runtime.handleMessage(
     runtimeMessage({
       type: "runtime:set-sync-preferences",
@@ -4247,7 +4308,8 @@ test("Send Off during automatic auth recovery prevents publish and replay after 
 
   fixture.releaseRefresh();
   await readyReplacementSocket(fixture);
-  await observation;
+  await Promise.all([observation, latestObservation]);
+  fixture.releaseWatcherRestart();
 
   assert.deepEqual(fixture.encryptedTexts, []);
   assert.equal(
@@ -4263,5 +4325,16 @@ test("Send Off during automatic auth recovery prevents publish and replay after 
     }),
   );
   assert.equal(reenabled.ok, true);
+  await waitForRuntimeCondition(
+    () => fixture.setup.runtime.getStatus().clipboardWatch === "watching",
+    "clipboard watcher did not restart after re-enable",
+  );
   assert.deepEqual(fixture.encryptedTexts, []);
+  assert.deepEqual(
+    fixture.watchCalls.filter((call) => call.type === "start"),
+    [
+      { type: "start", resetBaseline: true },
+      { type: "start", resetBaseline: true },
+    ],
+  );
 });

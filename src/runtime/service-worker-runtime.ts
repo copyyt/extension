@@ -1243,7 +1243,11 @@ export class CopyytServiceWorkerRuntime {
     const sendPolicyRevision = this.sendPolicyRevision;
     let authRecoveryAttempted = false;
     while (true) {
-      if (!this.isAutomaticSyncEligible()) return;
+      // The one bounded retry retained across an authoritative 401 belongs
+      // to the observation that was already captured before recovery. The
+      // watcher is restarted with a fresh baseline for future changes, but an
+      // in-flight restart must not invalidate this transport-ready retry.
+      if (!this.isAutomaticSyncEligible(!authRecoveryAttempted)) return;
       try {
         this.requireSendPolicy(sendPolicyRevision);
         await this.publishClipboardText(current.text);
