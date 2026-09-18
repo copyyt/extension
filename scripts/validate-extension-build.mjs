@@ -1,11 +1,26 @@
-import { readFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { parse } from "acorn";
 
-const outputDirectory = path.resolve("build-extension");
+const extensionEnvironment = process.env.VITE_EXTENSION_ENV === "store" ? "store" : "dev";
+const outputDirectory = path.resolve(
+  process.env.VITE_EXTENSION_OUTPUT ||
+    (extensionEnvironment === "store" ? "build-extension-store" : "build-extension"),
+);
+const sourceDirectories = [path.resolve("src"), path.resolve("public")];
 const manifestPath = path.join(outputDirectory, "manifest.json");
 const popupPath = path.join(outputDirectory, "index.html");
 const workerPath = path.join(outputDirectory, "assets/service-worker.js");
+const expectedStoreHostPermissions = ["https://api.copyyt.psami.com/*"];
+const expectedStoreEndpoint = "https://api.copyyt.psami.com";
+const expectedStorePermissions = [
+  "identity",
+  "clipboardRead",
+  "clipboardWrite",
+  "offscreen",
+  "storage",
+  "alarms",
+];
 
 async function assertFileExists(filePath, description) {
   let fileStats;
@@ -89,9 +104,103 @@ function findModuleDependencies(source) {
   return dependencies;
 }
 
+async function collectFiles(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const filePath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await collectFiles(filePath)));
+    } else if (entry.isFile()) {
+      files.push(filePath);
+    }
+  }
+  return files;
+}
+
+function isPrivateHostPermission(permission) {
+  const normalized = permission.toLowerCase();
+  return (
+    normalized.includes("localhost") ||
+    /https?:\/\/(?:127\.|0\.0\.0\.0|10\.|169\.254\.|192\.168\.)/u.test(normalized) ||
+    /https?:\/\/172\.(?:1[6-9]|2\d|3[01])\./u.test(normalized)
+  );
+}
+
+function assertSameList(actual, expected, label) {
+  if (
+    actual.length !== expected.length ||
+    actual.some((value, index) => value !== expected[index])
+  ) {
+    throw new Error(
+      `${label} must be exactly ${JSON.stringify(expected)}; got ${JSON.stringify(actual)}`,
+    );
+  }
+}
+
+function assertNoRemoteExecutableCode(filePath, source) {
+  const checks = [
+    { pattern: /\beval\s*\(/u, description: "eval()" },
+    { pattern: /\bnew\s+Function\s*\(/u, description: "new Function()" },
+    { pattern: /(?<!new\s)\bFunction\s*\(/u, description: "Function()" },
+    {
+      pattern: /<script\b[^>]*\bsrc\s*=\s*["']https?:\/\//iu,
+      description: "a remotely loaded script tag",
+    },
+    {
+      pattern: /\b(?:src|href)\s*=\s*["']https?:\/\/[^"']+\.js(?:[?#][^"']*)?["']/iu,
+      description: "a remote JavaScript resource",
+    },
+    {
+      pattern: /\bimport\s*\(\s*["']https?:\/\//iu,
+      description: "a remotely loaded dynamic import",
+    },
+  ];
+  for (const { pattern, description } of checks) {
+    if (pattern.test(source)) {
+      throw new Error(`${description} found in ${path.relative(process.cwd(), filePath)}`);
+    }
+  }
+}
+
+async function auditRemoteCode(files, label) {
+  for (const filePath of files) {
+    const source = await readFile(filePath, "utf8");
+    assertNoRemoteExecutableCode(filePath, source);
+  }
+  console.log(`Audited ${files.length} ${label} files for MV3 remote-code violations`);
+}
+
 const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
 if (manifest.background?.service_worker !== "assets/service-worker.js") {
   throw new Error('manifest background.service_worker must be "assets/service-worker.js"');
+}
+
+if (extensionEnvironment === "store") {
+  if (manifest.manifest_version !== 3) {
+    throw new Error("The Store manifest must use manifest_version 3");
+  }
+  if (manifest.version !== "2.0.0") {
+    throw new Error(`The Store manifest must be version 2.0.0; got ${manifest.version}`);
+  }
+  if (
+    process.env.VITE_API_URL !== expectedStoreEndpoint ||
+    process.env.VITE_SOCKET_URL !== expectedStoreEndpoint
+  ) {
+    throw new Error(
+      `Store builds must use ${expectedStoreEndpoint} for both VITE_API_URL and VITE_SOCKET_URL`,
+    );
+  }
+  assertSameList(manifest.permissions ?? [], expectedStorePermissions, "Store permissions");
+  assertSameList(
+    manifest.host_permissions ?? [],
+    expectedStoreHostPermissions,
+    "Store host permissions",
+  );
+  const privateHostPermission = (manifest.host_permissions ?? []).find(isPrivateHostPermission);
+  if (privateHostPermission) {
+    throw new Error(`Store manifest contains a localhost/private-LAN host permission: ${privateHostPermission}`);
+  }
 }
 
 await assertFileExists(workerPath, "service-worker.js");
@@ -105,7 +214,7 @@ for (const reference of collectManifestFileReferences(manifest)) {
 
 const popupSource = await readFile(popupPath, "utf8");
 if (/\brel\s*=\s*["']modulepreload["']/iu.test(popupSource)) {
-  throw new Error("build-extension/index.html must not contain rel=\"modulepreload\"");
+  throw new Error(`${path.basename(outputDirectory)}/index.html must not contain rel="modulepreload"`);
 }
 
 const workerSource = await readFile(workerPath, "utf8");
@@ -116,6 +225,25 @@ if (dependencies.length > 0) {
     .join(", ");
   throw new Error(`service-worker.js must be self-contained; found ${details}`);
 }
+
+const sourceFiles = (
+  await Promise.all(sourceDirectories.map((directory) => collectFiles(directory)))
+).flat();
+const artifactFiles = await collectFiles(outputDirectory);
+for (const filePath of artifactFiles.filter((candidate) => /\.html$/iu.test(candidate))) {
+  const source = await readFile(filePath, "utf8");
+  if (/\brel\s*=\s*["']modulepreload["']/iu.test(source)) {
+    throw new Error(`${path.relative(process.cwd(), filePath)} must not contain rel="modulepreload"`);
+  }
+}
+const auditableSourceFiles = sourceFiles.filter((filePath) =>
+  /\.(?:html|js|mjs|ts|tsx)$/iu.test(filePath),
+);
+const auditableArtifactFiles = artifactFiles.filter((filePath) =>
+  /\.(?:html|js|mjs|ts|tsx)$/iu.test(filePath),
+);
+await auditRemoteCode(auditableSourceFiles, "source");
+await auditRemoteCode(auditableArtifactFiles, "artifact");
 
 console.log(
   `Validated extension build: ${path.relative(process.cwd(), workerPath)} (${workerSource.length} bytes, no module dependencies)`,

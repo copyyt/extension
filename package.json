@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build && node scripts/build-extension-worker.mjs",
-    "build:extension": "VITE_APP_TYPE=extension yarn build",
+    "build:extension": "VITE_APP_TYPE=extension VITE_EXTENSION_ENV=dev yarn build",
+    "build:store": "VITE_APP_TYPE=extension VITE_EXTENSION_ENV=store VITE_EXTENSION_OUTPUT=build-extension-store VITE_API_URL=https://api.copyyt.psami.com VITE_SOCKET_URL=https://api.copyyt.psami.com yarn build",
     "lint": "eslint .",
     "test:crypto": "node --experimental-strip-types --test \"src/crypto/*.test.ts\"",
     "test:runtime": "node --experimental-strip-types --test \"src/runtime/*.test.ts\"",

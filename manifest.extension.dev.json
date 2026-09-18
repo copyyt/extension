@@ -1,7 +1,7 @@
 {
     "name": "Copyyt",
-    "description": "App for copying stuff",
-    "version": "1.2",
+    "description": "Securely sync copied text across your trusted devices with end-to-end encryption.",
+    "version": "2.0.0",
     "manifest_version": 3,
     "minimum_chrome_version": "137",
     "background": {

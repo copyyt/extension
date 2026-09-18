@@ -23,8 +23,9 @@ The offscreen document is only a `CLIPBOARD`-reason adapter for
 or return clipboard text through runtime messages.
 
 The extension build emits `assets/service-worker.js` and
-`assets/offscreen.js`; `manifest.extension.json` registers the former as a
-module service worker. Runtime session/status records live in
+`assets/offscreen.js`; the explicit `manifest.extension.dev.json` and
+`manifest.extension.store.json` variants register the former as a module
+service worker. Runtime session/status records live in
 `chrome.storage.local`. Processed and outbound item metadata live in the
 `copyyt-runtime-v1` IndexedDB database and contain no plaintext. Processed
 items are retained for at most 24 hours and 500 records.
@@ -46,19 +47,27 @@ fingerprint. Server trust labels alone never complete pairing. Access-token
 renewal is owned by the service worker and uses a single-flight refresh before
 recreating an authenticated socket when needed.
 
-Phase 2A uses manual **Send current clipboard** and does not install clipboard
-polling, `clipboardchange` listeners, WebRTC, or automatic clipboard
-detection.
+Clipboard Sync supports automatic text detection when sending is enabled, as
+well as manual **Send current clipboard**. It does not synchronize images or
+files and does not provide clipboard history.
 
 ## Development
 
 ```bash
 yarn build
+yarn build:extension
+yarn build:store
 yarn lint
 yarn test:crypto
 yarn test:runtime
 yarn test:chrome
 ```
+
+`yarn build:extension` keeps the development host permissions and writes to
+`build-extension/`. `yarn build:store` uses only the production API host,
+validates the Store manifest as version 2.0.0, audits the source and artifact
+for MV3 remote-code violations, and writes the uploadable directory to
+`build-extension-store/`.
 
 `yarn test:chrome` first runs the existing local Vite harness for cross-realm
 identity creation and real IndexedDB `CryptoKey` persistence, then builds the

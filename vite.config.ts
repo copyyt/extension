@@ -9,6 +9,25 @@ const target = env.VITE_APP_TYPE || "extension";
 const isPWA = target === "web";
 const isExtensionWorkerBuild = env.VITE_EXTENSION_BUILD === "worker";
 const isExtension = target === "extension";
+const extensionEnvironment = env.VITE_EXTENSION_ENV === "store" ? "store" : "dev";
+const extensionOutputDirectory =
+  env.VITE_EXTENSION_OUTPUT ||
+  (extensionEnvironment === "store" ? "build-extension-store" : "build-extension");
+const manifestSource = isExtension
+  ? `manifest.extension.${extensionEnvironment}.json`
+  : `manifest.${target}.json`;
+
+const mv3GlobalObjectPlugin = {
+  name: "copyyt-mv3-global-object",
+  apply: "build" as const,
+  renderChunk(code: string) {
+    const hardenedCode = code.replace(
+      /Function\(\s*["']return this["']\s*\)\(\s*\)/gu,
+      "globalThis",
+    );
+    return hardenedCode === code ? null : { code: hardenedCode, map: null };
+  },
+};
 
 const extensionInputs = isExtensionWorkerBuild
   ? "./src/service-worker.ts"
@@ -22,10 +41,11 @@ export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
+    ...(isExtension ? [mv3GlobalObjectPlugin] : []),
     viteStaticCopy({
       targets: [
         {
-          src: `manifest.${target}.json`,
+          src: manifestSource,
           dest: ".",
           rename: "manifest.json",
         },
@@ -47,7 +67,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: target === "extension" ? "build-extension" : "build",
+    outDir: target === "extension" ? extensionOutputDirectory : "build",
     emptyOutDir: !isExtensionWorkerBuild,
     ...(isExtension ? { modulePreload: false } : {}),
     rollupOptions: {

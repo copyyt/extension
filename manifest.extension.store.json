@@ -1,0 +1,40 @@
+{
+    "name": "Copyyt",
+    "description": "Securely sync copied text across your trusted devices with end-to-end encryption.",
+    "version": "2.0.0",
+    "manifest_version": 3,
+    "minimum_chrome_version": "137",
+    "background": {
+        "service_worker": "assets/service-worker.js",
+        "type": "module"
+    },
+    "action": {
+        "default_popup": "index.html",
+        "default_icon": "copyyt.png"
+    },
+    "icons": {
+        "16": "icon-16x16.png",
+        "48": "icon-48x48.png",
+        "128": "icon-128x128.png"
+    },
+    "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAySfZEmOHzNDW7Lo/jMhPAFvKAcoJjY9PsxQYjtdIxzPiAz/gtWtaG3wNgnlRUYFvijWkGMdoOHRn7vMGesh0BmhQhUoCCFFLu95oyJkCgGsTf7GoGvkvuun5TncuMVUe4ku4EKiK4L+1UsiGw6cyV1dSL30hoXTjKFg26BMjIlgYUaZLn6rriYmKLIYsHzDFJS8H7lUy2gxWOXgL+BWmU/XuX8aJCOtV2PAzDQ68q3m460cp6v4IHGIa9lp4INWL1fnVlQJ5exnhLCq+TDR8VrBPoUP01iM0PnrMhhHRhZBOoOMO9CKrtP5S0HIDpbAsyVkBL4F791eDS14svHG5pwIDAQAB",
+    "oauth2": {
+        "client_id": "367598261435-81eadc06f97is9l3aogrncpa1183ke9f.apps.googleusercontent.com",
+        "scopes": [
+            "openid",
+            "email",
+            "profile"
+        ]
+    },
+    "permissions": [
+        "identity",
+        "clipboardRead",
+        "clipboardWrite",
+        "offscreen",
+        "storage",
+        "alarms"
+    ],
+    "host_permissions": [
+        "https://api.copyyt.psami.com/*"
+    ]
+}
