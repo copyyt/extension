@@ -282,6 +282,7 @@ function makeRuntime(overrides: Partial<{
   socket: FakeSocket;
   localTrustState: LocalDeviceRecord["trustState"];
   accessToken: string;
+  apiFactory: (accessToken: string, api: RuntimeApi) => RuntimeApi;
   refreshTokens: (refreshToken?: string) => Promise<AxiosResponse<SignInResponse>>;
   googleSign: () => Promise<AxiosResponse<SignInResponse>>;
   verifyEmail: () => Promise<AxiosResponse<SignInResponse>>;
@@ -370,7 +371,9 @@ function makeRuntime(overrides: Partial<{
     processedItemStore,
     outboundItemStore,
     syncPreferencesStore,
-    apiFactory: () => api,
+    apiFactory: overrides.apiFactory
+      ? (accessToken) => overrides.apiFactory!(accessToken, api)
+      : () => api,
     socketFactory: overrides.socketFactory ?? ((url: string, options: SocketOptions) => {
       void url;
       socketOptions = options;
@@ -3697,23 +3700,61 @@ test("a concurrent forced token refresh is escalated into one follow-up", async 
   await Promise.all([first, second]);
 
   assert.equal(refreshCalls, 1);
-  assert.equal(sockets.length, 2);
+  assert.equal(sockets.length, 3);
   assert.equal(sockets[0].events.size, 0);
-  assert.equal(sockets[1].events.size, 7);
+  assert.equal(sockets[1].events.size, 0);
+  assert.equal(sockets[2].events.size, 7);
 
-  sockets[1].trigger("auth:challenge", {
+  sockets[2].trigger("auth:challenge", {
     socketId: "refreshed-socket",
     challenge: "refreshed-challenge",
   });
   await new Promise((resolve) => setImmediate(resolve));
-  sockets[1].trigger("auth:ready");
+  sockets[2].trigger("auth:ready");
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(signatures, 1);
   assert.equal(
-    sockets[1].emissions.some((emission) => emission.event === "auth:device"),
+    sockets[2].emissions.some((emission) => emission.event === "auth:device"),
     true,
   );
+});
+
+test("a connected but not-ready socket is replaced exactly once", async () => {
+  const sockets: FakeSocket[] = [];
+  const setup = makeRuntime({
+    localTrustState: "verified",
+    socketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+  });
+
+  await setup.runtime.start();
+  assert.equal(sockets.length, 1);
+  assert.equal(sockets[0].connected, true);
+  assert.equal(setup.runtime.getStatus().socket.deviceAuthenticated, false);
+
+  await setup.runtime.reconcileConnectivity("connected-not-ready");
+
+  assert.equal(sockets.length, 2);
+  assert.equal(sockets[0].connected, false);
+  assert.equal(sockets[0].events.size, 0);
+  assert.equal(sockets[1].connected, true);
+  assert.equal(sockets[1].events.size, 7);
+
+  sockets[1].trigger("auth:challenge", {
+    socketId: "replacement-socket",
+    challenge: "replacement-challenge",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1].trigger("auth:ready");
+  await new Promise((resolve) => setImmediate(resolve));
+  await setup.runtime.reconcileConnectivity("healthy-after-replacement");
+
+  assert.equal(sockets.length, 2);
+  assert.equal(setup.runtime.getStatus().syncReady, true);
 });
 
 test("an on-time recovery probe performs no control-plane or watcher work when healthy", async () => {
@@ -3791,4 +3832,142 @@ test("an on-time recovery probe performs no control-plane or watcher work when h
   assert.equal(after.socket.deviceAuthenticated, true);
   assert.equal(after.syncReady, true);
   assert.equal(after.connectionState, before.connectionState);
+});
+
+test("near-expiry recovery refreshes auth before automatic clipboard sync", async () => {
+  let currentTime = new Date("2026-09-18T17:00:00.000Z");
+  const initialExpiry = Math.floor(currentTime.getTime() / 1000) + 300;
+  const initialToken = jwtWithExpiry(initialExpiry);
+  const freshToken = jwtWithExpiry(initialExpiry + 3600);
+  const sockets: FakeSocket[] = [];
+  const membershipAccessTokens: string[] = [];
+  const encryptedTexts: string[] = [];
+  const watchCalls: Array<{ type: "start" | "stop"; resetBaseline?: boolean }> = [];
+  let refreshCalls = 0;
+  const setup = makeRuntime({
+    initialSession: {
+      schemaVersion: 2,
+      accessToken: initialToken,
+      refreshToken: "old-refresh-token",
+      user,
+    },
+    localTrustState: "verified",
+    now: () => currentTime,
+    refreshTokens: async (refreshToken) => {
+      refreshCalls += 1;
+      assert.equal(refreshToken, "old-refresh-token");
+      return response(refreshedSession(freshToken, "rotated-refresh-token"));
+    },
+    apiFactory: (accessToken, api) => ({
+      ...api,
+      devices: {
+        ...api.devices,
+        listDevices: async () => {
+          membershipAccessTokens.push(accessToken);
+          return api.devices.listDevices();
+        },
+        listPendingDevices: async () => {
+          membershipAccessTokens.push(accessToken);
+          return api.devices.listPendingDevices();
+        },
+      },
+    }),
+    socketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+      startWatching: async (options) => {
+        watchCalls.push({ type: "start", resetBaseline: options?.resetBaseline });
+      },
+      stopWatching: async () => {
+        watchCalls.push({ type: "stop" });
+      },
+    },
+    encrypt: async (input) => {
+      encryptedTexts.push(input.plaintext as string);
+      return {
+        itemId: `automatic-${encryptedTexts.length}`,
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+
+  await setup.runtime.start();
+  sockets[0].trigger("auth:challenge", {
+    socketId: "initial-socket",
+    challenge: "initial-challenge",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[0].trigger("auth:ready");
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    if (setup.runtime.getStatus().clipboardWatch === "watching") break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  const membershipCallsBeforeRecovery = membershipAccessTokens.length;
+  currentTime = new Date(initialExpiry * 1000 - 30_000);
+
+  await setup.runtime.reconcileConnectivity("recovery-alarm");
+
+  assert.equal(refreshCalls, 1);
+  assert.equal(sockets.length, 2);
+  assert.deepEqual(await setup.sessionStore.get(), {
+    schemaVersion: 2,
+    accessToken: freshToken,
+    refreshToken: "rotated-refresh-token",
+    user,
+  });
+  assert.deepEqual(encryptedTexts, []);
+
+  sockets[1].trigger("auth:challenge", {
+    socketId: "refreshed-socket",
+    challenge: "refreshed-challenge",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1].trigger("auth:ready");
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    if (setup.runtime.getStatus().clipboardWatch === "watching") break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.equal(setup.runtime.getStatus().syncReady, true);
+  assert.deepEqual(watchCalls.filter((call) => call.type === "start"), [
+    { type: "start", resetBaseline: true },
+    { type: "start", resetBaseline: true },
+  ]);
+  assert.ok(
+    membershipAccessTokens
+      .slice(membershipCallsBeforeRecovery)
+      .every((accessToken) => accessToken === freshToken),
+  );
+
+  await setup.runtime.handleClipboardObservation(
+    clipboardObservation("copied after recovery"),
+  );
+
+  assert.deepEqual(encryptedTexts, ["copied after recovery"]);
+  assert.ok(
+    membershipAccessTokens.slice(membershipCallsBeforeRecovery).length > 0,
+  );
+  assert.ok(
+    membershipAccessTokens
+      .slice(membershipCallsBeforeRecovery)
+      .every((accessToken) => accessToken === freshToken),
+  );
+  assert.equal(
+    sockets[1].emissions.some((emission) => emission.event === "clipboard:publish"),
+    true,
+  );
 });

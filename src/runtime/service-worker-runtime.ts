@@ -842,9 +842,14 @@ export class CopyytServiceWorkerRuntime {
   ): Promise<void> {
     if (!this.session) return;
 
+    const currentSession = this.requireSession();
+    const accessTokenNeedsRefresh =
+      options.forceTokenRefresh ||
+      tokenNeedsRefresh(currentSession.accessToken, this.now());
+
     if (
       !options.forceSocketRecycle &&
-      !options.forceTokenRefresh &&
+      !accessTokenNeedsRefresh &&
       this.isSocketTransportReady()
     ) {
       // The periodic alarm is a cheap health probe when the live transport is
@@ -866,12 +871,8 @@ export class CopyytServiceWorkerRuntime {
     }
 
     try {
-      let session = this.requireSession();
-      if (
-        options.forceTokenRefresh ||
-        tokenNeedsRefresh(session.accessToken, this.now())
-      ) {
-        session = await this.refreshAccessToken();
+      if (accessTokenNeedsRefresh) {
+        await this.refreshAccessToken();
         if (this.activeConnectivitySatisfaction) {
           this.activeConnectivitySatisfaction.forceTokenRefresh = true;
         }
@@ -2873,10 +2874,10 @@ export class CopyytServiceWorkerRuntime {
     }
     if (this.socket && this.socketAccountId === session.user.id) {
       if (this.isSocketTransportReady()) return;
-      if (this.socket.connected && this.socketReady) {
-        // A transport that is connected without Copyyt device authentication
-        // is not reusable as a ready transport. Recycle it through the same
-        // listener-safe path as a sleep/wake recovery.
+      if (this.socket.connected) {
+        // A connected transport that is not fully Copyyt-ready is not
+        // reusable. Recycle it through the listener-safe path and continue
+        // into the fresh-socket branch below.
         this.destroySocket(this.socket);
       }
     }
