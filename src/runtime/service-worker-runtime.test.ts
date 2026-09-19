@@ -282,6 +282,7 @@ function makeRuntime(overrides: Partial<{
   socket: FakeSocket;
   localTrustState: LocalDeviceRecord["trustState"];
   accessToken: string;
+  apiFactory: (accessToken: string, api: RuntimeApi) => RuntimeApi;
   refreshTokens: (refreshToken?: string) => Promise<AxiosResponse<SignInResponse>>;
   googleSign: () => Promise<AxiosResponse<SignInResponse>>;
   verifyEmail: () => Promise<AxiosResponse<SignInResponse>>;
@@ -370,7 +371,9 @@ function makeRuntime(overrides: Partial<{
     processedItemStore,
     outboundItemStore,
     syncPreferencesStore,
-    apiFactory: () => api,
+    apiFactory: overrides.apiFactory
+      ? (accessToken) => overrides.apiFactory!(accessToken, api)
+      : () => api,
     socketFactory: overrides.socketFactory ?? ((url: string, options: SocketOptions) => {
       void url;
       socketOptions = options;
@@ -599,6 +602,17 @@ function inboundEnvelope(
 
 const flushRuntimeWork = (): Promise<void> =>
   new Promise((resolve) => setImmediate(resolve));
+
+async function waitForRuntimeCondition(
+  condition: () => boolean,
+  message: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (condition()) return;
+    await flushRuntimeWork();
+  }
+  throw new Error(message);
+}
 
 test("sync preferences default to Both and survive worker recreation", async () => {
   const syncPreferencesStore = new InMemorySyncPreferencesStore();
@@ -3697,23 +3711,61 @@ test("a concurrent forced token refresh is escalated into one follow-up", async 
   await Promise.all([first, second]);
 
   assert.equal(refreshCalls, 1);
-  assert.equal(sockets.length, 2);
+  assert.equal(sockets.length, 3);
   assert.equal(sockets[0].events.size, 0);
-  assert.equal(sockets[1].events.size, 7);
+  assert.equal(sockets[1].events.size, 0);
+  assert.equal(sockets[2].events.size, 7);
 
-  sockets[1].trigger("auth:challenge", {
+  sockets[2].trigger("auth:challenge", {
     socketId: "refreshed-socket",
     challenge: "refreshed-challenge",
   });
   await new Promise((resolve) => setImmediate(resolve));
-  sockets[1].trigger("auth:ready");
+  sockets[2].trigger("auth:ready");
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(signatures, 1);
   assert.equal(
-    sockets[1].emissions.some((emission) => emission.event === "auth:device"),
+    sockets[2].emissions.some((emission) => emission.event === "auth:device"),
     true,
   );
+});
+
+test("a connected but not-ready socket is replaced exactly once", async () => {
+  const sockets: FakeSocket[] = [];
+  const setup = makeRuntime({
+    localTrustState: "verified",
+    socketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+  });
+
+  await setup.runtime.start();
+  assert.equal(sockets.length, 1);
+  assert.equal(sockets[0].connected, true);
+  assert.equal(setup.runtime.getStatus().socket.deviceAuthenticated, false);
+
+  await setup.runtime.reconcileConnectivity("connected-not-ready");
+
+  assert.equal(sockets.length, 2);
+  assert.equal(sockets[0].connected, false);
+  assert.equal(sockets[0].events.size, 0);
+  assert.equal(sockets[1].connected, true);
+  assert.equal(sockets[1].events.size, 7);
+
+  sockets[1].trigger("auth:challenge", {
+    socketId: "replacement-socket",
+    challenge: "replacement-challenge",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1].trigger("auth:ready");
+  await new Promise((resolve) => setImmediate(resolve));
+  await setup.runtime.reconcileConnectivity("healthy-after-replacement");
+
+  assert.equal(sockets.length, 2);
+  assert.equal(setup.runtime.getStatus().syncReady, true);
 });
 
 test("an on-time recovery probe performs no control-plane or watcher work when healthy", async () => {
@@ -3791,4 +3843,498 @@ test("an on-time recovery probe performs no control-plane or watcher work when h
   assert.equal(after.socket.deviceAuthenticated, true);
   assert.equal(after.syncReady, true);
   assert.equal(after.connectionState, before.connectionState);
+});
+
+test("near-expiry recovery refreshes auth before automatic clipboard sync", async () => {
+  let currentTime = new Date("2026-09-18T17:00:00.000Z");
+  const initialExpiry = Math.floor(currentTime.getTime() / 1000) + 300;
+  const initialToken = jwtWithExpiry(initialExpiry);
+  const freshToken = jwtWithExpiry(initialExpiry + 3600);
+  const sockets: FakeSocket[] = [];
+  const membershipAccessTokens: string[] = [];
+  const encryptedTexts: string[] = [];
+  const watchCalls: Array<{ type: "start" | "stop"; resetBaseline?: boolean }> = [];
+  let refreshCalls = 0;
+  const setup = makeRuntime({
+    initialSession: {
+      schemaVersion: 2,
+      accessToken: initialToken,
+      refreshToken: "old-refresh-token",
+      user,
+    },
+    localTrustState: "verified",
+    now: () => currentTime,
+    refreshTokens: async (refreshToken) => {
+      refreshCalls += 1;
+      assert.equal(refreshToken, "old-refresh-token");
+      return response(refreshedSession(freshToken, "rotated-refresh-token"));
+    },
+    apiFactory: (accessToken, api) => ({
+      ...api,
+      devices: {
+        ...api.devices,
+        listDevices: async () => {
+          membershipAccessTokens.push(accessToken);
+          return api.devices.listDevices();
+        },
+        listPendingDevices: async () => {
+          membershipAccessTokens.push(accessToken);
+          return api.devices.listPendingDevices();
+        },
+      },
+    }),
+    socketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+      startWatching: async (options) => {
+        watchCalls.push({ type: "start", resetBaseline: options?.resetBaseline });
+      },
+      stopWatching: async () => {
+        watchCalls.push({ type: "stop" });
+      },
+    },
+    encrypt: async (input) => {
+      encryptedTexts.push(input.plaintext as string);
+      return {
+        itemId: `automatic-${encryptedTexts.length}`,
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+
+  await setup.runtime.start();
+  sockets[0].trigger("auth:challenge", {
+    socketId: "initial-socket",
+    challenge: "initial-challenge",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[0].trigger("auth:ready");
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    if (setup.runtime.getStatus().clipboardWatch === "watching") break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  const membershipCallsBeforeRecovery = membershipAccessTokens.length;
+  currentTime = new Date(initialExpiry * 1000 - 30_000);
+
+  await setup.runtime.reconcileConnectivity("recovery-alarm");
+
+  assert.equal(refreshCalls, 1);
+  assert.equal(sockets.length, 2);
+  assert.deepEqual(await setup.sessionStore.get(), {
+    schemaVersion: 2,
+    accessToken: freshToken,
+    refreshToken: "rotated-refresh-token",
+    user,
+  });
+  assert.deepEqual(encryptedTexts, []);
+
+  sockets[1].trigger("auth:challenge", {
+    socketId: "refreshed-socket",
+    challenge: "refreshed-challenge",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  sockets[1].trigger("auth:ready");
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    if (setup.runtime.getStatus().clipboardWatch === "watching") break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.equal(setup.runtime.getStatus().syncReady, true);
+  assert.deepEqual(watchCalls.filter((call) => call.type === "start"), [
+    { type: "start", resetBaseline: true },
+    { type: "start", resetBaseline: true },
+  ]);
+  assert.ok(
+    membershipAccessTokens
+      .slice(membershipCallsBeforeRecovery)
+      .every((accessToken) => accessToken === freshToken),
+  );
+
+  await setup.runtime.handleClipboardObservation(
+    clipboardObservation("copied after recovery"),
+  );
+
+  assert.deepEqual(encryptedTexts, ["copied after recovery"]);
+  assert.ok(
+    membershipAccessTokens.slice(membershipCallsBeforeRecovery).length > 0,
+  );
+  assert.ok(
+    membershipAccessTokens
+      .slice(membershipCallsBeforeRecovery)
+      .every((accessToken) => accessToken === freshToken),
+  );
+  assert.equal(
+    sockets[1].emissions.some((emission) => emission.event === "clipboard:publish"),
+    true,
+  );
+});
+
+function automaticAuthRecoveryFixture(
+  blockRefresh = false,
+  blockWatcherRestart = false,
+) {
+  const initialToken = "rejected-access-token";
+  const freshToken = "recovered-access-token";
+  const sockets: FakeSocket[] = [];
+  const socketOptions: SocketOptions[] = [];
+  const watchCalls: Array<{ type: "start" | "stop"; resetBaseline?: boolean }> = [];
+  const membershipAccessTokens: string[] = [];
+  const membershipAccessTokensAfterRefresh: string[] = [];
+  const encryptedTexts: string[] = [];
+  let rejectNextMembership = false;
+  let refreshCalls = 0;
+  let watchStartCount = 0;
+  let markWatcherRestartStarted!: () => void;
+  const watcherRestartStarted = new Promise<void>((resolve) => {
+    markWatcherRestartStarted = resolve;
+  });
+  let releaseWatcherRestart = (): void => undefined;
+  const watcherRestartGate = new Promise<void>((resolve) => {
+    releaseWatcherRestart = resolve;
+  });
+  let markRefreshStarted!: () => void;
+  const refreshStarted = new Promise<void>((resolve) => {
+    markRefreshStarted = resolve;
+  });
+  let releaseRefresh = (): void => undefined;
+  const refreshGate = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+
+  const setup = makeRuntime({
+    initialSession: {
+      schemaVersion: 2,
+      accessToken: initialToken,
+      refreshToken: "old-refresh-token",
+      user,
+    },
+    localTrustState: "verified",
+    refreshTokens: async (refreshToken) => {
+      refreshCalls += 1;
+      assert.equal(refreshToken, "old-refresh-token");
+      markRefreshStarted();
+      if (blockRefresh) await refreshGate;
+      return response(refreshedSession(freshToken, "rotated-refresh-token"));
+    },
+    apiFactory: (accessToken, api) => ({
+      ...api,
+      devices: {
+        ...api.devices,
+        listDevices: async () => {
+          membershipAccessTokens.push(accessToken);
+          if (refreshCalls > 0) {
+            membershipAccessTokensAfterRefresh.push(accessToken);
+          }
+          if (rejectNextMembership) {
+            rejectNextMembership = false;
+            throw { response: { status: 401 } };
+          }
+          return response([registeredDevice]);
+        },
+        listPendingDevices: async () => {
+          membershipAccessTokens.push(accessToken);
+          if (refreshCalls > 0) {
+            membershipAccessTokensAfterRefresh.push(accessToken);
+          }
+          return response([]);
+        },
+      },
+    }),
+    socketFactory: (_url, options) => {
+      socketOptions.push(options);
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    clipboardAdapter: {
+      readText: async () => "pre-recovery clipboard baseline",
+      writeText: async () => undefined,
+      startWatching: async (options) => {
+        watchStartCount += 1;
+        watchCalls.push({
+          type: "start",
+          resetBaseline: options?.resetBaseline,
+        });
+        if (blockWatcherRestart && watchStartCount === 2) {
+          markWatcherRestartStarted();
+          await watcherRestartGate;
+        }
+      },
+      stopWatching: async () => {
+        watchCalls.push({ type: "stop" });
+      },
+    },
+    encrypt: async (input) => {
+      encryptedTexts.push(input.plaintext as string);
+      return {
+        itemId: `automatic-${encryptedTexts.length}`,
+        sourceDeviceId: input.identity.deviceId,
+        sourceKeyVersion: 1,
+        sourceSignature: "signature",
+        protocolVersion: 1 as const,
+        contentType: "text/plain",
+        ciphertext: "ciphertext",
+        nonce: "nonce",
+        recipients: [],
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+
+  return {
+    setup,
+    sockets,
+    socketOptions,
+    watchCalls,
+    membershipAccessTokens,
+    membershipAccessTokensAfterRefresh,
+    encryptedTexts,
+    refreshStarted,
+    releaseRefresh,
+    watcherRestartStarted,
+    releaseWatcherRestart,
+    getRefreshCalls: () => refreshCalls,
+    rejectNextMembership: () => {
+      rejectNextMembership = true;
+    },
+    freshToken,
+  };
+}
+
+async function startAutomaticAuthRecoveryFixture(
+  fixture: ReturnType<typeof automaticAuthRecoveryFixture>,
+): Promise<void> {
+  await fixture.setup.runtime.start();
+  fixture.sockets[0].trigger("auth:ready");
+  await waitForRuntimeCondition(
+    () =>
+      fixture.setup.runtime.getStatus().syncReady &&
+      fixture.setup.runtime.getStatus().clipboardWatch === "watching",
+    "initial socket and clipboard watcher did not become ready",
+  );
+  await flushRuntimeWork();
+}
+
+async function readyReplacementSocket(
+  fixture: ReturnType<typeof automaticAuthRecoveryFixture>,
+): Promise<void> {
+  await waitForRuntimeCondition(
+    () => fixture.sockets.length === 2,
+    "auth recovery did not create a replacement socket",
+  );
+  fixture.sockets[1].trigger("auth:ready");
+}
+
+test("automatic publish recovers once from a membership HTTP 401", async () => {
+  const fixture = automaticAuthRecoveryFixture(false, true);
+  await startAutomaticAuthRecoveryFixture(fixture);
+  const membershipCallsBeforeFailure = fixture.membershipAccessTokens.length;
+  fixture.rejectNextMembership();
+
+  const observation = fixture.setup.runtime.handleClipboardObservation(
+    clipboardObservation("auth-recovered clipboard"),
+  );
+  await readyReplacementSocket(fixture);
+  await fixture.watcherRestartStarted;
+  await observation;
+
+  assert.deepEqual(fixture.encryptedTexts, ["auth-recovered clipboard"]);
+  assert.equal(fixture.setup.runtime.getStatus().clipboardWatch, "starting");
+  fixture.releaseWatcherRestart();
+  await waitForRuntimeCondition(
+    () => fixture.setup.runtime.getStatus().clipboardWatch === "watching",
+    "replacement clipboard watcher did not become ready",
+  );
+
+  assert.equal(fixture.getRefreshCalls(), 1);
+  assert.deepEqual(await fixture.setup.sessionStore.get(), {
+    schemaVersion: 2,
+    accessToken: fixture.freshToken,
+    refreshToken: "rotated-refresh-token",
+    user,
+  });
+  assert.equal(fixture.setup.runtime.getStatus().syncReady, true);
+  assert.deepEqual(
+    fixture.watchCalls.filter((call) => call.type === "start"),
+    [
+      { type: "start", resetBaseline: true },
+      { type: "start", resetBaseline: true },
+    ],
+  );
+  assert.deepEqual(fixture.socketOptions[1].auth, { token: fixture.freshToken });
+  assert.ok(
+    fixture.membershipAccessTokens.length > membershipCallsBeforeFailure,
+  );
+  assert.ok(
+    fixture.membershipAccessTokensAfterRefresh.length > 0 &&
+      fixture.membershipAccessTokensAfterRefresh.every(
+        (accessToken) => accessToken === fixture.freshToken,
+      ),
+  );
+  assert.equal(
+    fixture.sockets[1].emissions.some(
+      (emission) => emission.event === "clipboard:publish",
+    ),
+    true,
+  );
+});
+
+test("automatic auth recovery keeps only the latest rapid observation", async () => {
+  const fixture = automaticAuthRecoveryFixture(true, true);
+  await startAutomaticAuthRecoveryFixture(fixture);
+  fixture.rejectNextMembership();
+
+  const first = fixture.setup.runtime.handleClipboardObservation(
+    clipboardObservation("A"),
+  );
+  await fixture.refreshStarted;
+  const second = fixture.setup.runtime.handleClipboardObservation(
+    clipboardObservation("B"),
+  );
+  await flushRuntimeWork();
+
+  fixture.releaseRefresh();
+  await readyReplacementSocket(fixture);
+  await fixture.watcherRestartStarted;
+  await Promise.all([first, second]);
+
+  assert.deepEqual(fixture.encryptedTexts, ["B"]);
+  fixture.releaseWatcherRestart();
+  await waitForRuntimeCondition(
+    () => fixture.setup.runtime.getStatus().clipboardWatch === "watching",
+    "replacement clipboard watcher did not become ready",
+  );
+
+  assert.equal(
+    fixture.sockets[1].emissions.filter(
+      (emission) => emission.event === "clipboard:publish",
+    ).length,
+    1,
+  );
+  assert.equal(fixture.getRefreshCalls(), 1);
+});
+
+test("automatic publish does not refresh for HTTP 500 or network failure", async () => {
+  for (const failure of [500, "network"] as const) {
+    let activeFailure: number | "network" | null = null;
+    let refreshCalls = 0;
+    const setup = await startReady({
+      localTrustState: "verified",
+      listDevices: async () => {
+        if (activeFailure === "network") {
+          throw new Error("network unavailable");
+        }
+        if (typeof activeFailure === "number") {
+          throw { response: { status: activeFailure } };
+        }
+        return response([registeredDevice]);
+      },
+      refreshTokens: async () => {
+        refreshCalls += 1;
+        return response(refreshedSession("unexpected-refresh"));
+      },
+    });
+
+    activeFailure = failure;
+    await setup.runtime.handleClipboardObservation(
+      clipboardObservation(`failure-${failure}`),
+    );
+
+    assert.equal(refreshCalls, 0);
+    assert.equal(setup.runtime.getStatus().socket.deviceAuthenticated, true);
+    assert.equal(setup.runtime.getStatus().lastAutoSyncError?.code, "SOCKET_PUBLISH_FAILED");
+  }
+});
+
+test("automatic publish does not refresh for non-auth HTTP 403", async () => {
+  let refreshCalls = 0;
+  let rejectMembership = false;
+  const setup = await startReady({
+    localTrustState: "verified",
+    listDevices: async () => {
+      if (rejectMembership) throw { response: { status: 403 } };
+      return response([registeredDevice]);
+    },
+    refreshTokens: async () => {
+      refreshCalls += 1;
+      return response(refreshedSession("unexpected-refresh"));
+    },
+  });
+
+  rejectMembership = true;
+  await setup.runtime.handleClipboardObservation(
+    clipboardObservation("forbidden"),
+  );
+
+  assert.equal(refreshCalls, 0);
+  assert.equal(setup.runtime.getStatus().socket.deviceAuthenticated, true);
+  assert.equal(setup.runtime.getStatus().lastAutoSyncError?.code, "SOCKET_PUBLISH_FAILED");
+});
+
+test("Send Off during automatic auth recovery prevents publish and replay after re-enable", async () => {
+  const fixture = automaticAuthRecoveryFixture(true, true);
+  await startAutomaticAuthRecoveryFixture(fixture);
+  fixture.rejectNextMembership();
+
+  const observation = fixture.setup.runtime.handleClipboardObservation(
+    clipboardObservation("A"),
+  );
+  await fixture.refreshStarted;
+  const latestObservation = fixture.setup.runtime.handleClipboardObservation(
+    clipboardObservation("B"),
+  );
+  const disabled = await fixture.setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: false,
+      receiveEnabled: true,
+    }),
+  );
+  assert.equal(disabled.ok, true);
+
+  fixture.releaseRefresh();
+  await readyReplacementSocket(fixture);
+  await Promise.all([observation, latestObservation]);
+  fixture.releaseWatcherRestart();
+
+  assert.deepEqual(fixture.encryptedTexts, []);
+  assert.equal(
+    fixture.setup.runtime.getStatus().lastAutoSyncError?.code,
+    "CLIPBOARD_SEND_DISABLED",
+  );
+
+  const reenabled = await fixture.setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:set-sync-preferences",
+      sendEnabled: true,
+      receiveEnabled: true,
+    }),
+  );
+  assert.equal(reenabled.ok, true);
+  await waitForRuntimeCondition(
+    () => fixture.setup.runtime.getStatus().clipboardWatch === "watching",
+    "clipboard watcher did not restart after re-enable",
+  );
+  assert.deepEqual(fixture.encryptedTexts, []);
+  assert.deepEqual(
+    fixture.watchCalls.filter((call) => call.type === "start"),
+    [
+      { type: "start", resetBaseline: true },
+      { type: "start", resetBaseline: true },
+    ],
+  );
 });

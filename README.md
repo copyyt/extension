@@ -84,7 +84,7 @@ yarn test:chrome
 
 `yarn build:extension` keeps the development host permissions and writes to
 `build-extension/`. `yarn build:store` uses only the production API host,
-validates the Store manifest as version 2.0.0, audits the source and artifact
+validates the Store manifest as version 2.0.1, audits the source and artifact
 for MV3 remote-code violations, and writes the uploadable directory to
 `build-extension-store/`.
 
