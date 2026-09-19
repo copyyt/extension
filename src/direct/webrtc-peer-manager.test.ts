@@ -17,6 +17,7 @@ import {
 
 const sourceDeviceId = "7d8a7f8f-3b6a-4d45-bf59-8f9c6dd6c2a1";
 const recipientDeviceId = "4e9cc7a0-2cbf-4d13-b5bd-4e3b4f1cf6a7";
+const otherSourceDeviceId = "0c2f3a0e-4a23-4b83-91ad-5e9ed6a7b8c9";
 const transferId = "b8a3df60-5d4c-4c48-8c56-efb31fdb71bc";
 
 class FakeChannel implements DataChannelLike {
@@ -77,6 +78,7 @@ class FakePeerConnection implements PeerConnectionLike {
   receivedDataChannel: FakeChannel | null = null;
   onconnectionstatechange: (() => void) | null = null;
   dataChannel: FakeChannel | null = null;
+  addedIceCandidates: unknown[] = [];
 
   set ondatachannel(listener: ((event: { channel: DataChannelLike }) => void) | null) {
     this.onDataChannel = listener;
@@ -112,7 +114,8 @@ class FakePeerConnection implements PeerConnectionLike {
     this.remoteDescription = description;
   }
 
-  async addIceCandidate(): Promise<void> {
+  async addIceCandidate(candidate: unknown): Promise<void> {
+    this.addedIceCandidates.push(candidate);
     return undefined;
   }
 
@@ -166,11 +169,14 @@ test("peer manager queues ICE until the offer creates its peer", async () => {
 });
 
 test("pre-offer ICE queues remain bound to their original source device", async () => {
+  let peer: FakePeerConnection | undefined;
   const manager = new WebRtcPeerManager({
-    peerConnectionFactory: () => new FakePeerConnection(),
+    peerConnectionFactory: () => {
+      peer = new FakePeerConnection();
+      return peer;
+    },
     emit: () => undefined,
   });
-  const otherSourceDeviceId = "0c2f3a0e-4a23-4b83-91ad-5e9ed6a7b8c9";
 
   await manager.handleSignal({
     transferId,
@@ -179,6 +185,15 @@ test("pre-offer ICE queues remain bound to their original source device", async 
     kind: "ice-candidate",
     candidate: { candidate: "candidate:1", sdpMLineIndex: 0 },
   });
+  await assert.rejects(
+    manager.handleSignal({
+      transferId,
+      sourceDeviceId: otherSourceDeviceId,
+      sourceKeyVersion: 1,
+      kind: "cancel",
+    }),
+    /pending transfer/,
+  );
   await assert.rejects(
     manager.handleSignal({
       transferId,
@@ -206,7 +221,74 @@ test("pre-offer ICE queues remain bound to their original source device", async 
     sdp: "offer-sdp",
   });
   assert.equal(manager.size, 1);
+  assert.equal(peer?.addedIceCandidates.length, 1);
   await manager.cancelAll();
+});
+
+test("mismatched active-transfer cancel leaves the transfer intact", async () => {
+  const events: DirectManagerEvent[] = [];
+  let peer: FakePeerConnection | undefined;
+  const manager = new WebRtcPeerManager({
+    peerConnectionFactory: () => {
+      peer = new FakePeerConnection();
+      peer.pendingRemoteChannel = new FakeChannel(DIRECT_DATA_CHANNEL_LABEL);
+      return peer;
+    },
+    emit: (event) => {
+      events.push(event);
+    },
+  });
+
+  await manager.handleSignal({
+    transferId,
+    sourceDeviceId,
+    sourceKeyVersion: 1,
+    kind: "offer",
+    sdp: "offer-sdp",
+  });
+  const channel = peer?.receivedDataChannel;
+  assert.ok(peer);
+  assert.ok(channel);
+
+  await assert.rejects(
+    manager.handleSignal({
+      transferId,
+      sourceDeviceId: otherSourceDeviceId,
+      sourceKeyVersion: 1,
+      kind: "cancel",
+      reason: "forged cancellation",
+    }),
+    /transfer/,
+  );
+  assert.equal(manager.size, 1);
+  assert.notEqual(peer.connectionState, "closed");
+  assert.notEqual(channel.readyState, "closed");
+  assert.equal(
+    events.some(
+      (event) =>
+        event.kind === "status" &&
+        event.state === "cancelled" &&
+        event.remoteDeviceId === sourceDeviceId,
+    ),
+    false,
+  );
+
+  await manager.handleSignal({
+    transferId,
+    sourceDeviceId,
+    sourceKeyVersion: 1,
+    kind: "cancel",
+    reason: "owner cancellation",
+  });
+  assert.equal(manager.size, 0);
+  assert.equal(peer.connectionState, "closed");
+  assert.equal(channel.readyState, "closed");
+  assert.equal(
+    events.some(
+      (event) => event.kind === "status" && event.state === "cancelled",
+    ),
+    true,
+  );
 });
 
 test("peer manager chunks the 2 MiB experiment and completes with verification", async () => {
@@ -361,6 +443,22 @@ test("cancel removes a pre-offer ICE queue and frees its slot", async () => {
     kind: "ice-candidate",
     candidate: { candidate: "candidate:1", sdpMLineIndex: 0 },
   });
+  await assert.rejects(
+    manager.handleSignal({
+      transferId,
+      sourceDeviceId: otherSourceDeviceId,
+      sourceKeyVersion: 1,
+      kind: "cancel",
+      reason: "forged cancellation",
+    }),
+    /pending transfer/,
+  );
+  await assert.rejects(
+    manager.startTestTransfer({
+      transferId: secondTransferId,
+      remoteDeviceId: recipientDeviceId,
+    }),
+  );
   await manager.handleSignal({
     transferId,
     sourceDeviceId,

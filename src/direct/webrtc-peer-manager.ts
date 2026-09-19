@@ -293,8 +293,21 @@ export class WebRtcPeerManager {
   private async handleSignalInternal(signal: DirectSignalDelivery): Promise<void> {
     if (signal.kind === "cancel") {
       const state = this.transfers.get(signal.transferId);
+      if (state && state.remoteDeviceId !== signal.sourceDeviceId) {
+        throw new DirectTransportError(
+          "The direct cancel source does not match the transfer",
+        );
+      }
+
+      const pending = this.pendingCandidates.get(signal.transferId);
+      if (pending && pending.sourceDeviceId !== signal.sourceDeviceId) {
+        throw new DirectTransportError(
+          "The direct cancel source does not match the pending transfer",
+        );
+      }
+
       if (state) this.cancelState(state, signal.reason ?? "Remote cancelled");
-      this.discardPendingCandidates(signal.transferId);
+      this.discardPendingCandidates(signal.transferId, pending);
       return;
     }
 
