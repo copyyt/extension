@@ -2329,7 +2329,7 @@ export class CopyytServiceWorkerRuntime {
       await this.dependencies.trustStore.upsertServerReportedDevice({
         userId: session.user.id,
         ...pending,
-        capabilities: [...pending.capabilities],
+        capabilities: validClipboardCapabilities(pending.capabilities),
         trustState: pending.trustState,
       });
     if (localPending.trustState !== "unverified") {
@@ -2443,7 +2443,7 @@ export class CopyytServiceWorkerRuntime {
       await this.dependencies.trustStore.upsertServerReportedDevice({
         userId: session.user.id,
         ...current,
-        capabilities: [...current.capabilities],
+        capabilities: validClipboardCapabilities(current.capabilities),
         trustState: current.trustState,
       });
     if (
@@ -2459,7 +2459,7 @@ export class CopyytServiceWorkerRuntime {
       await this.dependencies.trustStore.upsertServerReportedDevice({
         userId: session.user.id,
         ...serverApprover,
-        capabilities: [...serverApprover.capabilities],
+        capabilities: validClipboardCapabilities(serverApprover.capabilities),
         trustState: "trusted",
       });
     if (localApprover.trustState !== "unverified") {
@@ -2814,7 +2814,7 @@ export class CopyytServiceWorkerRuntime {
       await this.dependencies.trustStore.upsertServerReportedDevice({
         userId: session.user.id,
         ...pending,
-        capabilities: [...pending.capabilities],
+        capabilities: validClipboardCapabilities(pending.capabilities),
         trustState: pending.trustState,
       });
       const fingerprint = await this.pairingFingerprintFor(identity, pending);
@@ -2852,7 +2852,7 @@ export class CopyytServiceWorkerRuntime {
     await this.dependencies.trustStore.upsertServerReportedDevice({
       userId: session.user.id,
       ...approver,
-      capabilities: [...approver.capabilities],
+      capabilities: validClipboardCapabilities(approver.capabilities),
       trustState: approver.trustState,
     });
     const localApprover = await this.dependencies.trustStore.getDevice(

@@ -335,25 +335,7 @@ export function isOffscreenClipboardObservation(
     const hasText = Object.prototype.hasOwnProperty.call(value, "text");
     const hasPayload = Object.prototype.hasOwnProperty.call(value, "payload");
     if (hasText && hasPayload) {
-      if (!isClipboardText(candidate.text)) return false;
-      try {
-        validateClipboardPayloadV1(candidate.payload);
-      } catch {
-        return false;
-      }
-      return (
-        keys.length === 5 &&
-        keys.every(
-          (key) =>
-            typeof key === "string" &&
-            ["source", "target", "type", "text", "payload"].includes(key),
-        ) &&
-        candidate.payload.representations.some(
-          (representation) =>
-            representation.mime === "text/plain" &&
-            representation.data === candidate.text,
-        )
-      );
+      return false;
     }
     if (hasPayload) {
       try {

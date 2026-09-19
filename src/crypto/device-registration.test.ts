@@ -102,6 +102,41 @@ test("registration refresh advertises bundle receive support and preserves ident
   assert.equal(requests[0]!.deviceId, originalIdentity.deviceId);
   assert.equal(requests[0]!.encryptionPublicKey, originalIdentity.encryptionPublicKeyBase64);
   assert.equal(requests[0]!.signingPublicKey, originalIdentity.signingPublicKeyBase64);
+  const refreshedApprover = await trustStore.upsertServerReportedDevice({
+    userId,
+    deviceId: approverIdentity.deviceId,
+    keyVersion: approverIdentity.keyVersion!,
+    encryptionPublicKey: approverIdentity.encryptionPublicKeyBase64,
+    signingPublicKey: approverIdentity.signingPublicKeyBase64,
+    name: "Approver after capability update",
+    platform: "chrome",
+    capabilities: ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
+    appVersion: "2.0.2",
+    trustState: "trusted",
+  });
+  assert.equal(refreshedApprover.trustOrigin, pairingBefore?.trustOrigin);
+  assert.equal(refreshedApprover.pairedForDeviceId, pairingBefore?.pairedForDeviceId);
+  assert.equal(refreshedApprover.pairingFingerprint, pairingBefore?.pairingFingerprint);
+  assert.equal(refreshedApprover.pinnedAt, pairingBefore?.pinnedAt);
+  assert.deepEqual(refreshedApprover.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+  for (const changed of [
+    { signingPublicKey: bytesToBase64(new Uint8Array(32).fill(9)) },
+    { encryptionPublicKey: bytesToBase64(new Uint8Array(32).fill(9)) },
+    { keyVersion: originalIdentity.keyVersion! + 1 },
+  ]) {
+    await assert.rejects(
+      trustStore.upsertServerReportedDevice({
+        userId,
+        deviceId: originalIdentity.deviceId,
+        keyVersion: originalIdentity.keyVersion!,
+        encryptionPublicKey: originalIdentity.encryptionPublicKeyBase64,
+        signingPublicKey: originalIdentity.signingPublicKeyBase64,
+        ...changed,
+        capabilities: ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
+        trustState: "trusted",
+      }),
+    );
+  }
 
   // Reload from persistence, so this also covers metadata surviving a new runtime.
   const persistedIdentity = await getDeviceIdentity(userId);
@@ -131,8 +166,21 @@ test("registration refresh advertises bundle receive support and preserves ident
     assert.equal(getPrivateKeyHandles(refreshed).encryptionPrivateKey.extractable, false);
   }
   const reloadedTrustStore = new IndexedDBTrustStore();
-  assert.deepEqual(await reloadedTrustStore.getDevice(userId, localDeviceId), trustedBefore);
-  assert.deepEqual(await reloadedTrustStore.getDevice(userId, approverDeviceId), pairingBefore);
+  const refreshedLocal = await reloadedTrustStore.getDevice(userId, localDeviceId);
+  assert.equal(refreshedLocal?.trustState, trustedBefore?.trustState);
+  assert.equal(refreshedLocal?.trustOrigin, trustedBefore?.trustOrigin);
+  assert.deepEqual(refreshedLocal?.approvalCertificate, trustedBefore?.approvalCertificate);
+  assert.equal(refreshedLocal?.pairedForDeviceId, trustedBefore?.pairedForDeviceId);
+  assert.equal(refreshedLocal?.pairingFingerprint, trustedBefore?.pairingFingerprint);
+  assert.equal(refreshedLocal?.pinnedAt, trustedBefore?.pinnedAt);
+  assert.deepEqual(refreshedLocal?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+  const reloadedApprover = await reloadedTrustStore.getDevice(userId, approverDeviceId);
+  assert.equal(reloadedApprover?.trustState, pairingBefore?.trustState);
+  assert.equal(reloadedApprover?.trustOrigin, pairingBefore?.trustOrigin);
+  assert.equal(reloadedApprover?.pairedForDeviceId, pairingBefore?.pairedForDeviceId);
+  assert.equal(reloadedApprover?.pairingFingerprint, pairingBefore?.pairingFingerprint);
+  assert.equal(reloadedApprover?.pinnedAt, pairingBefore?.pinnedAt);
+  assert.deepEqual(reloadedApprover?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
   assert.equal((await reloadedTrustStore.listEncryptionRecipients(userId)).length, 2);
 });
 

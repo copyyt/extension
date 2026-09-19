@@ -4,7 +4,11 @@ import {
   createRuntimeMessageListener,
   type RuntimeMessageSender,
 } from "./service-worker-bootstrap.ts";
-import type { RuntimeRequest, RuntimeResponse } from "./messages.ts";
+import {
+  isOffscreenClipboardObservation,
+  type RuntimeRequest,
+  type RuntimeResponse,
+} from "./messages.ts";
 
 function request(command: RuntimeRequest["command"]): RuntimeRequest {
   return {
@@ -207,4 +211,26 @@ test("offscreen observations from another extension page or id are rejected", as
   );
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(observations, []);
+});
+
+test("offscreen clipboard observations enforce the typed legacy-or-payload union", () => {
+  const payload = {
+    version: 1 as const,
+    representations: [
+      { mime: "text/plain" as const, encoding: "utf-8" as const, data: "Copyyt" },
+    ],
+  };
+  const base = {
+    source: "offscreen" as const,
+    target: "service-worker" as const,
+    type: "CLIPBOARD_CHANGED" as const,
+  };
+  assert.equal(isOffscreenClipboardObservation({ ...base, payload }), true);
+  assert.equal(isOffscreenClipboardObservation({ ...base, text: "Copyyt" }), true);
+  assert.equal(isOffscreenClipboardObservation({ ...base, text: "Copyyt", payload }), false);
+  assert.equal(isOffscreenClipboardObservation(base), false);
+  assert.equal(
+    isOffscreenClipboardObservation({ ...base, payload: { version: 1, representations: [] } }),
+    false,
+  );
 });

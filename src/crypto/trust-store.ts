@@ -15,6 +15,7 @@ import {
   verifyDeviceApproval,
 } from "./crypto-core.ts";
 import { isCanonicalBase64Bytes } from "./bytes.ts";
+import { validClipboardCapabilities } from "../clipboard/capabilities.ts";
 
 export type LocalTrustState = "root" | "verified" | "unverified" | "revoked";
 export type TrustOrigin = "initial-tofu" | "pairing";
@@ -103,6 +104,19 @@ function sameKeys(
     left.encryptionPublicKey === right.encryptionPublicKey &&
     left.signingPublicKey === right.signingPublicKey
   );
+}
+
+function samePinnedIdentity(
+  left: Pick<
+    LocalDeviceRecord,
+    "userId" | "deviceId" | "keyVersion" | "encryptionPublicKey" | "signingPublicKey"
+  >,
+  right: Pick<
+    LocalDeviceRecord,
+    "userId" | "deviceId" | "keyVersion" | "encryptionPublicKey" | "signingPublicKey"
+  >,
+): boolean {
+  return left.userId === right.userId && sameKeys(left, right);
 }
 
 const UUID_PATTERN =
@@ -264,6 +278,45 @@ function cloneDevice(device: LocalDeviceRecord): LocalDeviceRecord {
   };
 }
 
+type MutableDeviceMetadata = Pick<
+  LocalDeviceRecord,
+  "name" | "platform" | "capabilities" | "appVersion"
+>;
+
+function mutableMetadataFromServer(
+  device: ServerReportedDevice,
+): MutableDeviceMetadata {
+  return {
+    name: typeof device.name === "string" ? device.name : undefined,
+    platform: typeof device.platform === "string" ? device.platform : undefined,
+    capabilities: validClipboardCapabilities(device.capabilities),
+    appVersion:
+      typeof device.appVersion === "string" ? device.appVersion : undefined,
+  };
+}
+
+/**
+ * Refreshes feature/display metadata without allowing a server observation to
+ * mutate the locally pinned identity or trust ceremony.
+ */
+function refreshMutableMetadata(
+  current: LocalDeviceRecord,
+  incoming: LocalDeviceRecord,
+): LocalDeviceRecord {
+  if (!samePinnedIdentity(current, incoming)) {
+    throw new TrustStoreError("Trusted device metadata changed unexpectedly");
+  }
+  return {
+    ...current,
+    name: incoming.name,
+    platform: incoming.platform,
+    capabilities: incoming.capabilities
+      ? [...incoming.capabilities]
+      : undefined,
+    appVersion: incoming.appVersion,
+  };
+}
+
 function locallyVerified(device: LocalDeviceRecord | null | undefined): device is ClientVerifiedDevice {
   return Boolean(
     device && (device.trustState === "root" || device.trustState === "verified"),
@@ -392,26 +445,31 @@ export class InMemoryTrustStore implements ClientTrustStore {
       keyVersion: device.keyVersion,
       encryptionPublicKey: device.encryptionPublicKey,
       signingPublicKey: device.signingPublicKey,
-      name: device.name,
-      platform: device.platform,
-      capabilities: device.capabilities ? [...device.capabilities] : undefined,
-      appVersion: device.appVersion,
+      ...mutableMetadataFromServer(device),
       trustState: device.trustState === "revoked" ? "revoked" : "unverified",
       approvalCertificate: undefined,
     };
     if (current?.trustState === "revoked") {
       return cloneDevice(current);
     }
+    if (locallyVerified(current)) {
+      if (incoming.trustState === "revoked") {
+        if (!samePinnedIdentity(current, incoming)) {
+          throw new TrustStoreError("Trusted device metadata changed unexpectedly");
+        }
+        assertValidTrustRecord(incoming);
+        this.devices.set(key, incoming);
+        return cloneDevice(incoming);
+      }
+      const refreshed = refreshMutableMetadata(current, incoming);
+      assertValidTrustRecord(refreshed);
+      this.devices.set(key, refreshed);
+      return cloneDevice(refreshed);
+    }
     if (incoming.trustState === "revoked") {
       assertValidTrustRecord(incoming);
       this.devices.set(key, incoming);
       return cloneDevice(incoming);
-    }
-    if (locallyVerified(current)) {
-      if (!sameKeys(current, incoming)) {
-        throw new TrustStoreError("Trusted device metadata changed unexpectedly");
-      }
-      return cloneDevice(current);
     }
     assertValidTrustRecord(incoming);
     this.devices.set(key, incoming);
@@ -724,10 +782,7 @@ function normalizeServerReportedDevice(device: ServerReportedDevice): LocalDevic
     keyVersion: device.keyVersion,
     encryptionPublicKey: device.encryptionPublicKey,
     signingPublicKey: device.signingPublicKey,
-    name: device.name,
-    platform: device.platform,
-    capabilities: device.capabilities ? [...device.capabilities] : undefined,
-    appVersion: device.appVersion,
+    ...mutableMetadataFromServer(device),
     trustState: device.trustState === "revoked" ? "revoked" : "unverified",
     approvalCertificate: undefined,
   };
@@ -765,16 +820,23 @@ export class IndexedDBTrustStore implements ClientTrustStore {
             return;
           }
           if (incoming.trustState === "revoked") {
+            if (locallyVerified(current) && !samePinnedIdentity(current, incoming)) {
+              fail(new TrustStoreError("Trusted device metadata changed unexpectedly"));
+              return;
+            }
             store.put(incoming, deviceKey(incoming.userId, incoming.deviceId));
             finish(cloneDevice(incoming));
             return;
           }
           if (locallyVerified(current)) {
-            if (!sameKeys(current, incoming)) {
-              fail(new TrustStoreError("Trusted device metadata changed unexpectedly"));
-              return;
+            try {
+              const refreshed = refreshMutableMetadata(current, incoming);
+              assertValidTrustRecord(refreshed);
+              store.put(refreshed, deviceKey(incoming.userId, incoming.deviceId));
+              finish(cloneDevice(refreshed));
+            } catch (error) {
+              fail(error);
             }
-            finish(cloneDevice(current));
             return;
           }
           store.put(incoming, deviceKey(incoming.userId, incoming.deviceId));

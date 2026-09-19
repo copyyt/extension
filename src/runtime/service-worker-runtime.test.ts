@@ -3,6 +3,7 @@ import test from "node:test";
 import type { AxiosResponse } from "axios";
 import {
   CLIPBOARD_BUNDLE_V1_MIME,
+  decodeClipboardBundleV1,
   encodeClipboardBundleV1,
   type ClipboardPayloadV1,
 } from "../clipboard/payload.ts";
@@ -2645,6 +2646,9 @@ function makePairingTrustStore(
     encryptionPublicKey: rootDevice.encryptionPublicKey,
     signingPublicKey: rootDevice.signingPublicKey,
     trustState: "root",
+    capabilities: Array.isArray(rootDevice.capabilities)
+      ? [...rootDevice.capabilities]
+      : undefined,
     trustOrigin: "initial-tofu",
   };
   if (initialDevice) {
@@ -2665,7 +2669,29 @@ function makePairingTrustStore(
     getDevice: async (_userId, deviceId) => records.get(key(deviceId)) ?? null,
     upsertServerReportedDevice: async (device) => {
       const current = records.get(key(device.deviceId));
-      if (current?.trustState === "root" || current?.trustState === "verified") return current;
+      if (current?.trustState === "revoked") return current;
+      if (current?.trustState === "root" || current?.trustState === "verified") {
+        if (
+          current.userId !== device.userId ||
+          current.deviceId !== device.deviceId ||
+          current.keyVersion !== device.keyVersion ||
+          current.encryptionPublicKey !== device.encryptionPublicKey ||
+          current.signingPublicKey !== device.signingPublicKey
+        ) {
+          throw new Error("trusted device identity changed");
+        }
+        const refreshed = {
+          ...current,
+          name: device.name,
+          platform: device.platform,
+          capabilities: Array.isArray(device.capabilities)
+            ? [...device.capabilities]
+            : undefined,
+          appVersion: device.appVersion,
+        };
+        records.set(key(device.deviceId), refreshed);
+        return refreshed;
+      }
       const next: LocalDeviceRecord = {
         ...device,
         trustState: device.trustState === "revoked" ? "revoked" : "unverified",
@@ -3592,20 +3618,15 @@ test("rich publish encrypts one exact bundle for the full rich-capable recipient
     ...registeredDevice,
     capabilities: ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
   };
+  const staleCurrent = { ...richCurrent, capabilities: ["clipboard"] };
   const richRecipient = {
     ...pendingDevice,
     trustState: "trusted",
     capabilities: ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
   };
-  const pairing = makePairingTrustStore(identity, richCurrent);
-  const localRoot = pairing.records.get(`${user.id}:${identity.deviceId}`);
-  assert.ok(localRoot);
-  pairing.records.set(`${user.id}:${identity.deviceId}`, {
-    ...localRoot,
-    capabilities: [...richCurrent.capabilities],
-  });
+  const pairing = makePairingTrustStore(identity, staleCurrent);
   putLocalRecord(pairing.records, richRecipient, "verified", {
-    capabilities: [...richRecipient.capabilities],
+    capabilities: ["clipboard"],
   });
   const encryptInputs: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0][] = [];
   const setup = await startReady({
@@ -3622,14 +3643,74 @@ test("rich publish encrypts one exact bundle for the full rich-capable recipient
     },
   });
 
+  assert.deepEqual(
+    pairing.records.get(`${user.id}:${identity.deviceId}`)?.capabilities,
+    ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
+  );
+  assert.deepEqual(
+    pairing.records.get(`${user.id}:${richRecipient.deviceId}`)?.capabilities,
+    ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
+  );
+
   await setup.runtime.publishClipboardPayload(rich.payload);
 
   assert.equal(encryptInputs.length, 1);
   assert.equal(encryptInputs[0]?.contentType, CLIPBOARD_BUNDLE_V1_MIME);
+  assert.ok(encryptInputs[0]?.plaintext instanceof Uint8Array);
   assert.deepEqual(encryptInputs[0]?.plaintext, rich.bytes);
+  assert.deepEqual(
+    decodeClipboardBundleV1(encryptInputs[0]!.plaintext as Uint8Array),
+    rich.payload,
+  );
   assert.deepEqual(
     encryptInputs[0]?.recipients.map((recipient) => recipient.deviceId).sort(),
     [identity.deviceId, richRecipient.deviceId].sort(),
+  );
+  assert.equal(
+    setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
+    1,
+  );
+});
+
+test("public 2.0.x mixed recipients force one legacy runtime encryption", async () => {
+  const rich = richClipboardBundle("Copyyt");
+  const richCurrent = {
+    ...registeredDevice,
+    capabilities: ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
+  };
+  const legacyRecipient = {
+    ...pendingDevice,
+    trustState: "trusted",
+    capabilities: ["clipboard"],
+  };
+  const pairing = makePairingTrustStore(identity, richCurrent);
+  putLocalRecord(pairing.records, legacyRecipient, "verified", {
+    capabilities: ["clipboard"],
+  });
+  const encryptInputs: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0][] = [];
+  const setup = await startReady({
+    registeredDevice: richCurrent,
+    trustStore: pairing.trustStore,
+    listDevices: async () => response([richCurrent, legacyRecipient]),
+    encrypt: async (input) => {
+      encryptInputs.push(input);
+      return {
+        ...inboundEnvelope("mixed-legacy-publish"),
+        contentType: input.contentType,
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+
+  await setup.runtime.publishClipboardPayload(rich.payload);
+
+  assert.equal(encryptInputs.length, 1);
+  assert.equal(encryptInputs[0]?.contentType, "text/plain");
+  assert.equal(encryptInputs[0]?.plaintext, "Copyyt");
+  assert.equal(typeof encryptInputs[0]?.plaintext, "string");
+  assert.deepEqual(
+    encryptInputs[0]?.recipients.map((recipient) => recipient.deviceId).sort(),
+    [identity.deviceId, legacyRecipient.deviceId].sort(),
   );
   assert.equal(
     setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
