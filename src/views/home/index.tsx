@@ -4,6 +4,7 @@ import { sendRuntimeCommand } from "@/runtime/client";
 import type { RuntimeStatus } from "@/runtime/messages";
 import { useRuntimeStatus } from "@/hooks/runtime-status.hook";
 import { useLogout } from "@/hooks/auth.hook";
+import { writePngToFocusedClipboard } from "@/clipboard/focused-page-writer";
 import { useUserStore } from "@/hooks/user-store.hook";
 import Logo from "@/vectors/logo";
 import LogoutIcon from "@/vectors/logout";
@@ -46,14 +47,49 @@ function Home() {
     setSending(true);
     setMessage(null);
     try {
-      const result = await sendRuntimeCommand<{ itemId: string }>({
+      const result = await sendRuntimeCommand<{
+        itemId: string;
+        projectionCount?: number;
+      }>({
         type: "runtime:send-current-clipboard",
       });
-      setMessage(`Encrypted item accepted: ${result.itemId}`);
+      setMessage(
+        result.projectionCount && result.projectionCount > 1
+          ? `Encrypted ${result.projectionCount} capability-specific items accepted.`
+          : `Encrypted item accepted: ${result.itemId}`,
+      );
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Unable to send clipboard");
     } finally {
       setSending(false);
+      void reload();
+    }
+  };
+
+  const copyPendingImage = async (itemId: string) => {
+    let prepared = false;
+    setMessage(null);
+    try {
+      const result = await sendRuntimeCommand<{
+        itemId: string;
+        pngBytes: Uint8Array;
+      }>({ type: "runtime:copy-pending-image", itemId });
+      prepared = true;
+      await writePngToFocusedClipboard(new Uint8Array(result.pngBytes));
+      await sendRuntimeCommand<RuntimeStatus>({
+        type: "runtime:complete-pending-image",
+        itemId: result.itemId,
+      });
+      setMessage("Image copied to the native clipboard.");
+    } catch (error) {
+      if (prepared) {
+        await sendRuntimeCommand<RuntimeStatus>({
+          type: "runtime:release-pending-image",
+          itemId,
+        }).catch(() => undefined);
+      }
+      setMessage(error instanceof Error ? error.message : "Unable to copy image");
+    } finally {
       void reload();
     }
   };
@@ -224,6 +260,27 @@ function Home() {
           ))}
         </div>
       </div>
+
+      {(status?.pendingAssistedImages?.length ?? 0) > 0 ? (
+        <div className="mt-3 rounded-lg border border-[#D1D5DB] p-4">
+          <p className="text-sm font-semibold">Image received</p>
+          {(status?.pendingAssistedImages ?? []).map((image) => (
+            <div key={image.itemId} className="mt-3 flex items-center justify-between gap-3 text-xs">
+              <div className="min-w-0 text-[#4B5563]">
+                <p>From: {image.sourceDeviceName ?? "Copyyt device"}</p>
+                <p className="mt-1">Available until {new Date(image.expiresAt).toLocaleTimeString()}</p>
+              </div>
+              <Button
+                variant="primary"
+                className="shrink-0 !rounded-lg px-3 text-xs"
+                onClick={() => void copyPendingImage(image.itemId)}
+              >
+                Copy image
+              </Button>
+            </div>
+          ))}
+        </div>
+      ) : null}
 
       {status?.onboarding?.bootstrapEligible === true ? (
         <Button

@@ -27,7 +27,7 @@ const userId = "11111111-1111-4111-8111-111111111111";
 const localDeviceId = "00000000-0000-4000-8000-000000000001";
 const approverDeviceId = "00000000-0000-4000-8000-000000000002";
 
-test("registration refresh advertises bundle receive support and preserves identity, keys, and pairing", async (context) => {
+test("registration refresh advertises assisted PNG receive support and preserves identity, keys, and pairing", async (context) => {
   const record = await storedIdentity(localDeviceId, 9);
   const approverRecord = await storedIdentity(approverDeviceId, 4);
   installIdentityDatabase(context, record);
@@ -96,8 +96,8 @@ test("registration refresh advertises bundle receive support and preserves ident
   });
 
   assert.equal(requests.length, 1);
-  assert.deepEqual(requests[0]!.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
-  assert.deepEqual(device.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+  assert.deepEqual(requests[0]!.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-assisted-write-v1"]);
+  assert.deepEqual(device.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-assisted-write-v1"]);
   assert.notEqual(requests[0]!.capabilities, CLIPBOARD_RECEIVE_CAPABILITIES);
   assert.equal(requests[0]!.deviceId, originalIdentity.deviceId);
   assert.equal(requests[0]!.encryptionPublicKey, originalIdentity.encryptionPublicKeyBase64);
@@ -147,7 +147,7 @@ test("registration refresh advertises bundle receive support and preserves ident
     assert.deepEqual(refreshed.encryptionPublicKey, originalIdentity.encryptionPublicKey);
     assert.deepEqual(refreshed.signingPublicKey, originalIdentity.signingPublicKey);
     assert.equal(refreshed.registration?.name, "Chrome after capability update");
-    assert.deepEqual(refreshed.registration?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+    assert.deepEqual(refreshed.registration?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-assisted-write-v1"]);
     assert.equal(
       await signSocketChallenge({ ...socketChallenge, identity: refreshed }),
       signatureBefore,
@@ -173,7 +173,7 @@ test("registration refresh advertises bundle receive support and preserves ident
   assert.equal(refreshedLocal?.pairedForDeviceId, trustedBefore?.pairedForDeviceId);
   assert.equal(refreshedLocal?.pairingFingerprint, trustedBefore?.pairingFingerprint);
   assert.equal(refreshedLocal?.pinnedAt, trustedBefore?.pinnedAt);
-  assert.deepEqual(refreshedLocal?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+  assert.deepEqual(refreshedLocal?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-assisted-write-v1"]);
   const reloadedApprover = await reloadedTrustStore.getDevice(userId, approverDeviceId);
   assert.equal(reloadedApprover?.trustState, pairingBefore?.trustState);
   assert.equal(reloadedApprover?.trustOrigin, pairingBefore?.trustOrigin);
@@ -196,9 +196,9 @@ test("registration capabilities and server trust labels do not establish local t
     trustStore,
   });
 
-  assert.deepEqual(requests[0]!.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+  assert.deepEqual(requests[0]!.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-assisted-write-v1"]);
   const local = await trustStore.getDevice(userId, localDeviceId);
-  assert.deepEqual(local?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+  assert.deepEqual(local?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-assisted-write-v1"]);
   assert.equal(local?.trustState, "unverified");
   assert.equal(local?.trustOrigin, undefined);
   assert.equal(local?.approvalCertificate, undefined);

@@ -619,7 +619,7 @@ function richClipboardBundle(plainText = "\uFEFF  fallback café e\u0301 🦊\r\
   return { payload, plainText, html, bytes: encodeClipboardBundleV1(payload) };
 }
 
-test("registration advertises clipboard, bundle-v1, and HTML receive capabilities", async () => {
+test("registration advertises assisted PNG receive capability", async () => {
   const registrations: string[][] = [];
   const setup = await startReady({
     registerDevice: async (_api, options) => {
@@ -627,7 +627,12 @@ test("registration advertises clipboard, bundle-v1, and HTML receive capabilitie
       return { identity, device: registeredDevice };
     },
   });
-  assert.deepEqual(registrations, [["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]]);
+  assert.deepEqual(registrations, [[
+    "clipboard",
+    "clipboard-bundle-v1",
+    "clipboard-html-v1",
+    "clipboard-image-png-assisted-write-v1",
+  ]]);
   assert.equal(setup.runtime.getStatus().device.deviceId, identity.deviceId);
   assert.equal(setup.runtime.getStatus().syncReady, true);
 });
@@ -748,7 +753,7 @@ test("mixed local image payloads project to exact text-only network content", as
   assert.equal(typeof encryptInputs[0]!.plaintext === "string" && encryptInputs[0]!.plaintext.includes(image.representations[0]!.data), false);
 });
 
-test("inbound development image bundles reach the adapter and fail without placeholder text", async () => {
+test("inbound image bundles stay out of the offscreen writer and create pending assisted state", async () => {
   const image = clipboardPayloadFromPngBytes(
     new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 3]),
   );
@@ -766,7 +771,36 @@ test("inbound development image bundles reach the adapter and fail without place
     ...inboundEnvelope("inbound-image-adapter"),
     contentType: CLIPBOARD_BUNDLE_V1_MIME,
   });
-  assert.deepEqual(applied, [image]);
+  assert.deepEqual(applied, []);
+  assert.equal(withImageAdapter.runtime.getStatus().pendingAssistedImages?.length, 1);
+
+  const copyResponse = await withImageAdapter.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:copy-pending-image",
+      itemId: "inbound-image-adapter",
+    }),
+  );
+  assert.equal(copyResponse.ok, true);
+  assert.deepEqual(
+    Array.from((copyResponse.data as { pngBytes: Uint8Array }).pngBytes),
+    Array.from(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 3])),
+  );
+  await withImageAdapter.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: image,
+  });
+  // The assisted write is consumed by the durable suppression record, not
+  // republished as a new clipboard event.
+  assert.equal(withImageAdapter.runtime.getStatus().pendingAssistedImages?.length, 1);
+  await withImageAdapter.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:complete-pending-image",
+      itemId: "inbound-image-adapter",
+    }),
+  );
+  assert.equal(withImageAdapter.runtime.getStatus().pendingAssistedImages?.length, 0);
 
   const textWrites: string[] = [];
   const withoutImageAdapter = await startReady({
@@ -781,10 +815,8 @@ test("inbound development image bundles reach the adapter and fail without place
     contentType: CLIPBOARD_BUNDLE_V1_MIME,
   });
   assert.deepEqual(textWrites, []);
-  assert.equal(
-    withoutImageAdapter.runtime.getStatus().lastSyncError?.code,
-    "UNSUPPORTED_CLIPBOARD_CONTENT",
-  );
+  assert.equal(withoutImageAdapter.runtime.getStatus().pendingAssistedImages?.length, 1);
+  assert.equal(withoutImageAdapter.runtime.getStatus().lastSyncError, undefined);
 });
 
 test("unknown content types are consumed after crypto verification without decoding or retrying", async () => {
@@ -3779,7 +3811,7 @@ test("rich publish encrypts one exact bundle for the full rich-capable recipient
   );
 });
 
-test("public 2.0.x mixed recipients force one legacy runtime encryption", async () => {
+test("mixed recipients receive capability-specific encrypted projections", async () => {
   const rich = richClipboardBundle("Copyyt");
   const richCurrent = {
     ...registeredDevice,
@@ -3811,17 +3843,16 @@ test("public 2.0.x mixed recipients force one legacy runtime encryption", async 
 
   await setup.runtime.publishClipboardPayload(rich.payload);
 
-  assert.equal(encryptInputs.length, 1);
-  assert.equal(encryptInputs[0]?.contentType, "text/plain");
-  assert.equal(encryptInputs[0]?.plaintext, "Copyyt");
-  assert.equal(typeof encryptInputs[0]?.plaintext, "string");
-  assert.deepEqual(
-    encryptInputs[0]?.recipients.map((recipient) => recipient.deviceId).sort(),
-    [identity.deviceId, legacyRecipient.deviceId].sort(),
-  );
+  assert.equal(encryptInputs.length, 2);
+  const bundleInput = encryptInputs.find((input) => input.contentType === CLIPBOARD_BUNDLE_V1_MIME)!;
+  const plainInput = encryptInputs.find((input) => input.contentType === "text/plain")!;
+  assert.deepEqual(decodeClipboardBundleV1(bundleInput.plaintext as Uint8Array), rich.payload);
+  assert.equal(plainInput.plaintext, "Copyyt");
+  assert.deepEqual(bundleInput.recipients.map((recipient) => recipient.deviceId), [identity.deviceId]);
+  assert.deepEqual(plainInput.recipients.map((recipient) => recipient.deviceId), [legacyRecipient.deviceId]);
   assert.equal(
     setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
-    1,
+    2,
   );
 });
 

@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   CLIPBOARD_BUNDLE_V1_CAPABILITY,
   CLIPBOARD_HTML_V1_CAPABILITY,
+  CLIPBOARD_IMAGE_PNG_ASSISTED_WRITE_V1_CAPABILITY,
 } from "./capabilities.ts";
 import {
   CLIPBOARD_BUNDLE_V1_MIME,
@@ -13,6 +14,8 @@ import {
 } from "./payload.ts";
 import {
   selectClipboardWirePayload,
+  selectClipboardWirePayloads,
+  ClipboardWirePayloadTooLargeError,
   type ClipboardWireRecipient,
 } from "./wire-payload.ts";
 import { MAX_CLIPBOARD_PLAINTEXT_BYTES } from "./limits.ts";
@@ -28,6 +31,10 @@ const richPayload: ClipboardPayloadV1 = {
 const richCapabilities = [
   CLIPBOARD_BUNDLE_V1_CAPABILITY,
   CLIPBOARD_HTML_V1_CAPABILITY,
+];
+const pngCapabilities = [
+  ...richCapabilities,
+  CLIPBOARD_IMAGE_PNG_ASSISTED_WRITE_V1_CAPABILITY,
 ];
 
 function recipient(
@@ -133,4 +140,78 @@ test("downgrades a bundle that exceeds the safe plaintext limit without truncati
     plaintext: plainText,
     format: "legacy-text",
   });
+});
+
+test("selects an image bundle only for recipients with the assisted PNG capability", () => {
+  const image = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9]),
+  );
+  const mixed: ClipboardPayloadV1 = {
+    version: 1,
+    representations: [
+      { mime: "text/plain", encoding: "utf-8", data: "exact plain" },
+      { mime: "text/html", encoding: "utf-8", data: "<b>exact plain</b>" },
+      ...image.representations,
+    ],
+  };
+  const projections = selectClipboardWirePayloads({
+    payload: mixed,
+    recipients: [
+      recipient(pngCapabilities, pngCapabilities),
+      recipient(richCapabilities, richCapabilities),
+      recipient(["clipboard"], ["clipboard"]),
+    ],
+  });
+
+  assert.equal(projections.length, 3);
+  const representations = projections.map((projection) =>
+    projection.payload.representations.map((value) => value.mime),
+  );
+  assert.deepEqual(representations, [
+    ["text/plain", "text/html", "image/png"],
+    ["text/plain", "text/html"],
+    ["text/plain"],
+  ]);
+  assert.equal(
+    (projections[0]!.wirePayload.plaintext as Uint8Array).byteLength > 0,
+    true,
+  );
+  assert.equal(projections[0]!.wirePayload.format, "bundle-v1");
+});
+
+test("an image-only payload has no projection for recipients without assisted PNG", () => {
+  const image = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9]),
+  );
+  assert.equal(
+    selectClipboardWirePayloads({
+      payload: image,
+      recipients: [recipient(richCapabilities, richCapabilities)],
+    }).length,
+    0,
+  );
+  const selected = selectClipboardWirePayload({
+    payload: image,
+    recipients: [recipient(pngCapabilities, pngCapabilities)],
+  });
+  assert.equal(selected.format, "bundle-v1");
+  assert.deepEqual(
+    JSON.parse(new TextDecoder().decode(selected.plaintext as Uint8Array))
+      .representations.map((value: { mime: string }) => value.mime),
+    ["image/png"],
+  );
+});
+
+test("PNG projection measures serialized bundle size and never truncates", () => {
+  const bytes = new Uint8Array(1_100_000);
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const image = clipboardPayloadFromPngBytes(bytes);
+  assert.throws(
+    () =>
+      selectClipboardWirePayloads({
+        payload: image,
+        recipients: [recipient(pngCapabilities, pngCapabilities)],
+      }),
+    ClipboardWirePayloadTooLargeError,
+  );
 });

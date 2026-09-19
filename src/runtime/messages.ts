@@ -80,6 +80,8 @@ export interface RuntimeStatus {
     message: string;
     at: string;
   };
+  /** Encrypted-envelope metadata only; no decrypted image bytes are exposed. */
+  pendingAssistedImages?: PendingAssistedImageSummary[];
   onboarding: {
     state: OnboardingState;
     bootstrapEligible: boolean;
@@ -104,6 +106,15 @@ export interface RuntimeStatus {
   lastRecoveryReason?: string;
 }
 
+export interface PendingAssistedImageSummary {
+  itemId: string;
+  sourceDeviceId: string;
+  sourceDeviceName?: string;
+  receivedAt: string;
+  expiresAt: string;
+  hasPng: true;
+}
+
 export interface AuthenticatedRuntimeResult {
   message: string;
   user: IUser;
@@ -117,6 +128,9 @@ export type RuntimeCommand =
       receiveEnabled: boolean;
     }
   | { type: "runtime:send-current-clipboard" }
+  | { type: "runtime:copy-pending-image"; itemId: string }
+  | { type: "runtime:complete-pending-image"; itemId: string }
+  | { type: "runtime:release-pending-image"; itemId: string }
   | { type: "runtime:bootstrap-trust-anchor" }
   | { type: "runtime:refresh-onboarding" }
   | {

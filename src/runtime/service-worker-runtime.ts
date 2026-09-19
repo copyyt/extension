@@ -11,12 +11,15 @@ import {
   type ClipboardItemEnvelope,
   type DeviceIdentity,
 } from "../crypto/index.ts";
+import { sha256 } from "../crypto/bytes.ts";
 import {
   CLIPBOARD_BUNDLE_V1_MIME,
   clipboardPayloadFromPlainText,
   decodeClipboardBundleV1,
   decodeClipboardPlainText,
   findPlainTextRepresentation,
+  getPngBytes,
+  getPngRepresentation,
   projectClipboardPayloadToText,
   validateClipboardPayloadV1,
   type ClipboardPayloadV1,
@@ -26,7 +29,8 @@ import {
   validClipboardCapabilities,
 } from "../clipboard/capabilities.ts";
 import {
-  selectClipboardWirePayload,
+  ClipboardWirePayloadTooLargeError,
+  selectClipboardWirePayloads,
   type ClipboardWireRecipient,
 } from "../clipboard/wire-payload.ts";
 import {
@@ -68,9 +72,17 @@ import {
   type RuntimeResponse,
   type RuntimeStatus,
   type RuntimeStatusBroadcast,
+  type PendingAssistedImageSummary,
 } from "./messages.ts";
 import type { ClipboardAdapter } from "./clipboard-adapter.ts";
-import type { OutboundItemStore, ProcessedItemStore } from "./runtime-db.ts";
+import {
+  InMemoryAssistedPngSuppressionStore,
+  InMemoryPendingAssistedImageStore,
+  type AssistedPngSuppressionStore,
+  type OutboundItemStore,
+  type PendingAssistedImageStore,
+  type ProcessedItemStore,
+} from "./runtime-db.ts";
 import {
   DEFAULT_SYNC_PREFERENCES,
   OFF_SYNC_PREFERENCES,
@@ -145,6 +157,8 @@ export interface RuntimeDependencies {
   clipboardAdapter: ClipboardAdapter;
   processedItemStore: ProcessedItemStore;
   outboundItemStore: OutboundItemStore;
+  pendingAssistedImageStore?: PendingAssistedImageStore;
+  assistedPngSuppressionStore?: AssistedPngSuppressionStore;
   syncPreferencesStore: SyncPreferencesStore;
   apiFactory: (accessToken: string) => RuntimeApi;
   socketFactory: (url: string, options: SocketOptions) => SocketLike;
@@ -163,7 +177,10 @@ export interface RuntimeDependencies {
   };
 }
 
-export { selectClipboardWirePayload } from "../clipboard/wire-payload.ts";
+export {
+  selectClipboardWirePayload,
+  selectClipboardWirePayloads,
+} from "../clipboard/wire-payload.ts";
 
 const DEFAULT_STATUS: RuntimeStatus = {
   connectionState: "signed-out",
@@ -177,6 +194,7 @@ const DEFAULT_STATUS: RuntimeStatus = {
     deviceAuthenticated: false,
   },
   syncReady: false,
+  pendingAssistedImages: [],
   syncPreferences: { ...DEFAULT_SYNC_PREFERENCES },
   clipboardWatch: "stopped",
   onboarding: {
@@ -193,6 +211,7 @@ const LOGOUT_REQUEST_TIMEOUT_MS = 5_000;
 
 export const LIVE_CLIPBOARD_TTL_MS = 60_000;
 export const MAX_CLOCK_SKEW_MS = 5 * 60_000;
+const ASSISTED_PNG_SUPPRESSION_TTL_MS = 15_000;
 
 function parseStrictExpiry(value: string): number | null {
   const parsed = Date.parse(value);
@@ -607,6 +626,8 @@ export class CopyytServiceWorkerRuntime {
   private readonly decrypt: typeof decryptClipboardItemBytes;
   private readonly signChallenge: typeof signSocketChallenge;
   private readonly signApproval: typeof signDeviceApproval;
+  private readonly pendingAssistedImageStore: PendingAssistedImageStore;
+  private readonly assistedPngSuppressionStore: AssistedPngSuppressionStore;
   private readonly now: () => Date;
   private status: RuntimeStatus = DEFAULT_STATUS;
   private lastPersistedSyncPreferences: SyncPreferences = {
@@ -665,6 +686,10 @@ export class CopyytServiceWorkerRuntime {
     this.decrypt = dependencies.decrypt ?? decryptClipboardItemBytes;
     this.signChallenge = dependencies.signChallenge ?? signSocketChallenge;
     this.signApproval = dependencies.signApproval ?? signDeviceApproval;
+    this.pendingAssistedImageStore =
+      dependencies.pendingAssistedImageStore ?? new InMemoryPendingAssistedImageStore();
+    this.assistedPngSuppressionStore =
+      dependencies.assistedPngSuppressionStore ?? new InMemoryAssistedPngSuppressionStore();
     this.now = dependencies.now ?? (() => new Date());
   }
 
@@ -1070,6 +1095,7 @@ export class CopyytServiceWorkerRuntime {
       syncPreferences: { ...syncPreferences },
       clipboardWatch: "stopped",
     };
+    await this.refreshPendingAssistedImageStatus();
     this.serverDeviceState = "unknown";
     this.socketReady = false;
     this.challengeInFlight = false;
@@ -1137,6 +1163,21 @@ export class CopyytServiceWorkerRuntime {
     return structuredClone(this.status);
   }
 
+  private async refreshPendingAssistedImageStatus(): Promise<void> {
+    const records = this.session
+      ? await this.pendingAssistedImageStore.list(this.session.user.id)
+      : [];
+    const summaries: PendingAssistedImageSummary[] = records.map((record) => ({
+      itemId: record.itemId,
+      sourceDeviceId: record.sourceDeviceId,
+      ...(record.sourceDeviceName ? { sourceDeviceName: record.sourceDeviceName } : {}),
+      receivedAt: record.receivedAt,
+      expiresAt: record.expiresAt,
+      hasPng: true,
+    }));
+    this.setStatus({ ...this.status, pendingAssistedImages: summaries });
+  }
+
   /** Handles a validated, fire-and-forget observation from the offscreen document. */
   async handleClipboardObservation(message: unknown): Promise<void> {
     if (!isOffscreenClipboardObservation(message)) return;
@@ -1147,16 +1188,35 @@ export class CopyytServiceWorkerRuntime {
     } catch {
       return;
     }
+    const png = getPngRepresentation(payload);
+    if (png && this.session) {
+      try {
+        const fingerprint = await this.pngFingerprint(getPngBytes(payload));
+        if (
+          await this.assistedPngSuppressionStore.consumeByFingerprint(
+            this.session.user.id,
+            fingerprint,
+          )
+        ) {
+          // The focused-page assisted write is an intentional local clipboard
+          // change. Consume its durable suppression before the observation can
+          // enter the live publish path, even if the worker was reconstructed.
+          this.autoObservationSequence += 1;
+          this.pendingAutoObservation = null;
+          return;
+        }
+      } catch {
+        // A suppression-store failure must not make a valid clipboard item
+        // unreadable. The normal publish path remains authoritative.
+      }
+    }
     const plain = findPlainTextRepresentation(payload);
     if (!plain) {
-      // An image-only observation cannot be sent by the current transport,
-      // but it is still a newer clipboard state. Advance the sequence so it
-      // invalidates an older retry without retaining the image payload.
-      this.autoObservationSequence += 1;
-      this.pendingAutoObservation = null;
-      return;
+      // Image-only observations are now eligible for capability-aware
+      // encrypted delivery. The publish path decides whether any compatible
+      // recipient exists and whether the serialized bundle fits the relay.
     }
-    if (plain.data.length === 0 && payload.representations.length === 1) {
+    if (plain?.data.length === 0 && payload.representations.length === 1) {
       this.pendingAutoObservation = null;
       return;
     }
@@ -1366,6 +1426,7 @@ export class CopyytServiceWorkerRuntime {
           runtimeError.code === "SOCKET_NOT_READY" ||
           runtimeError.code === "AUTH_REQUIRED" ||
           runtimeError.code === "CLIPBOARD_SEND_DISABLED"
+          || runtimeError.code === "CLIPBOARD_CONTENT_TOO_LARGE"
         ) {
           // These are eligibility failures, not transient publish failures.
           // Never carry a newer plaintext value across them.
@@ -1381,7 +1442,7 @@ export class CopyytServiceWorkerRuntime {
     }
   }
 
-  async publishClipboardText(text: string): Promise<{ itemId: string }> {
+  async publishClipboardText(text: string): Promise<{ itemId: string; itemIds: string[]; projectionCount: number }> {
     this.requireSendPolicy(this.sendPolicyRevision);
     if (!isClipboardText(text)) {
       throw new RuntimeError(
@@ -1392,7 +1453,7 @@ export class CopyytServiceWorkerRuntime {
     return this.publishClipboardPayload(clipboardPayloadFromPlainText(text));
   }
 
-  async publishClipboardPayload(payload: ClipboardPayloadV1): Promise<{ itemId: string }> {
+  async publishClipboardPayload(payload: ClipboardPayloadV1): Promise<{ itemId: string; itemIds: string[]; projectionCount: number }> {
     const sendPolicyRevision = this.sendPolicyRevision;
     this.requireSendPolicy(sendPolicyRevision);
     try {
@@ -1405,15 +1466,6 @@ export class CopyytServiceWorkerRuntime {
     }
     const session = this.requireSession();
     this.requireSocketReady();
-    let textPayload: ClipboardPayloadV1;
-    try {
-      textPayload = projectClipboardPayloadToText(payload);
-    } catch {
-      throw new RuntimeError(
-        "UNSUPPORTED_CLIPBOARD_CONTENT",
-        "This clipboard content cannot be sent by the current sync transport",
-      );
-    }
     await this.ensureAccountInitialized();
     const identity = await this.identityLoader(session.user.id);
     if (!identity || identity.keyVersion === null) {
@@ -1486,40 +1538,93 @@ export class CopyytServiceWorkerRuntime {
         server: serverDeviceById.get(recipient.deviceId) ?? {},
       }),
     );
-    const wirePayload = selectClipboardWirePayload({
-      payload: textPayload,
-      recipients: wireRecipients,
-    });
-    let envelope: ClipboardItemEnvelope;
+    let projections;
     try {
-      envelope = await this.encrypt({
-        userId: session.user.id,
-        identity,
-        plaintext: wirePayload.plaintext,
-        contentType: wirePayload.contentType,
-        expiresAt: new Date(
-          this.now().getTime() + LIVE_CLIPBOARD_TTL_MS,
-        ),
-        recipients,
+      projections = selectClipboardWirePayloads({
+        payload,
+        recipients: wireRecipients,
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof ClipboardWirePayloadTooLargeError) {
+        throw new RuntimeError(
+          "CLIPBOARD_CONTENT_TOO_LARGE",
+          "The clipboard image is too large for the encrypted relay limit",
+        );
+      }
       throw new RuntimeError(
-        "ENCRYPTION_FAILED",
-        "Clipboard encryption failed",
+        "UNSUPPORTED_CLIPBOARD_CONTENT",
+        "This clipboard content has no compatible recipient representation",
       );
     }
-    this.requireSendPolicy(sendPolicyRevision);
-    // Record before emitting so a synchronous self-echo cannot rewrite the
-    // clipboard, and so the decision survives a worker restart.
-    await this.dependencies.outboundItemStore.mark({
-      userId: session.user.id,
-      itemId: envelope.itemId,
-      publishedAt: this.now().toISOString(),
-      sourceDeviceId: envelope.sourceDeviceId,
+    if (projections.length === 0) {
+      throw new RuntimeError(
+        "UNSUPPORTED_CLIPBOARD_CONTENT",
+        "No selected device can receive this clipboard image",
+      );
+    }
+
+    const recipientByWire = new Map<
+      ClipboardWireRecipient,
+      ClientVerifiedDevice
+    >();
+    wireRecipients.forEach((wireRecipient, index) => {
+      recipientByWire.set(wireRecipient, recipients[index]!);
     });
+    const envelopes: ClipboardItemEnvelope[] = [];
+    for (const projection of projections) {
+      const projectionRecipients = projection.recipients.map((recipient) =>
+        recipientByWire.get(recipient),
+      );
+      if (projectionRecipients.some((recipient) => !recipient)) {
+        throw new RuntimeError(
+          "UNSUPPORTED_CLIPBOARD_CONTENT",
+          "Clipboard recipient projection could not be resolved",
+        );
+      }
+      try {
+        envelopes.push(
+          await this.encrypt({
+            userId: session.user.id,
+            identity,
+            plaintext: projection.wirePayload.plaintext,
+            contentType: projection.wirePayload.contentType,
+            expiresAt: new Date(
+              this.now().getTime() + LIVE_CLIPBOARD_TTL_MS,
+            ),
+            recipients: projectionRecipients as ClientVerifiedDevice[],
+          }),
+        );
+      } catch (error) {
+        if (error instanceof Error && /size limit/i.test(error.message)) {
+          throw new RuntimeError(
+            "CLIPBOARD_CONTENT_TOO_LARGE",
+            "The clipboard image is too large for the encrypted relay limit",
+          );
+        }
+        throw new RuntimeError(
+          "ENCRYPTION_FAILED",
+          "Clipboard encryption failed",
+        );
+      }
+    }
     this.requireSendPolicy(sendPolicyRevision);
-    await this.emitPublish(envelope);
-    return { itemId: envelope.itemId };
+    // Record every envelope before emitting so synchronous self-echoes cannot
+    // rewrite the clipboard and the projection decision survives a restart.
+    for (const envelope of envelopes) {
+      await this.dependencies.outboundItemStore.mark({
+        userId: session.user.id,
+        itemId: envelope.itemId,
+        publishedAt: this.now().toISOString(),
+        sourceDeviceId: envelope.sourceDeviceId,
+      });
+    }
+    this.requireSendPolicy(sendPolicyRevision);
+    for (const envelope of envelopes) await this.emitPublish(envelope);
+    return {
+      itemId: envelopes[0]!.itemId,
+      itemIds: envelopes.map((envelope) => envelope.itemId),
+      projectionCount: envelopes.length,
+    };
   }
 
   async receiveClipboardItem(payload: unknown): Promise<void> {
@@ -1695,9 +1800,29 @@ export class CopyytServiceWorkerRuntime {
         }
         return;
       }
-      // HTML stays inert data in this phase. Decode and extract the fallback
-      // before the final policy barrier, with no async gap before the OS write.
+      // HTML and PNG stay inert data until all envelope and payload checks have
+      // completed. PNG validation here is the last barrier before it can be
+      // persisted as an encrypted-envelope reference or exposed to the popup.
       const plain = findPlainTextRepresentation(clipboardPayload);
+      const receivedPng = getPngRepresentation(clipboardPayload);
+      if (receivedPng) {
+        try {
+          getPngBytes(clipboardPayload);
+        } catch {
+          await this.dependencies.processedItemStore.mark({
+            userId: session.user.id,
+            itemId: envelope.itemId,
+            processedAt: this.now().toISOString(),
+            sourceDeviceId: envelope.sourceDeviceId,
+            disposition: "invalid-content",
+          });
+          this.recordSyncError(
+            "INVALID_CLIPBOARD_CONTENT",
+            "The incoming clipboard image is invalid",
+          );
+          return;
+        }
+      }
       if (!this.isReceivePolicyCurrent(receivePolicyRevision)) {
         await this.dependencies.processedItemStore.mark({
           userId: session.user.id,
@@ -1708,7 +1833,7 @@ export class CopyytServiceWorkerRuntime {
         });
         return;
       }
-      if (!this.dependencies.clipboardAdapter.writePayload && !plain) {
+      if (!this.dependencies.clipboardAdapter.writePayload && !plain && !receivedPng) {
         await this.dependencies.processedItemStore.mark({
           userId: session.user.id,
           itemId: envelope.itemId,
@@ -1722,10 +1847,28 @@ export class CopyytServiceWorkerRuntime {
         );
         return;
       }
+      if (receivedPng) {
+        await this.pendingAssistedImageStore.put({
+          userId: session.user.id,
+          itemId: envelope.itemId,
+          sourceDeviceId: envelope.sourceDeviceId,
+          ...(source.name ? { sourceDeviceName: source.name } : {}),
+          receivedAt: this.now().toISOString(),
+          expiresAt: String(envelope.expiresAt),
+          hasPng: true,
+          envelope,
+        });
+      }
+
+      // The offscreen writer is intentionally given only the compatible text
+      // projection. An image-only item never reaches WRITE_PAYLOAD.
+      const textPayload = plain
+        ? projectClipboardPayloadToText(clipboardPayload)
+        : undefined;
       try {
-        if (this.dependencies.clipboardAdapter.writePayload) {
-          await this.dependencies.clipboardAdapter.writePayload(clipboardPayload);
-        } else {
+        if (textPayload && this.dependencies.clipboardAdapter.writePayload) {
+          await this.dependencies.clipboardAdapter.writePayload(textPayload);
+        } else if (plain) {
           await this.dependencies.clipboardAdapter.writeText(plain!.data);
         }
       } catch {
@@ -1739,8 +1882,9 @@ export class CopyytServiceWorkerRuntime {
         itemId: envelope.itemId,
         processedAt: this.now().toISOString(),
         sourceDeviceId: envelope.sourceDeviceId,
-        disposition: "applied",
+        disposition: receivedPng ? "pending-image" : "applied",
       });
+      if (receivedPng) await this.refreshPendingAssistedImageStatus();
     } catch (error) {
       const runtimeError = asRuntimeError(
         error,
@@ -1753,9 +1897,147 @@ export class CopyytServiceWorkerRuntime {
     }
   }
 
+  private async pngFingerprint(bytes: Uint8Array): Promise<string> {
+    const digest = await sha256(bytes);
+    return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  private async copyPendingImage(itemId: string): Promise<{
+    itemId: string;
+    pngBytes: Uint8Array;
+  }> {
+    if (typeof itemId !== "string" || itemId.length === 0) {
+      throw new RuntimeError(
+        "UNSUPPORTED_CLIPBOARD_CONTENT",
+        "The pending clipboard image reference is invalid",
+      );
+    }
+    const session = this.requireSession();
+    const record = await this.pendingAssistedImageStore.get(
+      session.user.id,
+      itemId,
+    );
+    if (!record) {
+      await this.refreshPendingAssistedImageStatus();
+      throw new RuntimeError(
+        "UNSUPPORTED_CLIPBOARD_CONTENT",
+        "The pending clipboard image has expired",
+      );
+    }
+    const now = this.now().getTime();
+    const expiresAt = parseStrictExpiry(record.expiresAt);
+    if (
+      expiresAt === null ||
+      now >= expiresAt ||
+      !isLiveExpiryWithinPolicy(expiresAt, now)
+    ) {
+      await this.pendingAssistedImageStore.remove(session.user.id, itemId);
+      await this.refreshPendingAssistedImageStatus();
+      throw new RuntimeError(
+        "UNSUPPORTED_CLIPBOARD_CONTENT",
+        "The pending clipboard image has expired",
+      );
+    }
+    if (!this.status.syncPreferences.receiveEnabled) {
+      throw new RuntimeError(
+        "CLIPBOARD_WRITE_FAILED",
+        "Clipboard receiving is disabled for this device",
+      );
+    }
+
+    const identity = await this.identityLoader(session.user.id);
+    if (!identity || identity.keyVersion === null) {
+      throw new RuntimeError(
+        "DEVICE_NOT_REGISTERED",
+        "The device is not registered",
+      );
+    }
+    const source = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      record.sourceDeviceId,
+    );
+    if (!isLocallyVerified(source)) {
+      await this.discardPendingImage(session.user.id, itemId);
+      throw new RuntimeError(
+        "SOURCE_UNTRUSTED",
+        "The clipboard source is not locally trusted",
+      );
+    }
+    let decrypted: { plaintextBytes: Uint8Array };
+    try {
+      decrypted = await this.decrypt({
+        userId: session.user.id,
+        identity,
+        envelope: record.envelope,
+        trustStore: this.dependencies.trustStore,
+      });
+    } catch {
+      await this.discardPendingImage(session.user.id, itemId);
+      throw new RuntimeError(
+        "DECRYPTION_FAILED",
+        "Clipboard decryption or verification failed",
+      );
+    }
+    if (record.envelope.contentType !== CLIPBOARD_BUNDLE_V1_MIME) {
+      await this.discardPendingImage(session.user.id, itemId);
+      throw new RuntimeError(
+        "INVALID_CLIPBOARD_CONTENT",
+        "The pending clipboard image bundle is invalid",
+      );
+    }
+    let pngBytes: Uint8Array;
+    try {
+      const payload = decodeClipboardBundleV1(decrypted.plaintextBytes);
+      pngBytes = getPngBytes(payload);
+    } catch {
+      await this.discardPendingImage(session.user.id, itemId);
+      throw new RuntimeError(
+        "INVALID_CLIPBOARD_CONTENT",
+        "The pending clipboard image is invalid",
+      );
+    }
+
+    // Persist only a short-lived fingerprint before returning the transient
+    // bytes. This survives a worker restart between ClipboardItem.write() and
+    // the next offscreen poll without persisting any image plaintext.
+    const fingerprint = await this.pngFingerprint(pngBytes);
+    const suppressionExpiry = new Date(
+      Math.min(
+        expiresAt,
+        now + ASSISTED_PNG_SUPPRESSION_TTL_MS,
+      ),
+    ).toISOString();
+    await this.assistedPngSuppressionStore.put({
+      userId: session.user.id,
+      itemId,
+      payloadFingerprint: fingerprint,
+      expiresAt: suppressionExpiry,
+    });
+    return { itemId, pngBytes };
+  }
+
+  private async completePendingImage(itemId: string): Promise<void> {
+    const session = this.requireSession();
+    await this.pendingAssistedImageStore.remove(session.user.id, itemId);
+    await this.assistedPngSuppressionStore.remove(session.user.id, itemId);
+    await this.refreshPendingAssistedImageStatus();
+  }
+
+  private async discardPendingImage(userId: string, itemId: string): Promise<void> {
+    await this.pendingAssistedImageStore.remove(userId, itemId).catch(() => undefined);
+    await this.assistedPngSuppressionStore.remove(userId, itemId).catch(() => undefined);
+    await this.refreshPendingAssistedImageStatus().catch(() => undefined);
+  }
+
+  private async releasePendingImage(itemId: string): Promise<void> {
+    const session = this.requireSession();
+    await this.assistedPngSuppressionStore.remove(session.user.id, itemId);
+  }
+
   private async handleCommand(command: RuntimeCommand): Promise<unknown> {
     switch (command.type) {
       case "runtime:get-status":
+        await this.refreshPendingAssistedImageStatus().catch(() => undefined);
         if (this.session && !this.isSocketTransportReady()) {
           // Status is intentionally non-blocking. The recovery operation is
           // single-flight and continues after this response is delivered.
@@ -1834,6 +2116,14 @@ export class CopyytServiceWorkerRuntime {
           return this.publishClipboardPayload(payload);
         }
       }
+      case "runtime:copy-pending-image":
+        return this.copyPendingImage(command.itemId);
+      case "runtime:complete-pending-image":
+        await this.completePendingImage(command.itemId);
+        return this.getStatus();
+      case "runtime:release-pending-image":
+        await this.releasePendingImage(command.itemId);
+        return this.getStatus();
       case "runtime:bootstrap-trust-anchor":
         return this.bootstrapTrustAnchor();
       case "runtime:refresh-onboarding":
@@ -2102,6 +2392,7 @@ export class CopyytServiceWorkerRuntime {
 
     if (!expected) this.sessionGeneration += 1;
     await this.enqueueSessionMutation(async () => {
+      const previousUserId = this.session?.user.id;
       if (
         expected &&
         (this.session !== expected.session ||
@@ -2118,6 +2409,10 @@ export class CopyytServiceWorkerRuntime {
         this.session.accessToken !== response.accessToken
       ) {
         this.destroySocket(this.socket);
+      }
+      if (previousUserId && previousUserId !== session.user.id) {
+        await this.pendingAssistedImageStore.clearUser(previousUserId);
+        await this.assistedPngSuppressionStore.clearUser(previousUserId);
       }
       await this.dependencies.sessionStore.set(session);
       // A clearSession() can invalidate a refresh while the storage write is
@@ -2199,6 +2494,7 @@ export class CopyytServiceWorkerRuntime {
   }
 
   private async clearSession(): Promise<void> {
+    const previousUserId = this.session?.user.id;
     this.sessionGeneration += 1;
     this.session = null;
     this.destroySocket(this.socket);
@@ -2209,9 +2505,16 @@ export class CopyytServiceWorkerRuntime {
       connectionState: "signed-out",
       syncPreferences: { ...this.status.syncPreferences },
     });
+    const pendingImageCleanup = previousUserId
+      ? Promise.all([
+          this.pendingAssistedImageStore.clearUser(previousUserId),
+          this.assistedPngSuppressionStore.clearUser(previousUserId),
+        ]).catch(() => undefined)
+      : Promise.resolve();
     await this.enqueueSessionMutation(() =>
       this.dependencies.sessionStore.clear(),
     );
+    await pendingImageCleanup;
     await this.ensureRecoveryAlarm();
   }
 
@@ -3511,6 +3814,11 @@ export class CopyytServiceWorkerRuntime {
         });
       }
       if (this.serverDeviceState !== "trusted") {
+        await this.pendingAssistedImageStore.clearUser(session.user.id).catch(() => undefined);
+        await this.assistedPngSuppressionStore.clearUser(session.user.id).catch(() => undefined);
+        if ((this.status.pendingAssistedImages?.length ?? 0) > 0) {
+          this.setStatus({ ...this.status, pendingAssistedImages: [] });
+        }
         this.destroySocket(this.socket);
         this.setAccountAuthenticatedWithoutSocket();
       }
@@ -3703,6 +4011,8 @@ export class CopyytServiceWorkerRuntime {
     if (
       code === "CLIPBOARD_READ_FAILED" ||
       code === "CLIPBOARD_WRITE_FAILED" ||
+      code === "UNSUPPORTED_CLIPBOARD_CONTENT" ||
+      code === "INVALID_CLIPBOARD_CONTENT" ||
       code === "NO_VERIFIED_RECIPIENTS" ||
       code === "ENCRYPTION_FAILED" ||
       code === "DECRYPTION_FAILED" ||
@@ -3712,6 +4022,7 @@ export class CopyytServiceWorkerRuntime {
       code === "DEVICE_NOT_LOCALLY_TRUSTED" ||
       code === "DEVICE_NOT_REGISTERED" ||
       code === "CLIPBOARD_SEND_DISABLED" ||
+      code === "CLIPBOARD_CONTENT_TOO_LARGE" ||
       code === "SYNC_PREFERENCES_INVALID"
     ) {
       this.recordSyncError(code, message);
