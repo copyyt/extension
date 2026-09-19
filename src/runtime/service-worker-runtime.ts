@@ -20,7 +20,14 @@ import {
   validateClipboardPayloadV1,
   type ClipboardPayloadV1,
 } from "../clipboard/payload.ts";
-import { CLIPBOARD_RECEIVE_CAPABILITIES } from "../clipboard/capabilities.ts";
+import {
+  CLIPBOARD_RECEIVE_CAPABILITIES,
+  validClipboardCapabilities,
+} from "../clipboard/capabilities.ts";
+import {
+  selectClipboardWirePayload,
+  type ClipboardWireRecipient,
+} from "../clipboard/wire-payload.ts";
 import {
   registerCurrentDevice,
   type ApproveDeviceRequest,
@@ -154,6 +161,8 @@ export interface RuntimeDependencies {
     clear: () => Promise<void> | void;
   };
 }
+
+export { selectClipboardWirePayload } from "../clipboard/wire-payload.ts";
 
 const DEFAULT_STATUS: RuntimeStatus = {
   connectionState: "signed-out",
@@ -1376,9 +1385,6 @@ export class CopyytServiceWorkerRuntime {
         "The clipboard payload is invalid",
       );
     }
-    // Phase 2C.1 can retain rich data locally, but every recipient, including
-    // public 2.0.x clients, still receives the exact raw text/plain fallback.
-    const text = getPlainTextRepresentation(payload).data;
     const session = this.requireSession();
     this.requireSocketReady();
     await this.ensureAccountInitialized();
@@ -1389,7 +1395,9 @@ export class CopyytServiceWorkerRuntime {
         "The device must be registered before publishing",
       );
     }
-    const activeServerDevices = await this.refreshServerDevices(session);
+    const activeServerDevices = (await this.refreshServerDevices(session)).filter(
+      (device) => device.trustState === "trusted",
+    );
     const localRecipients =
       await this.dependencies.trustStore.listEncryptionRecipients(
         session.user.id,
@@ -1442,13 +1450,26 @@ export class CopyytServiceWorkerRuntime {
         "No locally verified devices are available for encrypted delivery",
       );
     }
+    const serverDeviceById = new Map(
+      activeServerDevices.map((device) => [device.deviceId, device]),
+    );
+    const wireRecipients: ClipboardWireRecipient[] = recipients.map(
+      (recipient) => ({
+        local: recipient,
+        server: serverDeviceById.get(recipient.deviceId) ?? {},
+      }),
+    );
+    const wirePayload = selectClipboardWirePayload({
+      payload,
+      recipients: wireRecipients,
+    });
     let envelope: ClipboardItemEnvelope;
     try {
       envelope = await this.encrypt({
         userId: session.user.id,
         identity,
-        plaintext: text,
-        contentType: "text/plain",
+        plaintext: wirePayload.plaintext,
+        contentType: wirePayload.contentType,
         expiresAt: new Date(
           this.now().getTime() + LIVE_CLIPBOARD_TTL_MS,
         ),
@@ -2516,7 +2537,7 @@ export class CopyytServiceWorkerRuntime {
       await this.dependencies.trustStore.upsertServerReportedDevice({
         userId: session.user.id,
         ...serverDevice,
-        capabilities: [...serverDevice.capabilities],
+        capabilities: validClipboardCapabilities(serverDevice.capabilities),
         trustState: serverDevice.trustState,
       });
     }
@@ -2632,7 +2653,7 @@ export class CopyytServiceWorkerRuntime {
       await this.dependencies.trustStore.upsertServerReportedDevice({
         userId: session.user.id,
         ...device,
-        capabilities: [...device.capabilities],
+        capabilities: validClipboardCapabilities(device.capabilities),
         trustState: device.trustState,
       });
     }
@@ -3416,7 +3437,7 @@ export class CopyytServiceWorkerRuntime {
         signingPublicKey: device.signingPublicKey,
         name: device.name,
         platform: device.platform,
-        capabilities: [...device.capabilities],
+        capabilities: validClipboardCapabilities(device.capabilities),
         appVersion: device.appVersion,
         trustState: device.trustState,
       });

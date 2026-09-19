@@ -3586,6 +3586,57 @@ test("rich automatic and manual observations stay legacy on the network", async 
   assert.deepEqual(applied[applied.length - 1], rich.payload);
 });
 
+test("rich publish encrypts one exact bundle for the full rich-capable recipient set", async () => {
+  const rich = richClipboardBundle("rich network fallback");
+  const richCurrent = {
+    ...registeredDevice,
+    capabilities: ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
+  };
+  const richRecipient = {
+    ...pendingDevice,
+    trustState: "trusted",
+    capabilities: ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
+  };
+  const pairing = makePairingTrustStore(identity, richCurrent);
+  const localRoot = pairing.records.get(`${user.id}:${identity.deviceId}`);
+  assert.ok(localRoot);
+  pairing.records.set(`${user.id}:${identity.deviceId}`, {
+    ...localRoot,
+    capabilities: [...richCurrent.capabilities],
+  });
+  putLocalRecord(pairing.records, richRecipient, "verified", {
+    capabilities: [...richRecipient.capabilities],
+  });
+  const encryptInputs: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0][] = [];
+  const setup = await startReady({
+    registeredDevice: richCurrent,
+    trustStore: pairing.trustStore,
+    listDevices: async () => response([richCurrent, richRecipient]),
+    encrypt: async (input) => {
+      encryptInputs.push(input);
+      return {
+        ...inboundEnvelope("rich-network-publish"),
+        contentType: input.contentType,
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+
+  await setup.runtime.publishClipboardPayload(rich.payload);
+
+  assert.equal(encryptInputs.length, 1);
+  assert.equal(encryptInputs[0]?.contentType, CLIPBOARD_BUNDLE_V1_MIME);
+  assert.deepEqual(encryptInputs[0]?.plaintext, rich.bytes);
+  assert.deepEqual(
+    encryptInputs[0]?.recipients.map((recipient) => recipient.deviceId).sort(),
+    [identity.deviceId, richRecipient.deviceId].sort(),
+  );
+  assert.equal(
+    setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
+    1,
+  );
+});
+
 test("an offscreen clipboard change routes to automatic publish without popup involvement", async () => {
   const encryptedTexts: string[] = [];
   const setup = await startReady({
