@@ -2,8 +2,6 @@ import {
   clipboardPayloadFromPlainText,
   clipboardPayloadFromPngBytes,
   getHtmlRepresentation,
-  getPngBytes,
-  getPngRepresentation,
   findPlainTextRepresentation,
   validateClipboardPayloadV1,
   type ClipboardPayloadV1,
@@ -29,7 +27,6 @@ export interface ClipboardDataItemLike {
 export interface ClipboardDataItemsLike {
   readonly length: number;
   item(index: number): ClipboardDataItemLike | null;
-  add(data: Blob | File): unknown;
 }
 
 export interface ClipboardDataLike {
@@ -183,35 +180,35 @@ export function getPngFileFromClipboardData(
   return undefined;
 }
 
-function createPngClipboardFile(bytes: Uint8Array): Blob | File {
-  const FileConstructor = globalThis.File;
-  if (typeof FileConstructor === "function") {
-    return new FileConstructor([bytes], "copyyt.png", { type: "image/png" });
-  }
-  return new Blob([bytes], { type: "image/png" });
-}
-
 /**
- * Apply all supported formats that can be applied by this clipboard data
- * store, returning the exact valid payload that was actually accepted. Image
- * application is deliberately best-effort when a text fallback exists.
+ * Chrome's MV3 offscreen clipboard writer intentionally supports text only.
+ * The service worker cannot use the document Clipboard API directly, and the
+ * offscreen document cannot satisfy its focus requirement. In real Chrome,
+ * execCommand("copy") plus DataTransfer.items.add(File) produced a file-style
+ * clipboard result named copyyt.png instead of a native image entry. Keep
+ * image/png as a read/model capability for future assisted or native clients,
+ * but never apply it from this writer.
  */
-export function setClipboardDataFromPayload(
+export function setChromeOffscreenClipboardDataFromPayload(
   data: ClipboardDataLike,
   payload: ClipboardPayloadV1,
 ): ClipboardPayloadV1 {
   validateClipboardPayloadV1(payload);
 
-  const applied = new Set<string>();
   const plain = findPlainTextRepresentation(payload);
-  if (plain) {
-    try {
-      data.setData("text/plain", plain.data);
-      applied.add("text/plain");
-    } catch {
-      // Keep trying independent formats. A successful image-only application
-      // is still a truthful result when the plain channel is unavailable.
-    }
+  if (!plain) {
+    throw new Error(
+      "Chrome offscreen clipboard writing does not support image/png",
+    );
+  }
+
+  const applied = new Set<string>();
+  try {
+    data.setData("text/plain", plain.data);
+    applied.add("text/plain");
+  } catch {
+    // Keep trying independent formats. The caller will reject if no text
+    // representation was actually accepted.
   }
 
   const html = getHtmlRepresentation(payload);
@@ -221,24 +218,6 @@ export function setClipboardDataFromPayload(
       applied.add("text/html");
     } catch {
       // Return the plain fallback if the richer text channel is unavailable.
-    }
-  }
-
-  const png = getPngRepresentation(payload);
-  if (png) {
-    try {
-      if (!data.items || Array.isArray(data.items)) {
-        throw new Error("Clipboard image items are unavailable");
-      }
-      const result = (data.items as ClipboardDataItemsLike).add(
-        createPngClipboardFile(getPngBytes(payload)),
-      );
-      if (result === null || result === undefined) {
-        throw new Error("Clipboard image item was not applied");
-      }
-      applied.add("image/png");
-    } catch {
-      // Text formats, if any, remain the actual applied clipboard value.
     }
   }
 
@@ -257,6 +236,10 @@ export function setClipboardDataFromPayload(
   validateClipboardPayloadV1(actual);
   return actual;
 }
+
+/** @deprecated Use setChromeOffscreenClipboardDataFromPayload explicitly. */
+export const setClipboardDataFromPayload =
+  setChromeOffscreenClipboardDataFromPayload;
 
 export function clipboardPayloadsEqual(
   left: ClipboardPayloadV1,

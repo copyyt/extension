@@ -5,7 +5,7 @@ import {
   clipboardPayloadFromClipboardFile,
   clipboardPayloadsEqual,
   getPngFileFromClipboardData,
-  setClipboardDataFromPayload,
+  setChromeOffscreenClipboardDataFromPayload,
   type ClipboardDataLike,
 } from "./clipboard-data.ts";
 import {
@@ -133,15 +133,14 @@ test("clipboard data writing sets exact plain and HTML without interpretation", 
       { mime: "text/plain", encoding: "utf-8", data: "fallback" },
     ],
   };
-  setClipboardDataFromPayload(clipboardData(values), payload);
+  setChromeOffscreenClipboardDataFromPayload(clipboardData(values), payload);
   assert.deepEqual(values, { "text/plain": "fallback", "text/html": html });
 });
 
-test("PNG clipboard data is assembled and written as exact opaque bytes", async () => {
+test("PNG clipboard data is captured as exact opaque bytes", async () => {
   const bytes = new Uint8Array([
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02, 0x03,
   ]);
-  const image = clipboardPayloadFromPngBytes(bytes);
   const readFile = {
     arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
   };
@@ -154,22 +153,84 @@ test("PNG clipboard data is assembled and written as exact opaque bytes", async 
     getPngFileFromClipboardData(fromItems),
     readFile,
   );
+});
 
-  const added: Blob[] = [];
-  const target = clipboardData({}, ["text/plain"]);
+test("Chrome offscreen image-only writes fail before touching clipboard data", () => {
+  const image = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]),
+  );
+  const values: Record<string, string> = {};
+  let addCalls = 0;
+  const target = clipboardData(values, ["Files"]);
   (target as { items: unknown }).items = {
     length: 0,
     item: () => null,
-    add: (value: Blob) => {
-      added.push(value);
+    add: () => {
+      addCalls += 1;
       return {};
     },
   };
-  const actual = setClipboardDataFromPayload(target, image);
-  assert.deepEqual(actual, image);
-  assert.equal(added.length, 1);
-  assert.equal(added[0]!.type, "image/png");
-  assert.deepEqual(new Uint8Array(await added[0]!.arrayBuffer()), bytes);
+
+  assert.throws(
+    () => setChromeOffscreenClipboardDataFromPayload(target, image),
+    /does not support image\/png/,
+  );
+  assert.deepEqual(values, {});
+  assert.equal(addCalls, 0);
+  assert.equal(Object.values(values).includes("copyyt.png"), false);
+  assert.equal(Object.values(values).includes(""), false);
+});
+
+test("Chrome offscreen PNG downgrade applies exact plain text only", () => {
+  const image = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 2]),
+  );
+  const payload: ClipboardPayloadV1 = {
+    version: 1,
+    representations: [
+      { mime: "text/plain", encoding: "utf-8", data: "\uFEFF exact\r\n" },
+      ...image.representations,
+    ],
+  };
+  const values: Record<string, string> = {};
+  const actual = setChromeOffscreenClipboardDataFromPayload(
+    clipboardData(values),
+    payload,
+  );
+
+  assert.deepEqual(actual, {
+    version: 1,
+    representations: [payload.representations[0]],
+  });
+  assert.deepEqual(values, { "text/plain": "\uFEFF exact\r\n" });
+});
+
+test("Chrome offscreen PNG downgrade applies exact plain text and HTML only", () => {
+  const image = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 3]),
+  );
+  const payload: ClipboardPayloadV1 = {
+    version: 1,
+    representations: [
+      { mime: "text/html", encoding: "utf-8", data: "<b>\uFEFF rich</b>" },
+      { mime: "text/plain", encoding: "utf-8", data: "\uFEFF rich\r\n" },
+      ...image.representations,
+    ],
+  };
+  const values: Record<string, string> = {};
+  const actual = setChromeOffscreenClipboardDataFromPayload(
+    clipboardData(values),
+    payload,
+  );
+
+  assert.deepEqual(actual, {
+    version: 1,
+    representations: payload.representations.slice(0, 2),
+  });
+  assert.deepEqual(values, {
+    "text/plain": "\uFEFF rich\r\n",
+    "text/html": "<b>\uFEFF rich</b>",
+  });
 });
 
 test("oversized PNGs preserve supported text and fail cleanly without text", async () => {
@@ -186,7 +247,7 @@ test("oversized PNGs preserve supported text and fail cleanly without text", asy
   );
 });
 
-test("PNG application failure returns the actual text fallback", () => {
+test("PNG application is omitted from the actual text fallback", () => {
   const payload: ClipboardPayloadV1 = {
     version: 1,
     representations: [
@@ -199,61 +260,12 @@ test("PNG application failure returns the actual text fallback", () => {
       },
     ],
   };
-  const target = clipboardData({}, ["text/plain", "text/html"]);
-  (target as { items: unknown }).items = {
-    length: 0,
-    item: () => null,
-    add: () => {
-      throw new Error("image unsupported");
-    },
-  };
-  const actual = setClipboardDataFromPayload(target, payload);
+  const actual = setChromeOffscreenClipboardDataFromPayload(
+    clipboardData({}, ["text/plain", "text/html"]),
+    payload,
+  );
   assert.deepEqual(actual, {
     version: 1,
     representations: payload.representations.slice(0, 2),
   });
-});
-
-test("PNG add returning null returns the actual text fallback", () => {
-  const payload: ClipboardPayloadV1 = {
-    version: 1,
-    representations: [
-      { mime: "text/plain", encoding: "utf-8", data: "plain" },
-      { mime: "text/html", encoding: "utf-8", data: "<b>plain</b>" },
-      {
-        mime: "image/png",
-        encoding: "base64",
-        data: "iVBORw0KGgoBAgM=",
-      },
-    ],
-  };
-  const target = clipboardData({}, ["text/plain", "text/html"]);
-  (target as { items: unknown }).items = {
-    length: 0,
-    item: () => null,
-    add: () => null,
-  };
-
-  const actual = setClipboardDataFromPayload(target, payload);
-  assert.deepEqual(actual, {
-    version: 1,
-    representations: payload.representations.slice(0, 2),
-  });
-});
-
-test("PNG add returning null fails an image-only write", () => {
-  const payload = clipboardPayloadFromPngBytes(
-    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]),
-  );
-  const target = clipboardData({}, ["Files"]);
-  (target as { items: unknown }).items = {
-    length: 0,
-    item: () => null,
-    add: () => null,
-  };
-
-  assert.throws(
-    () => setClipboardDataFromPayload(target, payload),
-    /No supported clipboard representation could be applied/,
-  );
 });

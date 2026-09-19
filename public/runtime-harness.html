@@ -20,10 +20,65 @@
     if (!clipboard?.ok) {
       throw new Error(`${clipboard?.error?.code || "CLIPBOARD_TEST_FAILED"}: ${clipboard?.error?.message || "clipboard test failed"}`);
     }
+
+    // The service worker creates the offscreen document for the text smoke
+    // test above. Exercise the typed offscreen writer directly so this harness
+    // covers the Chrome-specific PNG application boundary as well.
+    const offscreenRequest = (type, payload) =>
+      chrome.runtime.sendMessage({
+        source: "service-worker",
+        target: "offscreen",
+        requestId: crypto.randomUUID(),
+        type,
+        ...(payload === undefined ? {} : { payload }),
+      });
+    const png = {
+      version: 1,
+      representations: [{
+        mime: "image/png",
+        encoding: "base64",
+        data: "iVBORw0KGgoBAgM=",
+      }],
+    };
+    const mixed = {
+      version: 1,
+      representations: [
+        { mime: "text/plain", encoding: "utf-8", data: "harness plain" },
+        { mime: "text/html", encoding: "utf-8", data: "<b>harness plain</b>" },
+        png.representations[0],
+      ],
+    };
+    const mixedResult = await offscreenRequest("WRITE_PAYLOAD", mixed);
+    const mixedMimes = mixedResult?.payload?.representations?.map((item) => item.mime);
+    if (mixedResult?.type !== "WRITE_PAYLOAD_RESULT" ||
+        JSON.stringify(mixedMimes) !== JSON.stringify(["text/plain", "text/html"])) {
+      throw new Error("text + HTML + PNG was not truthfully downgraded");
+    }
+
+    const sentinel = `copyyt-before-image-${crypto.randomUUID()}`;
+    const sentinelResult = await offscreenRequest("WRITE_PAYLOAD", {
+      version: 1,
+      representations: [{ mime: "text/plain", encoding: "utf-8", data: sentinel }],
+    });
+    if (sentinelResult?.type !== "WRITE_PAYLOAD_RESULT") {
+      throw new Error("text WRITE_PAYLOAD failed before image-only check");
+    }
+    const imageResult = await offscreenRequest("WRITE_PAYLOAD", png);
+    if (imageResult?.type !== "ERROR" || imageResult.error?.code !== "CLIPBOARD_WRITE_FAILED") {
+      throw new Error("image-only WRITE_PAYLOAD did not return a controlled failure");
+    }
+    const afterImage = await offscreenRequest("READ_PAYLOAD");
+    const afterImagePlain = afterImage?.payload?.representations?.find(
+      (item) => item.mime === "text/plain",
+    )?.data;
+    if (afterImagePlain !== sentinel || JSON.stringify(afterImage).includes("copyyt.png")) {
+      throw new Error("image-only WRITE_PAYLOAD changed the clipboard");
+    }
+
     const after = await request({ type: "runtime:get-status" });
     if (!after?.ok) throw new Error(after?.error?.message || "post-test status request failed");
     output.textContent = clipboard.data?.ping && clipboard.data?.readText && clipboard.data?.writeText
-      ? "PASS\nservice worker → offscreen PING/READ_TEXT/WRITE_TEXT → OS clipboard"
+      ? "PASS\ntext + HTML writes, PNG downgrade, and image-only failure verified in Chrome"
       : "FAIL clipboard adapter returned an unsuccessful result";
   } catch (error) {
     output.textContent = `FAIL ${error instanceof Error ? error.message : String(error)}`;

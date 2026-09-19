@@ -627,7 +627,7 @@ test("registration advertises clipboard, bundle-v1, and HTML receive capabilitie
       return { identity, device: registeredDevice };
     },
   });
-  assert.deepEqual(registrations, [["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-v1"]]);
+  assert.deepEqual(registrations, [["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]]);
   assert.equal(setup.runtime.getStatus().device.deviceId, identity.deviceId);
   assert.equal(setup.runtime.getStatus().syncReady, true);
 });
@@ -748,7 +748,7 @@ test("mixed local image payloads project to exact text-only network content", as
   assert.equal(typeof encryptInputs[0]!.plaintext === "string" && encryptInputs[0]!.plaintext.includes(image.representations[0]!.data), false);
 });
 
-test("inbound development image bundles reach image adapters and never become placeholder text", async () => {
+test("inbound development image bundles reach the adapter and fail without placeholder text", async () => {
   const image = clipboardPayloadFromPngBytes(
     new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 3]),
   );

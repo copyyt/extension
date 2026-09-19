@@ -9,7 +9,7 @@ import {
 import {
   clipboardPayloadFromClipboardFile,
   getPngFileFromClipboardData,
-  setClipboardDataFromPayload,
+  setChromeOffscreenClipboardDataFromPayload,
   type ClipboardDataLike,
 } from "./clipboard/clipboard-data.ts";
 import {
@@ -128,6 +128,14 @@ function writeClipboardTextFallback(text: string): void {
 function writeClipboardPayload(payload: ClipboardPayloadV1): ClipboardPayloadV1 {
   validateClipboardPayloadV1(payload);
   const plain = findPlainTextRepresentation(payload);
+  if (!plain) {
+    // Reject before creating a copy target or invoking execCommand("copy"),
+    // so an unsupported image-only request cannot replace the clipboard with
+    // an empty value or a browser-generated file name.
+    throw new Error(
+      "Chrome offscreen clipboard writing does not support image/png",
+    );
+  }
   const plainOnly = plain ? clipboardPayloadFromPlainText(plain.data) : undefined;
   const element = createClipboardTextarea();
   let copyEventSeen = false;
@@ -138,7 +146,7 @@ function writeClipboardPayload(payload: ClipboardPayloadV1): ClipboardPayloadV1 
         throw new Error("ClipboardData is unavailable");
       }
       copyEventSeen = true;
-      const actualPayload = setClipboardDataFromPayload(
+      const actualPayload = setChromeOffscreenClipboardDataFromPayload(
         event.clipboardData as unknown as ClipboardDataLike,
         payload,
       );
