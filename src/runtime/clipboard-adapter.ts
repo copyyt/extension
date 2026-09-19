@@ -20,6 +20,7 @@ export interface ClipboardAdapter {
   writeText(text: string): Promise<void>;
   readPayload?(): Promise<ClipboardPayloadV1>;
   writePayload?(payload: ClipboardPayloadV1): Promise<void>;
+  rebaselineFromClipboard?(): Promise<void>;
   ping?(): Promise<void>;
   startWatching?(options?: { resetBaseline?: boolean }): Promise<void>;
   stopWatching?(): Promise<void>;
@@ -45,6 +46,7 @@ function isResponse(value: unknown): value is OffscreenResponse {
       candidate.type === "WRITE_TEXT_RESULT" ||
       candidate.type === "READ_PAYLOAD_RESULT" ||
       candidate.type === "WRITE_PAYLOAD_RESULT" ||
+      candidate.type === "REBASELINE_FROM_CLIPBOARD_RESULT" ||
       candidate.type === "WATCH_START_RESULT" ||
       candidate.type === "WATCH_STOP_RESULT" ||
       candidate.type === "PONG" ||
@@ -170,6 +172,31 @@ export class OffscreenClipboardAdapter implements ClipboardAdapter {
       throw new RuntimeError(
         "CLIPBOARD_WRITE_FAILED",
         "The clipboard adapter returned an invalid payload",
+      );
+    }
+  }
+
+  async rebaselineFromClipboard(): Promise<void> {
+    let response: OffscreenResponse;
+    try {
+      response = await this.send({ type: "REBASELINE_FROM_CLIPBOARD" });
+    } catch {
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The operating-system clipboard could not be re-baselined",
+      );
+    }
+    if (response.type === "ERROR") {
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        response.error?.message ??
+          "The operating-system clipboard could not be re-baselined",
+      );
+    }
+    if (response.type !== "REBASELINE_FROM_CLIPBOARD_RESULT") {
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The clipboard adapter returned an invalid re-baseline response",
       );
     }
   }

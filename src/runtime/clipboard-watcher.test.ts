@@ -418,3 +418,27 @@ test("typed watcher discards an invalidated asynchronous rich read", async () =>
   await flush();
   assert.deepEqual(changed, []);
 });
+
+test("re-baselining invalidates an in-flight poll before it can emit stale PNG data", async () => {
+  let release!: (payload: ClipboardPayloadV1) => void;
+  const pending = new Promise<ClipboardPayloadV1>((resolve) => {
+    release = resolve;
+  });
+  const timers = new FakeTimers();
+  const changed: ClipboardPayloadV1[] = [];
+  const watcher = new ClipboardWatcher({
+    readPayload: () => pending,
+    onPayloadChanged: (payload) => { changed.push(payload); },
+    setIntervalFn: timers.setInterval,
+    clearIntervalFn: timers.clearInterval,
+  });
+  const actualClipboard = pngPayload(2);
+
+  watcher.start();
+  watcher.noteExternalWrite(actualClipboard);
+  release(actualClipboard);
+  await flush();
+
+  assert.deepEqual(changed, []);
+  watcher.stop();
+});

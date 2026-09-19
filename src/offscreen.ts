@@ -249,6 +249,26 @@ chrome.runtime.onMessage.addListener(
         }
       }
 
+      if (request.type === "REBASELINE_FROM_CLIPBOARD") {
+        try {
+          const actualPayload = await readClipboardPayload();
+          clipboardWatcher.noteExternalWrite(actualPayload);
+          return response(request, "REBASELINE_FROM_CLIPBOARD_RESULT");
+        } catch (error) {
+          console.error("COPYyt offscreen clipboard re-baseline failed", error);
+
+          return response(request, "ERROR", {
+            error: {
+              code: "CLIPBOARD_READ_FAILED",
+              message:
+                error instanceof Error
+                  ? `${error.name}: ${error.message}`
+                  : "The operating-system clipboard could not be re-baselined",
+            },
+          });
+        }
+      }
+
       if (request.type === "WATCH_START") {
         clipboardWatcher.start({ resetBaseline: request.resetBaseline === true });
         return response(request, "WATCH_START_RESULT");

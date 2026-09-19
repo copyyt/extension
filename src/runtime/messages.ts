@@ -216,6 +216,7 @@ export interface OffscreenRequest {
     | "WRITE_TEXT"
     | "READ_PAYLOAD"
     | "WRITE_PAYLOAD"
+    | "REBASELINE_FROM_CLIPBOARD"
     | "WATCH_START"
     | "WATCH_STOP"
     | "PING";
@@ -233,6 +234,7 @@ export interface OffscreenResponse {
     | "WRITE_TEXT_RESULT"
     | "READ_PAYLOAD_RESULT"
     | "WRITE_PAYLOAD_RESULT"
+    | "REBASELINE_FROM_CLIPBOARD_RESULT"
     | "WATCH_START_RESULT"
     | "WATCH_STOP_RESULT"
     | "PONG"
@@ -300,6 +302,7 @@ export function isOffscreenRequest(value: unknown): value is OffscreenRequest {
       candidate.type === "WRITE_TEXT" ||
       candidate.type === "READ_PAYLOAD" ||
       candidate.type === "WRITE_PAYLOAD" ||
+      candidate.type === "REBASELINE_FROM_CLIPBOARD" ||
       candidate.type === "WATCH_START" ||
       candidate.type === "WATCH_STOP" ||
       candidate.type === "PING");

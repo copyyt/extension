@@ -143,21 +143,16 @@ class ClockedAssistedPngSuppressionStore implements AssistedPngSuppressionStore 
     this.records.set(`${record.userId}:${record.itemId}`, { ...record });
   }
 
-  async consumeByFingerprint(
-    userId: string,
-    payloadFingerprint: string,
-  ): Promise<boolean> {
+  async consumeNext(userId: string): Promise<boolean> {
     for (const [key, record] of this.records) {
       if (record.userId !== userId) continue;
       if (Date.parse(record.expiresAt) <= this.now()) {
         this.records.delete(key);
         continue;
       }
-      if (record.payloadFingerprint === payloadFingerprint) {
-        this.records.delete(key);
-        this.consumed += 1;
-        return true;
-      }
+      this.records.delete(key);
+      this.consumed += 1;
+      return true;
     }
     return false;
   }
@@ -916,6 +911,244 @@ test("inbound image bundles stay out of the offscreen writer and create pending 
   assert.equal(withoutImageAdapter.runtime.getStatus().lastSyncError, undefined);
 });
 
+test("normalized PNG observations use the assisted guard, not source-byte equality", async () => {
+  const sourceBytes = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x21,
+  ]);
+  const normalizedBytes = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x22,
+  ]);
+  const genuineBytes = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x23,
+  ]);
+  assert.notEqual(
+    bytesToHex(await sha256(sourceBytes)),
+    bytesToHex(await sha256(normalizedBytes)),
+  );
+
+  const sourceImage = clipboardPayloadFromPngBytes(sourceBytes);
+  const normalizedImage = clipboardPayloadFromPngBytes(normalizedBytes);
+  const genuineImage = clipboardPayloadFromPngBytes(genuineBytes);
+  const bundle = encodeClipboardBundleV1(sourceImage);
+  const capableDevice = {
+    ...registeredDevice,
+    capabilities: [...CLIPBOARD_RECEIVE_CAPABILITIES],
+  };
+  const pairing = makePairingTrustStore(identity, capableDevice);
+  const suppressionStore = new InMemoryAssistedPngSuppressionStore();
+  let encryptCalls = 0;
+  let rebaselineCalls = 0;
+  const setup = await startReady({
+    localTrustState: "root",
+    registeredDevice: capableDevice,
+    trustStore: pairing.trustStore,
+    assistedPngSuppressionStore: suppressionStore,
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+      rebaselineFromClipboard: async () => {
+        rebaselineCalls += 1;
+        throw new Error("simulated actual-clipboard read failure");
+      },
+    },
+    decrypt: async () => ({ plaintextBytes: bundle }),
+    encrypt: async (input) => {
+      encryptCalls += 1;
+      return {
+        ...inboundEnvelope(`genuine-normalized-test-${encryptCalls}`),
+        contentType: input.contentType,
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+  await setup.runtime.receiveClipboardItem({
+    ...inboundEnvelope("normalized-png-item"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+  const copied = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:copy-pending-image",
+      itemId: "normalized-png-item",
+    }),
+  );
+  assert.equal(copied.ok, true);
+
+  const completed = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:complete-pending-image",
+      itemId: "normalized-png-item",
+    }),
+  );
+  assert.equal(completed.ok, true);
+  assert.equal(rebaselineCalls, 1);
+  assert.deepEqual(setup.runtime.getStatus().pendingAssistedImages, []);
+
+  await setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: normalizedImage,
+  });
+  assert.equal(encryptCalls, 0);
+  assert.equal(
+    setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
+    0,
+  );
+  assert.equal(await suppressionStore.consumeNext(user.id), false);
+
+  await setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: genuineImage,
+  });
+  assert.equal(encryptCalls, 1);
+  assert.equal(
+    setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
+    1,
+  );
+});
+
+test("a PNG observation racing before re-baseline consumes the durable guard", async () => {
+  const sourceImage = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x31]),
+  );
+  const normalizedImage = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x32]),
+  );
+  const capableDevice = {
+    ...registeredDevice,
+    capabilities: [...CLIPBOARD_RECEIVE_CAPABILITIES],
+  };
+  const pairing = makePairingTrustStore(identity, capableDevice);
+  const suppressionStore = new InMemoryAssistedPngSuppressionStore();
+  let encryptCalls = 0;
+  const setup = await startReady({
+    localTrustState: "root",
+    registeredDevice: capableDevice,
+    trustStore: pairing.trustStore,
+    assistedPngSuppressionStore: suppressionStore,
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+      rebaselineFromClipboard: async () => undefined,
+    },
+    decrypt: async () => ({ plaintextBytes: encodeClipboardBundleV1(sourceImage) }),
+    encrypt: async () => {
+      encryptCalls += 1;
+      throw new Error("the racing assisted PNG must be suppressed");
+    },
+  });
+  await setup.runtime.receiveClipboardItem({
+    ...inboundEnvelope("racing-normalized-png"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+  const copied = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:copy-pending-image",
+      itemId: "racing-normalized-png",
+    }),
+  );
+  assert.equal(copied.ok, true);
+
+  await setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: normalizedImage,
+  });
+  assert.equal(encryptCalls, 0);
+  assert.equal(await suppressionStore.consumeNext(user.id), false);
+
+  const completed = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:complete-pending-image",
+      itemId: "racing-normalized-png",
+    }),
+  );
+  assert.equal(completed.ok, true);
+});
+
+test("successful re-baseline makes the watcher ignore the normalized PNG", async () => {
+  const sourceImage = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x41]),
+  );
+  const normalizedImage = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x42]),
+  );
+  const suppressionStore = new InMemoryAssistedPngSuppressionStore();
+  let clipboard = sourceImage;
+  const watcherRef: {
+    current?: ReturnType<typeof createOffscreenClipboardWatcher>;
+  } = {};
+  const callbacks = new Map<number, () => void>();
+  let nextTimerId = 1;
+  let encryptCalls = 0;
+  const setup = await startReady({
+    assistedPngSuppressionStore: suppressionStore,
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+      rebaselineFromClipboard: async () => {
+        watcherRef.current?.noteExternalWrite(clipboard);
+      },
+    },
+    decrypt: async () => ({ plaintextBytes: encodeClipboardBundleV1(sourceImage) }),
+    encrypt: async () => {
+      encryptCalls += 1;
+      throw new Error("the re-baselined PNG must not publish");
+    },
+  });
+  const watcher = createOffscreenClipboardWatcher({
+    readPayload: () => clipboard,
+    runtime: {
+      sendMessage: (message) => setup.runtime.handleClipboardObservation(message),
+    },
+    setIntervalFn: (handler) => {
+      const id = nextTimerId++;
+      callbacks.set(id, handler);
+      return id as unknown as ReturnType<typeof globalThis.setInterval>;
+    },
+    clearIntervalFn: (handle) => {
+      callbacks.delete(handle as unknown as number);
+    },
+  });
+  watcherRef.current = watcher;
+  watcher.start();
+  await flushRuntimeWork();
+
+  await setup.runtime.receiveClipboardItem({
+    ...inboundEnvelope("successful-png-rebaseline"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+  const copied = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:copy-pending-image",
+      itemId: "successful-png-rebaseline",
+    }),
+  );
+  assert.equal(copied.ok, true);
+
+  clipboard = normalizedImage;
+  const completed = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:complete-pending-image",
+      itemId: "successful-png-rebaseline",
+    }),
+  );
+  assert.equal(completed.ok, true);
+  assert.equal(await suppressionStore.consumeNext(user.id), false);
+
+  for (const callback of [...callbacks.values()]) callback();
+  await flushRuntimeWork();
+  assert.equal(encryptCalls, 0);
+  assert.equal(
+    setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
+    0,
+  );
+  watcher.stop();
+});
+
 test("assisted PNG suppression survives live envelope expiry until the watcher interval", async () => {
   const baseTime = Date.now();
   let nowMs = baseTime;
@@ -1111,10 +1344,7 @@ test("assisted completion leaves durable suppression for the real clipboard even
   );
   assert.deepEqual(recreated.runtime.getStatus().pendingAssistedImages, []);
   assert.equal(
-    await assistedPngSuppressionStore.consumeByFingerprint(
-      user.id,
-      bytesToHex(await sha256(pngBytes)),
-    ),
+    await assistedPngSuppressionStore.consumeNext(user.id),
     false,
   );
 });

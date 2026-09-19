@@ -80,6 +80,31 @@ test("WRITE_PAYLOAD and legacy writeText send strict typed payloads", async () =
   assert.deepEqual(requests[1].payload, clipboardPayloadFromPlainText("legacy"));
 });
 
+test("rebaselineFromClipboard sends an acknowledgement-only request", async () => {
+  const { adapter, requests } = adapterFor((request) =>
+    response(request, "REBASELINE_FROM_CLIPBOARD_RESULT"),
+  );
+
+  await adapter.rebaselineFromClipboard!();
+  assert.deepEqual(requests, [
+    {
+      source: "service-worker",
+      target: "offscreen",
+      requestId: requests[0]!.requestId,
+      type: "REBASELINE_FROM_CLIPBOARD",
+    },
+  ]);
+  assert.equal("payload" in requests[0]!, false);
+});
+
+test("rebaselineFromClipboard requires its exact acknowledgement", async () => {
+  const { adapter } = adapterFor((request) =>
+    response(request, "WATCH_START_RESULT"),
+  );
+
+  await assert.rejects(adapter.rebaselineFromClipboard!());
+});
+
 test("malformed payloads and malformed response envelopes are rejected", async () => {
   let calls = 0;
   const { adapter } = adapterFor((request) => {

@@ -55,10 +55,9 @@ test("assisted PNG suppression is durable metadata and single-use", async () => 
   await store.put({
     userId: "user-1",
     itemId: "item-1",
-    payloadFingerprint: "fingerprint-1",
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
   });
 
-  assert.equal(await store.consumeByFingerprint("user-1", "fingerprint-1"), true);
-  assert.equal(await store.consumeByFingerprint("user-1", "fingerprint-1"), false);
+  assert.equal(await store.consumeNext("user-1"), true);
+  assert.equal(await store.consumeNext("user-1"), false);
 });

@@ -11,7 +11,7 @@ import {
   type ClipboardItemEnvelope,
   type DeviceIdentity,
 } from "../crypto/index.ts";
-import { bytesToBase64, sha256 } from "../crypto/bytes.ts";
+import { bytesToBase64 } from "../crypto/bytes.ts";
 import {
   CLIPBOARD_BUNDLE_V1_MIME,
   clipboardPayloadFromPlainText,
@@ -1192,16 +1192,10 @@ export class CopyytServiceWorkerRuntime {
     const png = getPngRepresentation(payload);
     if (png && this.session) {
       try {
-        const fingerprint = await this.pngFingerprint(getPngBytes(payload));
-        if (
-          await this.assistedPngSuppressionStore.consumeByFingerprint(
-            this.session.user.id,
-            fingerprint,
-          )
-        ) {
+        if (await this.assistedPngSuppressionStore.consumeNext(this.session.user.id)) {
           // The focused-page assisted write is an intentional local clipboard
-          // change. Consume its durable suppression before the observation can
-          // enter the live publish path, even if the worker was reconstructed.
+          // change. Consume its durable one-shot guard before the observation
+          // can enter the live publish path, even if the worker was reconstructed.
           this.autoObservationSequence += 1;
           this.pendingAutoObservation = null;
           return;
@@ -1898,11 +1892,6 @@ export class CopyytServiceWorkerRuntime {
     }
   }
 
-  private async pngFingerprint(bytes: Uint8Array): Promise<string> {
-    const digest = await sha256(bytes);
-    return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
-  }
-
   private async copyPendingImage(
     itemId: string,
   ): Promise<PendingAssistedImageCopyResult> {
@@ -1997,17 +1986,16 @@ export class CopyytServiceWorkerRuntime {
       );
     }
 
-    // Persist only a short-lived fingerprint before returning the transient
+    // Persist only a short-lived one-shot guard before returning the transient
     // bytes. This survives a worker restart between ClipboardItem.write() and
-    // the next offscreen poll without persisting any image plaintext.
-    const fingerprint = await this.pngFingerprint(pngBytes);
+    // the next offscreen poll without persisting any image plaintext or
+    // assuming the OS preserves the PNG byte representation.
     const suppressionExpiry = new Date(
       now + ASSISTED_PNG_SUPPRESSION_TTL_MS,
     ).toISOString();
     await this.assistedPngSuppressionStore.put({
       userId: session.user.id,
       itemId,
-      payloadFingerprint: fingerprint,
       expiresAt: suppressionExpiry,
     });
     // This is an immediate response to the explicit popup action only. Keep
@@ -2018,6 +2006,23 @@ export class CopyytServiceWorkerRuntime {
 
   private async completePendingImage(itemId: string): Promise<void> {
     const session = this.requireSession();
+    let rebaselineSucceeded = false;
+    try {
+      if (!this.dependencies.clipboardAdapter.rebaselineFromClipboard) {
+        throw new Error("The clipboard adapter cannot re-baseline the watcher");
+      }
+      await this.dependencies.clipboardAdapter.rebaselineFromClipboard();
+      rebaselineSucceeded = true;
+    } catch {
+      // The focused-page write already succeeded. Keep the short-lived guard
+      // so a watcher race or a failed offscreen read still consumes the next
+      // PNG observation without turning the successful copy into a failure.
+    }
+    if (rebaselineSucceeded) {
+      await this.assistedPngSuppressionStore
+        .remove(session.user.id, itemId)
+        .catch(() => undefined);
+    }
     await this.pendingAssistedImageStore.remove(session.user.id, itemId);
     await this.refreshPendingAssistedImageStatus();
   }

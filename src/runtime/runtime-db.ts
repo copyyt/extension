@@ -53,7 +53,6 @@ export interface AssistedPngSuppressionRecord {
   key: string;
   userId: string;
   itemId: string;
-  payloadFingerprint: string;
   expiresAt: string;
 }
 
@@ -213,7 +212,7 @@ export interface PendingAssistedImageStore {
 
 export interface AssistedPngSuppressionStore {
   put(record: Omit<AssistedPngSuppressionRecord, "key">): Promise<void>;
-  consumeByFingerprint(userId: string, payloadFingerprint: string): Promise<boolean>;
+  consumeNext(userId: string): Promise<boolean>;
   remove(userId: string, itemId: string): Promise<void>;
   clearUser(userId: string): Promise<void>;
 }
@@ -324,7 +323,7 @@ export class InMemoryAssistedPngSuppressionStore implements AssistedPngSuppressi
     });
   }
 
-  async consumeByFingerprint(userId: string, payloadFingerprint: string): Promise<boolean> {
+  async consumeNext(userId: string): Promise<boolean> {
     const now = Date.now();
     for (const [key, record] of this.records) {
       if (record.userId !== userId) continue;
@@ -332,10 +331,8 @@ export class InMemoryAssistedPngSuppressionStore implements AssistedPngSuppressi
         this.records.delete(key);
         continue;
       }
-      if (record.payloadFingerprint === payloadFingerprint) {
-        this.records.delete(key);
-        return true;
-      }
+      this.records.delete(key);
+      return true;
     }
     return false;
   }
@@ -421,15 +418,14 @@ export class IndexedDBAssistedPngSuppressionStore implements AssistedPngSuppress
     });
   }
 
-  async consumeByFingerprint(userId: string, payloadFingerprint: string): Promise<boolean> {
+  async consumeNext(userId: string): Promise<boolean> {
     return withTransaction<boolean>(ASSISTED_PNG_SUPPRESSION_STORE, "readwrite", (store, finish) => {
       const request = store.getAll();
       request.onsuccess = () => {
         const records = request.result as AssistedPngSuppressionRecord[];
         const match = records.find((record) =>
           record.userId === userId &&
-          isUnexpired(record.expiresAt) &&
-          record.payloadFingerprint === payloadFingerprint,
+          isUnexpired(record.expiresAt),
         );
         for (const record of records) {
           if (!isUnexpired(record.expiresAt) || record === match) store.delete(record.key);
