@@ -24,6 +24,7 @@ import { CLIPBOARD_RECEIVE_CAPABILITIES } from "../clipboard/capabilities.ts";
 import { RuntimeError } from "./errors.ts";
 import type { ClipboardAdapter } from "./clipboard-adapter.ts";
 import type { ClipboardWatcherOptions } from "./clipboard-watcher.ts";
+import type { DirectTransport } from "./direct-transport.ts";
 import { createRuntimeMessageListener } from "./service-worker-bootstrap.ts";
 import { createOffscreenClipboardWatcher } from "./offscreen-watcher.ts";
 import {
@@ -57,6 +58,7 @@ import {
   clipboardSyncMode,
   syncPreferencesForStatus,
 } from "../views/home/sync-preferences.ts";
+import type { DirectSignalDelivery } from "../direct/protocol.ts";
 
 const user: IUser = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -377,6 +379,7 @@ function makeRuntime(overrides: Partial<{
   outboundItemStore: RuntimeDependencies["outboundItemStore"];
   pendingAssistedImageStore: PendingAssistedImageStore;
   assistedPngSuppressionStore: AssistedPngSuppressionStore;
+  directTransport: DirectTransport;
   now: () => Date;
 }> = {}) {
   const runtimeIdentity = overrides.identity ?? identity;
@@ -436,6 +439,7 @@ function makeRuntime(overrides: Partial<{
     statusStore,
     trustStore,
     clipboardAdapter,
+    directTransport: overrides.directTransport,
     processedItemStore,
     outboundItemStore,
     pendingAssistedImageStore: overrides.pendingAssistedImageStore,
@@ -3214,6 +3218,144 @@ async function startReady(overrides: Parameters<typeof makeRuntime>[0] = {}) {
   setup.socket.trigger("auth:ready");
   return setup;
 }
+
+const directSourceDevice: RegisteredDeviceResponse = {
+  ...registeredDevice,
+  deviceId: "00000000-0000-4000-8000-000000000002",
+  name: "Direct Source",
+  encryptionPublicKey: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+  signingPublicKey: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+};
+
+function directSignal(
+  overrides: Partial<DirectSignalDelivery> = {},
+): DirectSignalDelivery {
+  return {
+    transferId: "44444444-4444-4444-8444-444444444444",
+    sourceDeviceId: directSourceDevice.deviceId,
+    sourceKeyVersion: directSourceDevice.keyVersion,
+    kind: "cancel",
+    reason: "test signal",
+    ...overrides,
+  };
+}
+
+async function startDirectSignalRuntime(): Promise<{
+  setup: Awaited<ReturnType<typeof startReady>>;
+  handled: DirectSignalDelivery[];
+  pairing: ReturnType<typeof makePairingTrustStore>;
+  setServerSource: (device: RegisteredDeviceResponse | null) => void;
+}> {
+  const pairing = makePairingTrustStore();
+  const handled: DirectSignalDelivery[] = [];
+  const directTransport: DirectTransport = {
+    startTestTransfer: async () => undefined,
+    handleSignal: async (signal) => {
+      handled.push(signal);
+    },
+    cancelTransfer: async () => undefined,
+    cancelAll: async () => undefined,
+  };
+  let serverSource: RegisteredDeviceResponse | null = directSourceDevice;
+  const setup = await startReady({
+    trustStore: pairing.trustStore,
+    directTransport,
+    listDevices: async () =>
+      response([registeredDevice, ...(serverSource ? [serverSource] : [])]),
+    listPendingDevices: async () => response([]),
+  });
+  await waitForRuntimeCondition(
+    () => setup.runtime.getStatus().socket.deviceAuthenticated,
+    "direct signal test socket did not become authenticated",
+  );
+  return {
+    setup,
+    handled,
+    pairing,
+    setServerSource: (device) => {
+      serverSource = device;
+    },
+  };
+}
+
+test("a valid locally pinned direct signal is forwarded to offscreen", async () => {
+  const direct = await startDirectSignalRuntime();
+  putLocalRecord(direct.pairing.records, directSourceDevice, "verified");
+  const signal = directSignal();
+
+  direct.setup.socket.trigger("direct:signal", signal);
+  await waitForRuntimeCondition(
+    () => direct.handled.length === 1,
+    "valid direct signal was not forwarded",
+  );
+  assert.deepEqual(direct.handled, [signal]);
+});
+
+test("a direct signal from a locally unverified source is not forwarded", async () => {
+  const direct = await startDirectSignalRuntime();
+  putLocalRecord(direct.pairing.records, directSourceDevice, "unverified");
+
+  direct.setup.socket.trigger("direct:signal", directSignal());
+  await flushRuntimeWork();
+  await flushRuntimeWork();
+  assert.equal(direct.handled.length, 0);
+});
+
+test("a direct signal with a different source key version is not forwarded", async () => {
+  const direct = await startDirectSignalRuntime();
+  putLocalRecord(direct.pairing.records, directSourceDevice, "verified");
+
+  direct.setup.socket.trigger(
+    "direct:signal",
+    directSignal({ sourceKeyVersion: directSourceDevice.keyVersion + 1 }),
+  );
+  await flushRuntimeWork();
+  await flushRuntimeWork();
+  assert.equal(direct.handled.length, 0);
+});
+
+test("a direct signal with a different pinned signing key is not forwarded", async () => {
+  const direct = await startDirectSignalRuntime();
+  putLocalRecord(direct.pairing.records, directSourceDevice, "verified");
+  direct.setServerSource({
+    ...directSourceDevice,
+    signingPublicKey: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw=",
+  });
+
+  direct.setup.socket.trigger("direct:signal", directSignal());
+  await flushRuntimeWork();
+  await flushRuntimeWork();
+  assert.equal(direct.handled.length, 0);
+});
+
+test("a direct signal with a different pinned encryption key is not forwarded", async () => {
+  const direct = await startDirectSignalRuntime();
+  putLocalRecord(direct.pairing.records, directSourceDevice, "verified");
+  direct.setServerSource({
+    ...directSourceDevice,
+    encryptionPublicKey: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+  });
+
+  direct.setup.socket.trigger("direct:signal", directSignal());
+  await flushRuntimeWork();
+  await flushRuntimeWork();
+  assert.equal(direct.handled.length, 0);
+});
+
+test("a direct signal from a source no longer trusted by the server is not forwarded", async () => {
+  const direct = await startDirectSignalRuntime();
+  putLocalRecord(direct.pairing.records, directSourceDevice, "verified");
+  direct.setServerSource({
+    ...directSourceDevice,
+    trustState: "revoked",
+    revokedAt: new Date().toISOString(),
+  });
+
+  direct.setup.socket.trigger("direct:signal", directSignal());
+  await flushRuntimeWork();
+  await flushRuntimeWork();
+  assert.equal(direct.handled.length, 0);
+});
 
 test("sync failures preserve a ready authenticated socket and a later publish succeeds", async () => {
   const setup = await startReady({

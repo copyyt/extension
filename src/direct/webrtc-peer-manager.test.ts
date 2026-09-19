@@ -165,6 +165,50 @@ test("peer manager queues ICE until the offer creates its peer", async () => {
   await manager.cancelAll();
 });
 
+test("pre-offer ICE queues remain bound to their original source device", async () => {
+  const manager = new WebRtcPeerManager({
+    peerConnectionFactory: () => new FakePeerConnection(),
+    emit: () => undefined,
+  });
+  const otherSourceDeviceId = "0c2f3a0e-4a23-4b83-91ad-5e9ed6a7b8c9";
+
+  await manager.handleSignal({
+    transferId,
+    sourceDeviceId,
+    sourceKeyVersion: 1,
+    kind: "ice-candidate",
+    candidate: { candidate: "candidate:1", sdpMLineIndex: 0 },
+  });
+  await assert.rejects(
+    manager.handleSignal({
+      transferId,
+      sourceDeviceId: otherSourceDeviceId,
+      sourceKeyVersion: 1,
+      kind: "ice-candidate",
+      candidate: { candidate: "candidate:2", sdpMLineIndex: 0 },
+    }),
+  );
+  await assert.rejects(
+    manager.handleSignal({
+      transferId,
+      sourceDeviceId: otherSourceDeviceId,
+      sourceKeyVersion: 1,
+      kind: "offer",
+      sdp: "offer-sdp",
+    }),
+  );
+
+  await manager.handleSignal({
+    transferId,
+    sourceDeviceId,
+    sourceKeyVersion: 1,
+    kind: "offer",
+    sdp: "offer-sdp",
+  });
+  assert.equal(manager.size, 1);
+  await manager.cancelAll();
+});
+
 test("peer manager chunks the 2 MiB experiment and completes with verification", async () => {
   const initiatorEvents: DirectManagerEvent[] = [];
   const responderEvents: DirectManagerEvent[] = [];
@@ -264,5 +308,104 @@ test("peer manager enforces the bounded concurrent transfer ceiling", async () =
       remoteDeviceId: recipientDeviceId,
     }),
   );
+  await manager.cancelAll();
+});
+
+test("expired pre-offer ICE queues release their bounded transfer slot", async () => {
+  const manager = new WebRtcPeerManager({
+    peerConnectionFactory: () => new FakePeerConnection(),
+    emit: () => undefined,
+    maxConcurrentTransfers: 1,
+    connectionTimeoutMs: 10,
+  });
+  const secondTransferId = "e0e8e38b-7e3d-4ab7-8a1a-fd0ecf32c9a0";
+
+  await manager.handleSignal({
+    transferId,
+    sourceDeviceId,
+    sourceKeyVersion: 1,
+    kind: "ice-candidate",
+    candidate: { candidate: "candidate:1", sdpMLineIndex: 0 },
+  });
+  await assert.rejects(
+    manager.handleSignal({
+      transferId: secondTransferId,
+      sourceDeviceId,
+      sourceKeyVersion: 1,
+      kind: "ice-candidate",
+      candidate: { candidate: "candidate:2", sdpMLineIndex: 0 },
+    }),
+  );
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  await manager.startTestTransfer({
+    transferId: secondTransferId,
+    remoteDeviceId: recipientDeviceId,
+  });
+  await manager.cancelAll();
+});
+
+test("cancel removes a pre-offer ICE queue and frees its slot", async () => {
+  const manager = new WebRtcPeerManager({
+    peerConnectionFactory: () => new FakePeerConnection(),
+    emit: () => undefined,
+    maxConcurrentTransfers: 1,
+    connectionTimeoutMs: 10_000,
+  });
+  const secondTransferId = "e0e8e38b-7e3d-4ab7-8a1a-fd0ecf32c9a0";
+
+  await manager.handleSignal({
+    transferId,
+    sourceDeviceId,
+    sourceKeyVersion: 1,
+    kind: "ice-candidate",
+    candidate: { candidate: "candidate:1", sdpMLineIndex: 0 },
+  });
+  await manager.handleSignal({
+    transferId,
+    sourceDeviceId,
+    sourceKeyVersion: 1,
+    kind: "cancel",
+    reason: "test cancellation",
+  });
+
+  await manager.startTestTransfer({
+    transferId: secondTransferId,
+    remoteDeviceId: recipientDeviceId,
+  });
+  await manager.cancelAll();
+});
+
+test("cancelTransfer and cancelAll clear pre-offer queues and active transfers", async () => {
+  const manager = new WebRtcPeerManager({
+    peerConnectionFactory: () => new FakePeerConnection(),
+    emit: () => undefined,
+    maxConcurrentTransfers: 1,
+    connectionTimeoutMs: 10_000,
+  });
+  const secondTransferId = "e0e8e38b-7e3d-4ab7-8a1a-fd0ecf32c9a0";
+  const thirdTransferId = "f1f9f49c-8f4e-4bc8-9b2b-ae1fd043d0b1";
+
+  await manager.handleSignal({
+    transferId,
+    sourceDeviceId,
+    sourceKeyVersion: 1,
+    kind: "ice-candidate",
+    candidate: { candidate: "candidate:1", sdpMLineIndex: 0 },
+  });
+  await manager.cancelTransfer(transferId);
+  await manager.startTestTransfer({
+    transferId: secondTransferId,
+    remoteDeviceId: recipientDeviceId,
+  });
+
+  await manager.cancelAll();
+  await manager.handleSignal({
+    transferId: thirdTransferId,
+    sourceDeviceId,
+    sourceKeyVersion: 1,
+    kind: "ice-candidate",
+    candidate: { candidate: "candidate:2", sdpMLineIndex: 0 },
+  });
   await manager.cancelAll();
 });

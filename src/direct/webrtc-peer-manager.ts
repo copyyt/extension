@@ -95,6 +95,13 @@ interface TransferState {
   receivedEnd?: boolean;
 }
 
+interface PendingIceQueue {
+  sourceDeviceId: string;
+  candidates: DirectIceCandidate[];
+  expiresAt: number;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
 interface ControlStart {
   type: "start";
   transferId: string;
@@ -197,7 +204,7 @@ export class WebRtcPeerManager {
     configuration: RTCConfiguration,
   ) => PeerConnectionLike;
   private readonly transfers = new Map<string, TransferState>();
-  private readonly pendingCandidates = new Map<string, DirectIceCandidate[]>();
+  private readonly pendingCandidates = new Map<string, PendingIceQueue>();
 
   constructor(dependencies: DirectPeerManagerDependencies) {
     this.dependencies = {
@@ -231,7 +238,7 @@ export class WebRtcPeerManager {
     transferId: string;
     remoteDeviceId: string;
   }): Promise<void> {
-    if (this.transfers.size >= this.dependencies.maxConcurrentTransfers) {
+    if (this.occupiedTransferSlots() >= this.dependencies.maxConcurrentTransfers) {
       throw new DirectTransportError(
         "The maximum number of direct transfers is already active",
       );
@@ -274,7 +281,10 @@ export class WebRtcPeerManager {
           error instanceof Error ? error.message : "Direct signalling failed",
         );
       } else if (!state) {
-        this.pendingCandidates.delete(signal.transferId);
+        const pending = this.pendingCandidates.get(signal.transferId);
+        if (pending?.sourceDeviceId === signal.sourceDeviceId) {
+          this.discardPendingCandidates(signal.transferId, pending);
+        }
       }
       throw error;
     }
@@ -284,7 +294,7 @@ export class WebRtcPeerManager {
     if (signal.kind === "cancel") {
       const state = this.transfers.get(signal.transferId);
       if (state) this.cancelState(state, signal.reason ?? "Remote cancelled");
-      this.pendingCandidates.delete(signal.transferId);
+      this.discardPendingCandidates(signal.transferId);
       return;
     }
 
@@ -312,7 +322,7 @@ export class WebRtcPeerManager {
 
   async cancelTransfer(transferId: string, reason = "Cancelled"): Promise<void> {
     const state = this.transfers.get(transferId);
-    this.pendingCandidates.delete(transferId);
+    this.discardPendingCandidates(transferId);
     if (!state) return;
     await this.emitSignal(state, { kind: "cancel", reason }).catch(() => undefined);
     this.cancelState(state, reason);
@@ -324,7 +334,11 @@ export class WebRtcPeerManager {
         this.cancelTransfer(transferId, reason),
       ),
     );
-    this.pendingCandidates.clear();
+    this.discardAllPendingCandidates();
+  }
+
+  private occupiedTransferSlots(): number {
+    return this.transfers.size + this.pendingCandidates.size;
   }
 
   private createTransfer(
@@ -333,17 +347,17 @@ export class WebRtcPeerManager {
     role: "initiator" | "responder",
   ): TransferState {
     const peerConnection = this.peerConnectionFactory({ iceServers: [] });
+    const pendingCandidates = this.takePendingCandidates(transferId);
     const state: TransferState = {
       transferId,
       remoteDeviceId,
       role,
       peerConnection,
-      pendingCandidates: this.pendingCandidates.get(transferId) ?? [],
+      pendingCandidates,
       remoteDescriptionSet: false,
       createdAt: this.dependencies.now().getTime(),
       state: "connecting",
     };
-    this.pendingCandidates.delete(transferId);
     this.transfers.set(transferId, state);
     peerConnection.onicecandidate = (event) => {
       const candidate = candidateFromEvent(event.candidate);
@@ -385,7 +399,16 @@ export class WebRtcPeerManager {
         throw new DirectTransportError("The direct offer conflicts with an active transfer");
       }
     } else {
-      if (this.transfers.size >= this.dependencies.maxConcurrentTransfers) {
+      const pending = this.pendingCandidates.get(signal.transferId);
+      if (pending && pending.sourceDeviceId !== signal.sourceDeviceId) {
+        throw new DirectTransportError(
+          "The direct offer source does not match the pending ICE queue",
+        );
+      }
+      if (
+        !pending &&
+        this.occupiedTransferSlots() >= this.dependencies.maxConcurrentTransfers
+      ) {
         throw new DirectTransportError(
           "The maximum number of direct transfers is already active",
         );
@@ -416,21 +439,35 @@ export class WebRtcPeerManager {
     }
     const state = this.transfers.get(signal.transferId);
     if (!state) {
-      if (
-        !this.pendingCandidates.has(signal.transferId) &&
-        this.transfers.size + this.pendingCandidates.size >=
-          this.dependencies.maxConcurrentTransfers
-      ) {
+      const pending = this.pendingCandidates.get(signal.transferId);
+      if (!pending && this.occupiedTransferSlots() >= this.dependencies.maxConcurrentTransfers) {
         throw new DirectTransportError(
           "The maximum number of direct transfers is already active",
         );
       }
-      const candidates = this.pendingCandidates.get(signal.transferId) ?? [];
-      if (candidates.length >= DIRECT_MAX_ICE_CANDIDATES) {
+      if (pending && pending.sourceDeviceId !== signal.sourceDeviceId) {
+        throw new DirectTransportError(
+          "The ICE candidate source does not match the pending transfer",
+        );
+      }
+      if (pending && pending.candidates.length >= DIRECT_MAX_ICE_CANDIDATES) {
         throw new DirectTransportError("Too many ICE candidates for the transfer");
       }
-      candidates.push(signal.candidate);
-      this.pendingCandidates.set(signal.transferId, candidates);
+      if (pending) {
+        pending.candidates.push(signal.candidate);
+        return;
+      }
+      const queue: PendingIceQueue = {
+        sourceDeviceId: signal.sourceDeviceId,
+        candidates: [signal.candidate],
+        expiresAt:
+          this.dependencies.now().getTime() + this.dependencies.connectionTimeoutMs,
+      };
+      queue.timer = setTimeout(
+        () => this.expirePendingCandidates(signal.transferId, queue),
+        this.dependencies.connectionTimeoutMs,
+      );
+      this.pendingCandidates.set(signal.transferId, queue);
       return;
     }
     if (state.remoteDeviceId !== signal.sourceDeviceId) {
@@ -451,6 +488,45 @@ export class WebRtcPeerManager {
     const candidates = state.pendingCandidates.splice(0);
     for (const candidate of candidates) {
       await state.peerConnection.addIceCandidate(candidate);
+    }
+  }
+
+  private expirePendingCandidates(
+    transferId: string,
+    queue: PendingIceQueue,
+  ): void {
+    if (this.pendingCandidates.get(transferId) !== queue) return;
+    this.discardPendingCandidates(transferId, queue);
+  }
+
+  private takePendingCandidates(transferId: string): DirectIceCandidate[] {
+    const queue = this.pendingCandidates.get(transferId);
+    if (!queue) return [];
+    if (queue.timer !== undefined) {
+      clearTimeout(queue.timer);
+      queue.timer = undefined;
+    }
+    this.pendingCandidates.delete(transferId);
+    return queue.candidates;
+  }
+
+  private discardPendingCandidates(
+    transferId: string,
+    expectedQueue?: PendingIceQueue,
+  ): void {
+    const queue = this.pendingCandidates.get(transferId);
+    if (!queue || (expectedQueue && queue !== expectedQueue)) return;
+    if (queue.timer !== undefined) {
+      clearTimeout(queue.timer);
+      queue.timer = undefined;
+    }
+    queue.candidates.length = 0;
+    this.pendingCandidates.delete(transferId);
+  }
+
+  private discardAllPendingCandidates(): void {
+    for (const [transferId, queue] of this.pendingCandidates) {
+      this.discardPendingCandidates(transferId, queue);
     }
   }
 

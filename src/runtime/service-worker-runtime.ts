@@ -1476,6 +1476,8 @@ export class CopyytServiceWorkerRuntime {
       (device) =>
         device.deviceId === payload.sourceDeviceId &&
         device.keyVersion === payload.sourceKeyVersion &&
+        device.signingPublicKey === localSource.signingPublicKey &&
+        device.encryptionPublicKey === localSource.encryptionPublicKey &&
         device.revokedAt == null,
     );
     if (!serverSource) return;
