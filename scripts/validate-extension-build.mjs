@@ -180,8 +180,8 @@ if (extensionEnvironment === "store") {
   if (manifest.manifest_version !== 3) {
     throw new Error("The Store manifest must use manifest_version 3");
   }
-  if (manifest.version !== "2.0.0") {
-    throw new Error(`The Store manifest must be version 2.0.0; got ${manifest.version}`);
+  if (manifest.version !== "2.0.1") {
+    throw new Error(`The Store manifest must be version 2.0.1; got ${manifest.version}`);
   }
   if (
     process.env.VITE_API_URL !== expectedStoreEndpoint ||
