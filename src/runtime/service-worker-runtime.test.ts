@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import {
+  base64ToBytes,
+  bytesToBase64,
+  bytesToHex,
+  sha256,
+} from "../crypto/bytes.ts";
 import type { AxiosResponse } from "axios";
 import {
   CLIPBOARD_BUNDLE_V1_MIME,
@@ -13,13 +19,18 @@ import type { RegisteredDeviceResponse } from "../crypto/device-registration.ts"
 import type { ClientTrustStore, ClientVerifiedDevice, LocalDeviceRecord } from "../crypto/trust-store.ts";
 import type { IUser } from "../interfaces/user.interface.ts";
 import type { ILoginResponse, SignInResponse } from "../interfaces/auth.interface.ts";
+import { CLIPBOARD_RECEIVE_CAPABILITIES } from "../clipboard/capabilities.ts";
 import { RuntimeError } from "./errors.ts";
 import type { ClipboardAdapter } from "./clipboard-adapter.ts";
 import type { ClipboardWatcherOptions } from "./clipboard-watcher.ts";
 import { createRuntimeMessageListener } from "./service-worker-bootstrap.ts";
 import { createOffscreenClipboardWatcher } from "./offscreen-watcher.ts";
 import {
+  InMemoryAssistedPngSuppressionStore,
   InMemoryItemMetadataStore,
+  InMemoryPendingAssistedImageStore,
+  type AssistedPngSuppressionStore,
+  type PendingAssistedImageStore,
   type ProcessedItemRecord,
   type ProcessedItemStore,
 } from "./runtime-db.ts";
@@ -32,7 +43,11 @@ import {
   type SocketLike,
   type SocketOptions,
 } from "./service-worker-runtime.ts";
-import type { RuntimeCommand, RuntimeStatus } from "./messages.ts";
+import type {
+  PendingAssistedImageCopyResult,
+  RuntimeCommand,
+  RuntimeStatus,
+} from "./messages.ts";
 import {
   InMemorySyncPreferencesStore,
   type SyncPreferencesStore,
@@ -316,6 +331,8 @@ function makeRuntime(overrides: Partial<{
   syncPreferencesStore: SyncPreferencesStore;
   processedItemStore: RuntimeDependencies["processedItemStore"];
   outboundItemStore: RuntimeDependencies["outboundItemStore"];
+  pendingAssistedImageStore: PendingAssistedImageStore;
+  assistedPngSuppressionStore: AssistedPngSuppressionStore;
   now: () => Date;
 }> = {}) {
   const runtimeIdentity = overrides.identity ?? identity;
@@ -377,6 +394,8 @@ function makeRuntime(overrides: Partial<{
     clipboardAdapter,
     processedItemStore,
     outboundItemStore,
+    pendingAssistedImageStore: overrides.pendingAssistedImageStore,
+    assistedPngSuppressionStore: overrides.assistedPngSuppressionStore,
     syncPreferencesStore,
     apiFactory: overrides.apiFactory
       ? (accessToken) => overrides.apiFactory!(accessToken, api)
@@ -754,8 +773,20 @@ test("mixed local image payloads project to exact text-only network content", as
 });
 
 test("inbound image bundles stay out of the offscreen writer and create pending assisted state", async () => {
+  const pngBytes = new Uint8Array([
+    0x89,
+    0x50,
+    0x4e,
+    0x47,
+    0x0d,
+    0x0a,
+    0x1a,
+    0x0a,
+    3,
+    4,
+  ]);
   const image = clipboardPayloadFromPngBytes(
-    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 3]),
+    pngBytes,
   );
   const bundle = encodeClipboardBundleV1(image);
   const applied: ClipboardPayloadV1[] = [];
@@ -781,9 +812,26 @@ test("inbound image bundles stay out of the offscreen writer and create pending 
     }),
   );
   assert.equal(copyResponse.ok, true);
+  const transportedResponse = JSON.parse(JSON.stringify(copyResponse)) as typeof copyResponse;
+  const copyResult = transportedResponse.data as PendingAssistedImageCopyResult;
+  assert.equal("pngBytes" in copyResult, false);
+  assert.equal(typeof copyResult.pngBase64, "string");
+  assert.equal(copyResult.pngBase64, bytesToBase64(pngBytes));
   assert.deepEqual(
-    Array.from((copyResponse.data as { pngBytes: Uint8Array }).pngBytes),
-    Array.from(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 3])),
+    base64ToBytes(copyResult.pngBase64),
+    pngBytes,
+  );
+  assert.equal(
+    JSON.stringify(withImageAdapter.runtime.getStatus()).includes(
+      copyResult.pngBase64,
+    ),
+    false,
+  );
+  assert.equal(
+    JSON.stringify(await withImageAdapter.statusStore.get()).includes(
+      copyResult.pngBase64,
+    ),
+    false,
   );
   await withImageAdapter.runtime.handleClipboardObservation({
     source: "offscreen",
@@ -817,6 +865,232 @@ test("inbound image bundles stay out of the offscreen writer and create pending 
   assert.deepEqual(textWrites, []);
   assert.equal(withoutImageAdapter.runtime.getStatus().pendingAssistedImages?.length, 1);
   assert.equal(withoutImageAdapter.runtime.getStatus().lastSyncError, undefined);
+});
+
+test("assisted completion leaves durable suppression for the real clipboard event order", async () => {
+  const pngBytes = new Uint8Array([
+    0x89,
+    0x50,
+    0x4e,
+    0x47,
+    0x0d,
+    0x0a,
+    0x1a,
+    0x0a,
+    4,
+  ]);
+  const image = clipboardPayloadFromPngBytes(pngBytes);
+  const bundle = encodeClipboardBundleV1(image);
+  const pendingAssistedImageStore = new InMemoryPendingAssistedImageStore();
+  const assistedPngSuppressionStore = new InMemoryAssistedPngSuppressionStore();
+  let encryptCalls = 0;
+  const setup = await startReady({
+    pendingAssistedImageStore,
+    assistedPngSuppressionStore,
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+    },
+    decrypt: async () => ({ plaintextBytes: bundle }),
+    encrypt: async () => {
+      encryptCalls += 1;
+      throw new Error("suppressed observations must not encrypt");
+    },
+  });
+  await setup.runtime.receiveClipboardItem({
+    ...inboundEnvelope("assisted-order-item"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+
+  const copyResponse = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:copy-pending-image",
+      itemId: "assisted-order-item",
+    }),
+  );
+  assert.equal(copyResponse.ok, true);
+
+  // The focused page has now successfully written the decoded PNG, so the
+  // popup immediately completes the pending UI action before the next poll.
+  const completeResponse = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:complete-pending-image",
+      itemId: "assisted-order-item",
+    }),
+  );
+  assert.equal(completeResponse.ok, true);
+  assert.deepEqual(setup.runtime.getStatus().pendingAssistedImages, []);
+
+  // Reconstruct the worker before the offscreen event. The suppression record
+  // is shared durable metadata, while the pending UI state is already gone.
+  const recreatedSocket = new FakeSocket();
+  const recreated = await startReady({
+    sessionStore: setup.sessionStore,
+    pendingAssistedImageStore,
+    assistedPngSuppressionStore,
+    socket: recreatedSocket,
+    trustStore: setup.trustStore,
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+    },
+    encrypt: async () => {
+      encryptCalls += 1;
+      throw new Error("suppressed observations must not encrypt");
+    },
+  });
+  await recreated.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: image,
+  });
+
+  assert.equal(encryptCalls, 0);
+  assert.equal(
+    recreatedSocket.emissions.filter(
+      (emission) => emission.event === "clipboard:publish",
+    ).length,
+    0,
+  );
+  assert.deepEqual(recreated.runtime.getStatus().pendingAssistedImages, []);
+  assert.equal(
+    await assistedPngSuppressionStore.consumeByFingerprint(
+      user.id,
+      bytesToHex(await sha256(pngBytes)),
+    ),
+    false,
+  );
+});
+
+test("failed focused write release removes suppression and allows a genuine same-PNG copy", async () => {
+  const pngBytes = new Uint8Array([
+    0x89,
+    0x50,
+    0x4e,
+    0x47,
+    0x0d,
+    0x0a,
+    0x1a,
+    0x0a,
+    5,
+  ]);
+  const image = clipboardPayloadFromPngBytes(pngBytes);
+  const bundle = encodeClipboardBundleV1(image);
+  const capableDevice = {
+    ...registeredDevice,
+    capabilities: [...CLIPBOARD_RECEIVE_CAPABILITIES],
+  };
+  const pairing = makePairingTrustStore(identity, capableDevice);
+  const pendingAssistedImageStore = new InMemoryPendingAssistedImageStore();
+  const assistedPngSuppressionStore = new InMemoryAssistedPngSuppressionStore();
+  let encryptCalls = 0;
+  const setup = await startReady({
+    localTrustState: "root",
+    registeredDevice: capableDevice,
+    trustStore: pairing.trustStore,
+    pendingAssistedImageStore,
+    assistedPngSuppressionStore,
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+    },
+    decrypt: async () => ({ plaintextBytes: bundle }),
+    encrypt: async (input) => {
+      encryptCalls += 1;
+      return {
+        ...inboundEnvelope(`genuine-image-${encryptCalls}`),
+        contentType: input.contentType,
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+  await setup.runtime.receiveClipboardItem({
+    ...inboundEnvelope("release-item"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+  const copied = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:copy-pending-image", itemId: "release-item" }),
+  );
+  assert.equal(copied.ok, true);
+
+  // This is the popup's failure path after the focused ClipboardItem write
+  // rejects: release clears suppression, while the pending item remains.
+  const released = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:release-pending-image", itemId: "release-item" }),
+  );
+  assert.equal(released.ok, true);
+  assert.equal(setup.runtime.getStatus().pendingAssistedImages?.length, 1);
+
+  await setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: image,
+  });
+  assert.equal(encryptCalls, 1);
+  assert.equal(
+    setup.socket.emissions.filter(
+      (emission) => emission.event === "clipboard:publish",
+    ).length,
+    1,
+  );
+});
+
+test("expired assisted PNG suppression does not block a genuine later copy", async () => {
+  const pngBytes = new Uint8Array([
+    0x89,
+    0x50,
+    0x4e,
+    0x47,
+    0x0d,
+    0x0a,
+    0x1a,
+    0x0a,
+    6,
+  ]);
+  const image = clipboardPayloadFromPngBytes(pngBytes);
+  const capableDevice = {
+    ...registeredDevice,
+    capabilities: [...CLIPBOARD_RECEIVE_CAPABILITIES],
+  };
+  const pairing = makePairingTrustStore(identity, capableDevice);
+  const assistedPngSuppressionStore = new InMemoryAssistedPngSuppressionStore();
+  let encryptCalls = 0;
+  const setup = await startReady({
+    localTrustState: "root",
+    registeredDevice: capableDevice,
+    trustStore: pairing.trustStore,
+    assistedPngSuppressionStore,
+    encrypt: async (input) => {
+      encryptCalls += 1;
+      return {
+        ...inboundEnvelope(`expired-image-${encryptCalls}`),
+        contentType: input.contentType,
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+  await assistedPngSuppressionStore.put({
+    userId: user.id,
+    itemId: "expired-item",
+    payloadFingerprint: bytesToHex(await sha256(pngBytes)),
+    expiresAt: new Date(Date.now() - 1).toISOString(),
+  });
+
+  await setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: image,
+  });
+  assert.equal(encryptCalls, 1);
+  assert.equal(
+    setup.socket.emissions.filter(
+      (emission) => emission.event === "clipboard:publish",
+    ).length,
+    1,
+  );
 });
 
 test("unknown content types are consumed after crypto verification without decoding or retrying", async () => {

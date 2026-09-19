@@ -1,7 +1,11 @@
 import Button from "@/components/button";
 import withAuth from "@/hocs/with-auth.hoc";
+import { base64ToBytes } from "@/crypto/bytes";
 import { sendRuntimeCommand } from "@/runtime/client";
-import type { RuntimeStatus } from "@/runtime/messages";
+import type {
+  PendingAssistedImageCopyResult,
+  RuntimeStatus,
+} from "@/runtime/messages";
 import { useRuntimeStatus } from "@/hooks/runtime-status.hook";
 import { useLogout } from "@/hooks/auth.hook";
 import { writePngToFocusedClipboard } from "@/clipboard/focused-page-writer";
@@ -68,21 +72,23 @@ function Home() {
 
   const copyPendingImage = async (itemId: string) => {
     let prepared = false;
+    let focusedWriteSucceeded = false;
     setMessage(null);
     try {
-      const result = await sendRuntimeCommand<{
-        itemId: string;
-        pngBytes: Uint8Array;
-      }>({ type: "runtime:copy-pending-image", itemId });
+      const result = await sendRuntimeCommand<PendingAssistedImageCopyResult>({
+        type: "runtime:copy-pending-image",
+        itemId,
+      });
       prepared = true;
-      await writePngToFocusedClipboard(new Uint8Array(result.pngBytes));
+      await writePngToFocusedClipboard(base64ToBytes(result.pngBase64));
+      focusedWriteSucceeded = true;
       await sendRuntimeCommand<RuntimeStatus>({
         type: "runtime:complete-pending-image",
         itemId: result.itemId,
       });
       setMessage("Image copied to the native clipboard.");
     } catch (error) {
-      if (prepared) {
+      if (prepared && !focusedWriteSucceeded) {
         await sendRuntimeCommand<RuntimeStatus>({
           type: "runtime:release-pending-image",
           itemId,

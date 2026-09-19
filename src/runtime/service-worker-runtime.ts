@@ -11,7 +11,7 @@ import {
   type ClipboardItemEnvelope,
   type DeviceIdentity,
 } from "../crypto/index.ts";
-import { sha256 } from "../crypto/bytes.ts";
+import { bytesToBase64, sha256 } from "../crypto/bytes.ts";
 import {
   CLIPBOARD_BUNDLE_V1_MIME,
   clipboardPayloadFromPlainText,
@@ -72,6 +72,7 @@ import {
   type RuntimeResponse,
   type RuntimeStatus,
   type RuntimeStatusBroadcast,
+  type PendingAssistedImageCopyResult,
   type PendingAssistedImageSummary,
 } from "./messages.ts";
 import type { ClipboardAdapter } from "./clipboard-adapter.ts";
@@ -1902,10 +1903,9 @@ export class CopyytServiceWorkerRuntime {
     return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
   }
 
-  private async copyPendingImage(itemId: string): Promise<{
-    itemId: string;
-    pngBytes: Uint8Array;
-  }> {
+  private async copyPendingImage(
+    itemId: string,
+  ): Promise<PendingAssistedImageCopyResult> {
     if (typeof itemId !== "string" || itemId.length === 0) {
       throw new RuntimeError(
         "UNSUPPORTED_CLIPBOARD_CONTENT",
@@ -2013,13 +2013,15 @@ export class CopyytServiceWorkerRuntime {
       payloadFingerprint: fingerprint,
       expiresAt: suppressionExpiry,
     });
-    return { itemId, pngBytes };
+    // This is an immediate response to the explicit popup action only. Keep
+    // the runtime message JSON-safe without persisting or exposing the image
+    // through status, errors, or logs.
+    return { itemId, pngBase64: bytesToBase64(pngBytes) };
   }
 
   private async completePendingImage(itemId: string): Promise<void> {
     const session = this.requireSession();
     await this.pendingAssistedImageStore.remove(session.user.id, itemId);
-    await this.assistedPngSuppressionStore.remove(session.user.id, itemId);
     await this.refreshPendingAssistedImageStatus();
   }
 

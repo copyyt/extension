@@ -115,6 +115,12 @@ export interface PendingAssistedImageSummary {
   hasPng: true;
 }
 
+/** The transient, JSON-safe response for an explicit assisted image copy. */
+export interface PendingAssistedImageCopyResult {
+  itemId: string;
+  pngBase64: string;
+}
+
 export interface AuthenticatedRuntimeResult {
   message: string;
   user: IUser;
