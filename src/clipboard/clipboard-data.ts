@@ -230,9 +230,12 @@ export function setClipboardDataFromPayload(
       if (!data.items || Array.isArray(data.items)) {
         throw new Error("Clipboard image items are unavailable");
       }
-      (data.items as ClipboardDataItemsLike).add(
+      const result = (data.items as ClipboardDataItemsLike).add(
         createPngClipboardFile(getPngBytes(payload)),
       );
+      if (result === null || result === undefined) {
+        throw new Error("Clipboard image item was not applied");
+      }
       applied.add("image/png");
     } catch {
       // Text formats, if any, remain the actual applied clipboard value.

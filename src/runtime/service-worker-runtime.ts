@@ -1148,7 +1148,15 @@ export class CopyytServiceWorkerRuntime {
       return;
     }
     const plain = findPlainTextRepresentation(payload);
-    if (!plain || (plain.data.length === 0 && payload.representations.length === 1)) {
+    if (!plain) {
+      // An image-only observation cannot be sent by the current transport,
+      // but it is still a newer clipboard state. Advance the sequence so it
+      // invalidates an older retry without retaining the image payload.
+      this.autoObservationSequence += 1;
+      this.pendingAutoObservation = null;
+      return;
+    }
+    if (plain.data.length === 0 && payload.representations.length === 1) {
       this.pendingAutoObservation = null;
       return;
     }
@@ -1343,6 +1351,11 @@ export class CopyytServiceWorkerRuntime {
           this.pendingAutoObservation = null;
           if (pending && pending.sequence > current.sequence) {
             current = pending;
+          } else if (this.autoObservationSequence > current.sequence) {
+            // A newer observation may be image-only and therefore have no
+            // transportable payload to retain. Its sequence still cancels
+            // this older retry.
+            return;
           }
           continue;
         }

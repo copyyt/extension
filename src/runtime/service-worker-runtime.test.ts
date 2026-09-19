@@ -4907,6 +4907,44 @@ test("automatic auth recovery keeps only the latest rapid observation", async ()
   assert.equal(fixture.getRefreshCalls(), 1);
 });
 
+test("image-only observation cancels an automatic auth-recovery retry", async () => {
+  const fixture = automaticAuthRecoveryFixture(true, false);
+  await startAutomaticAuthRecoveryFixture(fixture);
+  fixture.rejectNextMembership();
+
+  const observation = fixture.setup.runtime.handleClipboardObservation(
+    clipboardObservation("A"),
+  );
+  await fixture.refreshStarted;
+
+  const imageOnly = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 3]),
+  );
+  await fixture.setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: imageOnly,
+  });
+  assert.deepEqual(fixture.encryptedTexts, []);
+
+  fixture.releaseRefresh();
+  await readyReplacementSocket(fixture);
+  await observation;
+
+  assert.deepEqual(fixture.encryptedTexts, []);
+  assert.equal(
+    fixture.sockets.every(
+      (socket) =>
+        socket.emissions.filter(
+          (emission) => emission.event === "clipboard:publish",
+        ).length === 0,
+    ),
+    true,
+  );
+  assert.equal(fixture.getRefreshCalls(), 1);
+});
+
 test("automatic publish does not refresh for HTTP 500 or network failure", async () => {
   for (const failure of [500, "network"] as const) {
     let activeFailure: number | "network" | null = null;

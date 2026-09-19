@@ -162,6 +162,7 @@ test("PNG clipboard data is assembled and written as exact opaque bytes", async 
     item: () => null,
     add: (value: Blob) => {
       added.push(value);
+      return {};
     },
   };
   const actual = setClipboardDataFromPayload(target, image);
@@ -211,4 +212,48 @@ test("PNG application failure returns the actual text fallback", () => {
     version: 1,
     representations: payload.representations.slice(0, 2),
   });
+});
+
+test("PNG add returning null returns the actual text fallback", () => {
+  const payload: ClipboardPayloadV1 = {
+    version: 1,
+    representations: [
+      { mime: "text/plain", encoding: "utf-8", data: "plain" },
+      { mime: "text/html", encoding: "utf-8", data: "<b>plain</b>" },
+      {
+        mime: "image/png",
+        encoding: "base64",
+        data: "iVBORw0KGgoBAgM=",
+      },
+    ],
+  };
+  const target = clipboardData({}, ["text/plain", "text/html"]);
+  (target as { items: unknown }).items = {
+    length: 0,
+    item: () => null,
+    add: () => null,
+  };
+
+  const actual = setClipboardDataFromPayload(target, payload);
+  assert.deepEqual(actual, {
+    version: 1,
+    representations: payload.representations.slice(0, 2),
+  });
+});
+
+test("PNG add returning null fails an image-only write", () => {
+  const payload = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]),
+  );
+  const target = clipboardData({}, ["Files"]);
+  (target as { items: unknown }).items = {
+    length: 0,
+    item: () => null,
+    add: () => null,
+  };
+
+  assert.throws(
+    () => setClipboardDataFromPayload(target, payload),
+    /No supported clipboard representation could be applied/,
+  );
 });
