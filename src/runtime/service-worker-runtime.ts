@@ -2,7 +2,7 @@ import { isAxiosError, type AxiosResponse } from "axios";
 import { jwtDecode } from "jwt-decode";
 import {
   computePairingFingerprint,
-  decryptClipboardItem,
+  decryptClipboardItemBytes,
   encryptClipboardItem,
   getDeviceIdentity,
   getOrCreateDeviceIdentity,
@@ -11,6 +11,16 @@ import {
   type ClipboardItemEnvelope,
   type DeviceIdentity,
 } from "../crypto/index.ts";
+import {
+  CLIPBOARD_BUNDLE_V1_MIME,
+  clipboardPayloadFromPlainText,
+  decodeClipboardBundleV1,
+  decodeClipboardPlainText,
+  getPlainTextRepresentation,
+  validateClipboardPayloadV1,
+  type ClipboardPayloadV1,
+} from "../clipboard/payload.ts";
+import { CLIPBOARD_RECEIVE_CAPABILITIES } from "../clipboard/capabilities.ts";
 import {
   registerCurrentDevice,
   type ApproveDeviceRequest,
@@ -134,7 +144,7 @@ export interface RuntimeDependencies {
   identityCreator?: (userId: string) => Promise<DeviceIdentity>;
   registerDevice?: typeof registerCurrentDevice;
   encrypt?: typeof encryptClipboardItem;
-  decrypt?: typeof decryptClipboardItem;
+  decrypt?: typeof decryptClipboardItemBytes;
   signChallenge?: typeof signSocketChallenge;
   signApproval?: typeof signDeviceApproval;
   now?: () => Date;
@@ -584,7 +594,7 @@ export class CopyytServiceWorkerRuntime {
   private readonly identityCreator: (userId: string) => Promise<DeviceIdentity>;
   private readonly registerDevice: typeof registerCurrentDevice;
   private readonly encrypt: typeof encryptClipboardItem;
-  private readonly decrypt: typeof decryptClipboardItem;
+  private readonly decrypt: typeof decryptClipboardItemBytes;
   private readonly signChallenge: typeof signSocketChallenge;
   private readonly signApproval: typeof signDeviceApproval;
   private readonly now: () => Date;
@@ -642,7 +652,7 @@ export class CopyytServiceWorkerRuntime {
       dependencies.identityCreator ?? getOrCreateDeviceIdentity;
     this.registerDevice = dependencies.registerDevice ?? registerCurrentDevice;
     this.encrypt = dependencies.encrypt ?? encryptClipboardItem;
-    this.decrypt = dependencies.decrypt ?? decryptClipboardItem;
+    this.decrypt = dependencies.decrypt ?? decryptClipboardItemBytes;
     this.signChallenge = dependencies.signChallenge ?? signSocketChallenge;
     this.signApproval = dependencies.signApproval ?? signDeviceApproval;
     this.now = dependencies.now ?? (() => new Date());
@@ -1340,14 +1350,30 @@ export class CopyytServiceWorkerRuntime {
   }
 
   async publishClipboardText(text: string): Promise<{ itemId: string }> {
-    const sendPolicyRevision = this.sendPolicyRevision;
-    this.requireSendPolicy(sendPolicyRevision);
+    this.requireSendPolicy(this.sendPolicyRevision);
     if (!isClipboardText(text)) {
       throw new RuntimeError(
         "CLIPBOARD_READ_FAILED",
         "The clipboard adapter returned invalid text data",
       );
     }
+    return this.publishClipboardPayload(clipboardPayloadFromPlainText(text));
+  }
+
+  async publishClipboardPayload(payload: ClipboardPayloadV1): Promise<{ itemId: string }> {
+    const sendPolicyRevision = this.sendPolicyRevision;
+    this.requireSendPolicy(sendPolicyRevision);
+    try {
+      validateClipboardPayloadV1(payload);
+    } catch {
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The clipboard payload is invalid",
+      );
+    }
+    // Phase 2C.0 advertises bundle reception only. Every recipient, including
+    // public 2.0.x clients, still receives the exact raw text/plain fallback.
+    const text = getPlainTextRepresentation(payload).data;
     const session = this.requireSession();
     this.requireSocketReady();
     await this.ensureAccountInitialized();
@@ -1534,7 +1560,7 @@ export class CopyytServiceWorkerRuntime {
         });
         return;
       }
-      let decrypted: { plaintext: string; plaintextBytes: Uint8Array };
+      let decrypted: { plaintextBytes: Uint8Array };
       try {
         decrypted = await this.decrypt({
           userId: session.user.id,
@@ -1581,6 +1607,44 @@ export class CopyytServiceWorkerRuntime {
         });
         return;
       }
+      if (
+        envelope.contentType !== "text/plain" &&
+        envelope.contentType !== CLIPBOARD_BUNDLE_V1_MIME
+      ) {
+        await this.dependencies.processedItemStore.mark({
+          userId: session.user.id,
+          itemId: envelope.itemId,
+          processedAt: this.now().toISOString(),
+          sourceDeviceId: envelope.sourceDeviceId,
+          disposition: "unsupported-content",
+        });
+        return;
+      }
+      let clipboardPayload: ClipboardPayloadV1;
+      try {
+        clipboardPayload = envelope.contentType === "text/plain"
+          ? decodeClipboardPlainText(decrypted.plaintextBytes)
+          : decodeClipboardBundleV1(decrypted.plaintextBytes);
+      } catch {
+        const receiveEnabled = this.isReceivePolicyCurrent(receivePolicyRevision);
+        await this.dependencies.processedItemStore.mark({
+          userId: session.user.id,
+          itemId: envelope.itemId,
+          processedAt: this.now().toISOString(),
+          sourceDeviceId: envelope.sourceDeviceId,
+          disposition: receiveEnabled ? "invalid-content" : "receive-disabled",
+        });
+        if (receiveEnabled) {
+          this.recordSyncError(
+            "INVALID_CLIPBOARD_CONTENT",
+            "The incoming clipboard content is invalid",
+          );
+        }
+        return;
+      }
+      // HTML stays inert data in this phase. Decode and extract the fallback
+      // before the final policy barrier, with no async gap before the OS write.
+      const text = getPlainTextRepresentation(clipboardPayload).data;
       if (!this.isReceivePolicyCurrent(receivePolicyRevision)) {
         await this.dependencies.processedItemStore.mark({
           userId: session.user.id,
@@ -1592,7 +1656,7 @@ export class CopyytServiceWorkerRuntime {
         return;
       }
       await this.dependencies.clipboardAdapter
-        .writeText(decrypted.plaintext)
+        .writeText(text)
         .catch(() => {
           throw new RuntimeError(
             "CLIPBOARD_WRITE_FAILED",
@@ -2858,7 +2922,7 @@ export class CopyytServiceWorkerRuntime {
           {
             userId: session.user.id,
             name: "Copyyt Chrome",
-            capabilities: ["clipboard"],
+            capabilities: [...CLIPBOARD_RECEIVE_CAPABILITIES],
             appVersion: this.dependencies.appVersion,
             trustStore: this.dependencies.trustStore,
           },

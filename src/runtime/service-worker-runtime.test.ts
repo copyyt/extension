@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AxiosResponse } from "axios";
+import {
+  CLIPBOARD_BUNDLE_V1_MIME,
+  encodeClipboardBundleV1,
+  type ClipboardPayloadV1,
+} from "../clipboard/payload.ts";
 import type { DeviceIdentity } from "../crypto/key-store.ts";
 import type { RegisteredDeviceResponse } from "../crypto/device-registration.ts";
 import type { ClientTrustStore, ClientVerifiedDevice, LocalDeviceRecord } from "../crypto/trust-store.ts";
@@ -398,7 +403,7 @@ function makeRuntime(overrides: Partial<{
       recipients: [],
       expiresAt: input.expiresAt,
     })),
-    decrypt: overrides.decrypt ?? (async () => ({ plaintext: "decrypted plaintext", plaintextBytes: new Uint8Array() })),
+    decrypt: overrides.decrypt ?? (async () => ({ plaintext: "decrypted plaintext", plaintextBytes: new TextEncoder().encode("decrypted plaintext") })),
   });
   return {
     runtime,
@@ -599,6 +604,309 @@ function inboundEnvelope(
     expiresAt,
   };
 }
+
+function richClipboardBundle(plainText = "\uFEFF  fallback café e\u0301 🦊\r\n\t ") {
+  const html = '<div onclick="throw new Error(\'must remain data\')">HTML only<script>throw 1</script></div>';
+  const payload: ClipboardPayloadV1 = {
+    version: 1,
+    representations: [
+      { mime: "text/plain", encoding: "utf-8", data: plainText },
+      { mime: "text/html", encoding: "utf-8", data: html },
+    ],
+  };
+  return { payload, plainText, html, bytes: encodeClipboardBundleV1(payload) };
+}
+
+test("registration advertises both clipboard and bundle-v1 receive capabilities", async () => {
+  const registrations: string[][] = [];
+  const setup = await startReady({
+    registerDevice: async (_api, options) => {
+      registrations.push(options.capabilities ?? []);
+      return { identity, device: registeredDevice };
+    },
+  });
+  assert.deepEqual(registrations, [["clipboard", "clipboard-bundle-v1"]]);
+  assert.equal(setup.runtime.getStatus().device.deviceId, identity.deviceId);
+  assert.equal(setup.runtime.getStatus().syncReady, true);
+});
+
+test("legacy receive decodes exact UTF-8 bytes rather than a predecoded plaintext field", async () => {
+  const exactText = "\uFEFF  café e\u0301 日本語 🦊\r\n\t \u0000";
+  const writes: string[] = [];
+  let decryptions = 0;
+  const setup = await startReady({
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text) => { writes.push(text); },
+    },
+    decrypt: async () => {
+      decryptions += 1;
+      return {
+        plaintext: "must not use this convenience field",
+        plaintextBytes: new TextEncoder().encode(exactText),
+      };
+    },
+  });
+  const envelope = inboundEnvelope("legacy-exact-utf8");
+  await setup.runtime.receiveClipboardItem(envelope);
+  await setup.runtime.receiveClipboardItem(envelope);
+  assert.deepEqual(writes, [exactText]);
+  assert.equal(decryptions, 1);
+});
+
+test("bundle-v1 receive writes only its exact plain text fallback once", async () => {
+  const bundle = richClipboardBundle();
+  const writes: string[] = [];
+  const processedItemStore = new RecordingProcessedItemStore();
+  let decryptions = 0;
+  const setup = await startReady({
+    processedItemStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text) => { writes.push(text); },
+    },
+    decrypt: async () => {
+      decryptions += 1;
+      return { plaintext: bundle.html, plaintextBytes: bundle.bytes };
+    },
+  });
+  const envelope = { ...inboundEnvelope("bundle-fallback"), contentType: CLIPBOARD_BUNDLE_V1_MIME };
+  await setup.runtime.receiveClipboardItem(envelope);
+  await setup.runtime.receiveClipboardItem(envelope);
+  assert.deepEqual(writes, [bundle.plainText]);
+  assert.equal(decryptions, 1);
+  assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "applied");
+  assert.equal(setup.runtime.getStatus().lastSyncError, undefined);
+});
+
+test("unknown content types are consumed after crypto verification without decoding or retrying", async () => {
+  for (const contentType of ["application/x-copyyt-future", "text/html", "text/plain;charset=utf-8"]) {
+    const processedItemStore = new RecordingProcessedItemStore();
+    const writes: string[] = [];
+    let decryptions = 0;
+    const setup = await startReady({
+      processedItemStore,
+      clipboardAdapter: {
+        readText: async () => "",
+        writeText: async (text) => { writes.push(text); },
+      },
+      decrypt: async () => {
+        decryptions += 1;
+        return { plaintextBytes: new Uint8Array([0xff]) };
+      },
+    });
+    const envelope = { ...inboundEnvelope(`unsupported-${contentType}`), contentType };
+    await setup.runtime.receiveClipboardItem(envelope);
+    await setup.runtime.receiveClipboardItem(envelope);
+    assert.deepEqual(writes, []);
+    assert.equal(decryptions, 1);
+    assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "unsupported-content");
+    assert.equal(setup.runtime.getStatus().lastSyncError, undefined);
+    assert.equal(setup.runtime.getStatus().syncReady, true);
+  }
+});
+
+test("invalid UTF-8 and malformed bundles are consumed as invalid content rather than crypto failure", async () => {
+  const malformedItems = [
+    { contentType: "text/plain", plaintextBytes: new Uint8Array([0xc3, 0x28]) },
+    { contentType: CLIPBOARD_BUNDLE_V1_MIME, plaintextBytes: new Uint8Array([0xff]) },
+    { contentType: CLIPBOARD_BUNDLE_V1_MIME, plaintextBytes: new TextEncoder().encode("{not JSON") },
+    {
+      contentType: CLIPBOARD_BUNDLE_V1_MIME,
+      plaintextBytes: new TextEncoder().encode(JSON.stringify({
+        version: 1,
+        representations: [{ mime: "text/html", encoding: "utf-8", data: "<b>no fallback</b>" }],
+      })),
+    },
+  ];
+  for (const [index, item] of malformedItems.entries()) {
+    const processedItemStore = new RecordingProcessedItemStore();
+    const writes: string[] = [];
+    let decryptions = 0;
+    const setup = await startReady({
+      processedItemStore,
+      clipboardAdapter: {
+        readText: async () => "",
+        writeText: async (text) => { writes.push(text); },
+      },
+      decrypt: async () => {
+        decryptions += 1;
+        return { plaintext: "never write this", plaintextBytes: item.plaintextBytes };
+      },
+    });
+    const envelope = { ...inboundEnvelope(`invalid-content-${index}`), contentType: item.contentType };
+    await setup.runtime.receiveClipboardItem(envelope);
+    await setup.runtime.receiveClipboardItem(envelope);
+    assert.deepEqual(writes, []);
+    assert.equal(decryptions, 1);
+    assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "invalid-content");
+    assert.equal(setup.runtime.getStatus().lastSyncError?.code, "INVALID_CLIPBOARD_CONTENT");
+    assert.equal(setup.runtime.getStatus().syncReady, true);
+    assert.equal(JSON.stringify(setup.runtime.getStatus()).includes("never write this"), false);
+  }
+});
+
+test("stale bundles are consumed before decrypt and without content diagnostics", async () => {
+  const processedItemStore = new RecordingProcessedItemStore();
+  let decryptions = 0;
+  const writes: string[] = [];
+  const setup = await startReady({
+    processedItemStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text) => { writes.push(text); },
+    },
+    decrypt: async () => {
+      decryptions += 1;
+      throw new Error("stale bundles must not decrypt");
+    },
+  });
+  const envelope = {
+    ...inboundEnvelope("stale-bundle", new Date(Date.now() - 1).toISOString()),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  };
+  await setup.runtime.receiveClipboardItem(envelope);
+  assert.equal(decryptions, 0);
+  assert.deepEqual(writes, []);
+  assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "stale");
+  assert.equal(setup.runtime.getStatus().lastSyncError, undefined);
+});
+
+test("bundle self-echo is verified and consumed without clipboard write", async () => {
+  const bundle = richClipboardBundle();
+  const processedItemStore = new RecordingProcessedItemStore();
+  const writes: string[] = [];
+  let decryptions = 0;
+  const setup = await startReady({
+    processedItemStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text) => { writes.push(text); },
+    },
+    decrypt: async () => {
+      decryptions += 1;
+      return { plaintextBytes: bundle.bytes };
+    },
+  });
+  const envelope = { ...inboundEnvelope("bundle-self-echo"), contentType: CLIPBOARD_BUNDLE_V1_MIME };
+  await setup.outboundItemStore.mark({
+    userId: user.id,
+    itemId: envelope.itemId,
+    publishedAt: new Date().toISOString(),
+    sourceDeviceId: identity.deviceId,
+  });
+  await setup.runtime.receiveClipboardItem(envelope);
+  assert.equal(decryptions, 1);
+  assert.deepEqual(writes, []);
+  assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "self-echo");
+});
+
+test("Receive Off consumes a bundle before decrypt and blocks replay after re-enable", async () => {
+  const syncPreferencesStore = new InMemorySyncPreferencesStore();
+  await syncPreferencesStore.set({ schemaVersion: 1, sendEnabled: true, receiveEnabled: false });
+  const processedItemStore = new RecordingProcessedItemStore();
+  const writes: string[] = [];
+  let decryptions = 0;
+  const setup = await startReady({
+    syncPreferencesStore,
+    processedItemStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text) => { writes.push(text); },
+    },
+    decrypt: async () => {
+      decryptions += 1;
+      return { plaintextBytes: richClipboardBundle().bytes };
+    },
+  });
+  const envelope = { ...inboundEnvelope("disabled-bundle"), contentType: CLIPBOARD_BUNDLE_V1_MIME };
+  await setup.runtime.receiveClipboardItem(envelope);
+  await setup.runtime.handleMessage(runtimeMessage({
+    type: "runtime:set-sync-preferences", sendEnabled: true, receiveEnabled: true,
+  }));
+  await setup.runtime.receiveClipboardItem(envelope);
+  assert.equal(decryptions, 0);
+  assert.deepEqual(writes, []);
+  assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "receive-disabled");
+});
+
+test("Receive Off during bundle decryption blocks writes even after immediate re-enable", async () => {
+  for (const reenableBeforeDecrypt of [false, true]) {
+    let beginDecryption!: () => void;
+    const decryptionStarted = new Promise<void>((resolve) => { beginDecryption = resolve; });
+    let releaseDecryption!: () => void;
+    const decryptionGate = new Promise<void>((resolve) => { releaseDecryption = resolve; });
+    const processedItemStore = new RecordingProcessedItemStore();
+    const writes: string[] = [];
+    let decryptions = 0;
+    const setup = await startReady({
+      processedItemStore,
+      clipboardAdapter: {
+        readText: async () => "",
+        writeText: async (text) => { writes.push(text); },
+      },
+      decrypt: async () => {
+        decryptions += 1;
+        beginDecryption();
+        await decryptionGate;
+        return { plaintextBytes: richClipboardBundle().bytes };
+      },
+    });
+    const envelope = { ...inboundEnvelope(`in-flight-bundle-${reenableBeforeDecrypt}`), contentType: CLIPBOARD_BUNDLE_V1_MIME };
+    const receive = setup.runtime.receiveClipboardItem(envelope);
+    await decryptionStarted;
+    assert.equal((await setup.runtime.handleMessage(runtimeMessage({
+      type: "runtime:set-sync-preferences", sendEnabled: true, receiveEnabled: false,
+    }))).ok, true);
+    if (reenableBeforeDecrypt) {
+      await setup.runtime.handleMessage(runtimeMessage({
+        type: "runtime:set-sync-preferences", sendEnabled: true, receiveEnabled: true,
+      }));
+    }
+    releaseDecryption();
+    await receive;
+    await setup.runtime.handleMessage(runtimeMessage({
+      type: "runtime:set-sync-preferences", sendEnabled: true, receiveEnabled: true,
+    }));
+    await setup.runtime.receiveClipboardItem(envelope);
+    assert.deepEqual(writes, []);
+    assert.equal(decryptions, 1);
+    assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "receive-disabled");
+  }
+});
+
+test("Receive policy is rechecked after bundle decoding immediately before OS write", async () => {
+  const bytes = richClipboardBundle().bytes;
+  const processedItemStore = new RecordingProcessedItemStore();
+  const writes: string[] = [];
+  let disableResult: ReturnType<CopyytServiceWorkerRuntime["handleMessage"]> | undefined;
+  const setup = await startReady({
+    processedItemStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text) => { writes.push(text); },
+    },
+    decrypt: async () => ({
+      // Force a policy change as decoding reads the decrypted bytes, after the
+      // post-decrypt guard, to exercise the final guard independently.
+      get plaintextBytes() {
+        disableReceive();
+        return bytes;
+      },
+    }),
+  });
+  const disableReceive = () => {
+    disableResult = setup.runtime.handleMessage(runtimeMessage({
+      type: "runtime:set-sync-preferences", sendEnabled: true, receiveEnabled: false,
+    }));
+  };
+  const envelope = { ...inboundEnvelope("bundle-decode-policy-boundary"), contentType: CLIPBOARD_BUNDLE_V1_MIME };
+  await setup.runtime.receiveClipboardItem(envelope);
+  assert.ok(disableResult);
+  assert.equal((await disableResult).ok, true);
+  assert.deepEqual(writes, []);
+  assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "receive-disabled");
+});
 
 const flushRuntimeWork = (): Promise<void> =>
   new Promise((resolve) => setImmediate(resolve));
@@ -1433,7 +1741,7 @@ test("receive disabled consumes an item without decrypting and never replays it"
     },
     decrypt: async () => {
       decryptions += 1;
-      return { plaintext: "secret", plaintextBytes: new Uint8Array() };
+      return { plaintext: "secret", plaintextBytes: new TextEncoder().encode("secret") };
     },
   });
   const envelope = inboundEnvelope("receive-disabled-item");
@@ -1479,7 +1787,7 @@ test("an in-flight receive is consumed when receive is disabled before clipboard
     decrypt: async () => {
       markDecryptionStarted();
       await decryptionGate;
-      return { plaintext: "old inbound value", plaintextBytes: new Uint8Array() };
+      return { plaintext: "old inbound value", plaintextBytes: new TextEncoder().encode("old inbound value") };
     },
   });
 
@@ -1526,7 +1834,7 @@ test("Receive disable becomes a barrier before its storage write completes", asy
     decrypt: async () => {
       markDecryptionStarted();
       await decryptionGate;
-      return { plaintext: "old inbound value", plaintextBytes: new Uint8Array() };
+      return { plaintext: "old inbound value", plaintextBytes: new TextEncoder().encode("old inbound value") };
     },
   });
 
@@ -1573,7 +1881,7 @@ test("an in-flight receive is not revived by Both after receive briefly turns Of
     decrypt: async () => {
       markDecryptionStarted();
       await decryptionGate;
-      return { plaintext: "pre-Off inbound value", plaintextBytes: new Uint8Array() };
+      return { plaintext: "pre-Off inbound value", plaintextBytes: new TextEncoder().encode("pre-Off inbound value") };
     },
   });
 
@@ -3089,6 +3397,50 @@ test("publishing intersects local recipients with active server-trusted devices"
   assert.deepEqual(recipientIds, [pendingDevice.deviceId]);
 });
 
+test("recipient bundle capabilities never select outgoing bundles or establish local trust", async () => {
+  for (const capabilities of [[], ["clipboard"], ["clipboard", "clipboard-bundle-v1"]]) {
+    const currentDevice = { ...registeredDevice, capabilities };
+    const recipient = {
+      ...pendingDevice,
+      trustState: "trusted",
+      approvedByDeviceId: identity.deviceId,
+      capabilities,
+    };
+    const unverifiedDevice = {
+      ...recipient,
+      deviceId: "00000000-0000-4000-8000-000000000003",
+      capabilities: ["clipboard", "clipboard-bundle-v1"],
+    };
+    const pairing = makePairingTrustStore(identity, currentDevice);
+    putLocalRecord(pairing.records, recipient, "verified");
+    putLocalRecord(pairing.records, unverifiedDevice, "unverified");
+    const plaintext = "  raw recipient-independent e\u0301 🦊\n";
+    const encryptInputs: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0][] = [];
+    const setup = await startReady({
+      registeredDevice: currentDevice,
+      trustStore: pairing.trustStore,
+      listDevices: async () => response([currentDevice, recipient, unverifiedDevice]),
+      encrypt: async (input) => {
+        encryptInputs.push(input);
+        return {
+          ...inboundEnvelope("capability-independent-publish"),
+          contentType: input.contentType,
+          expiresAt: input.expiresAt,
+        };
+      },
+    });
+    await setup.runtime.publishClipboardText(plaintext);
+    assert.equal(encryptInputs.length, 1);
+    assert.equal(encryptInputs[0].contentType, "text/plain");
+    assert.equal(encryptInputs[0].plaintext, plaintext);
+    assert.deepEqual(
+      encryptInputs[0].recipients.map((device) => device.deviceId).sort(),
+      [identity.deviceId, recipient.deviceId].sort(),
+    );
+    assert.equal(pairing.records.get(`${user.id}:${unverifiedDevice.deviceId}`)?.trustState, "unverified");
+  }
+});
+
 function clipboardObservation(text: string) {
   return {
     source: "offscreen" as const,
@@ -3098,11 +3450,15 @@ function clipboardObservation(text: string) {
   };
 }
 
-test("automatic observations use the same publish path as manual Send", async () => {
+test("automatic observations and manual Send use typed payloads but encrypt exact legacy raw text", async () => {
+  const now = new Date("2030-01-01T00:00:00.000Z");
+  const manualText = "\uFEFF  manual café e\u0301 🦊\r\n\t ";
+  const automaticText = "\n automatic 日本語 🚀\t  ";
   const watchCalls: Array<{ type: "start" | "stop"; resetBaseline?: boolean }> = [];
-  const encryptedTexts: string[] = [];
+  const encryptInputs: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0][] = [];
+  const typedPayloads: ClipboardPayloadV1[] = [];
   const clipboardAdapter: ClipboardAdapter = {
-    readText: async () => "manual text",
+    readText: async () => manualText,
     writeText: async () => undefined,
     startWatching: async (options) => {
       watchCalls.push({ type: "start", resetBaseline: options?.resetBaseline });
@@ -3114,22 +3470,28 @@ test("automatic observations use the same publish path as manual Send", async ()
   const setup = await startReady({
     localTrustState: "verified",
     clipboardAdapter,
+    now: () => now,
     encrypt: async (input) => {
-      encryptedTexts.push(input.plaintext as string);
+      encryptInputs.push(input);
       return {
-        itemId: `${encryptedTexts.length}`,
+        itemId: `${encryptInputs.length}`,
         sourceDeviceId: input.identity.deviceId,
         sourceKeyVersion: 1,
         sourceSignature: "signature",
         protocolVersion: 1 as const,
-        contentType: "text/plain",
+        contentType: input.contentType,
         ciphertext: "ciphertext",
         nonce: "nonce",
         recipients: [],
-        expiresAt: new Date().toISOString(),
+        expiresAt: input.expiresAt,
       };
     },
   });
+  const publishPayload = setup.runtime.publishClipboardPayload.bind(setup.runtime);
+  setup.runtime.publishClipboardPayload = async (payload) => {
+    typedPayloads.push(payload);
+    return publishPayload(payload);
+  };
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(setup.runtime.getStatus().clipboardWatch, "watching");
   assert.deepEqual(watchCalls, [
@@ -3141,8 +3503,21 @@ test("automatic observations use the same publish path as manual Send", async ()
     runtimeMessage({ type: "runtime:send-current-clipboard" }),
   );
   assert.equal(manual.ok, true);
-  await setup.runtime.handleClipboardObservation(clipboardObservation("automatic text"));
-  assert.deepEqual(encryptedTexts, ["manual text", "automatic text"]);
+  await setup.runtime.handleClipboardObservation(clipboardObservation(automaticText));
+  assert.deepEqual(typedPayloads, [manualText, automaticText].map((text) => ({
+    version: 1,
+    representations: [{ mime: "text/plain", encoding: "utf-8", data: text }],
+  })));
+  assert.deepEqual(encryptInputs.map((input) => input.plaintext), [manualText, automaticText]);
+  assert.deepEqual(encryptInputs.map((input) => input.contentType), ["text/plain", "text/plain"]);
+  assert.deepEqual(
+    encryptInputs.map((input) => new Date(input.expiresAt).getTime()),
+    [now.getTime() + 60_000, now.getTime() + 60_000],
+  );
+  const publishedEnvelopes = setup.socket.emissions
+    .filter((emission) => emission.event === "clipboard:publish")
+    .map((emission) => emission.args[0] as { contentType: string });
+  assert.deepEqual(publishedEnvelopes.map((envelope) => envelope.contentType), ["text/plain", "text/plain"]);
   assert.equal(typeof setup.runtime.getStatus().lastAutoSyncAt, "string");
 });
 

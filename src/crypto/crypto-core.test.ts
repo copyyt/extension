@@ -15,6 +15,7 @@ import {
 } from "./key-store.ts";
 import {
   decryptClipboardItem,
+  decryptClipboardItemBytes,
   encryptClipboardItem,
   pairingFingerprint,
   signDeviceApproval,
@@ -34,6 +35,12 @@ import {
 } from "./protocol.ts";
 import type { ClientVerifiedDevice } from "./trust-store.ts";
 import { InMemoryTrustStore } from "./trust-store.ts";
+import {
+  AES_GCM_TAG_BYTES,
+  MAX_CLIPBOARD_CIPHERTEXT_BYTES,
+  MAX_CLIPBOARD_PLAINTEXT_BYTES,
+} from "../clipboard/limits.ts";
+import { CLIPBOARD_BUNDLE_V1_MIME } from "../clipboard/payload.ts";
 
 const userId = "11111111-1111-4111-8111-111111111111";
 const deviceAId = "00000000-0000-4000-8000-000000000001";
@@ -348,6 +355,58 @@ test("fixed identities encrypt, wrap, sign, verify, unwrap, and decrypt", async 
   });
   assert.equal(decrypted.plaintext, "hello from Copyyt");
   assert.equal(bytesToHex(decrypted.plaintextBytes), bytesToHex(utf8Encode("hello from Copyyt")));
+});
+
+test("safe plaintext maximum encrypts to exactly the backend ciphertext maximum", async () => {
+  const identityA = await makeFixedIdentity(deviceAId, 1);
+  const identityB = await makeFixedIdentity(deviceBId, 1, true);
+  const plaintext = "a".repeat(MAX_CLIPBOARD_PLAINTEXT_BYTES);
+  const envelope = await encryptClipboardItem({
+    userId,
+    identity: identityA,
+    plaintext,
+    contentType: "text/plain",
+    expiresAt,
+    recipients: [verifiedDevice(identityB)],
+  });
+  const ciphertextBytes = base64ToBytes(envelope.ciphertext).byteLength;
+  assert.equal(ciphertextBytes, MAX_CLIPBOARD_CIPHERTEXT_BYTES);
+  assert.equal(ciphertextBytes - utf8Encode(plaintext).byteLength, AES_GCM_TAG_BYTES);
+  assert.equal(AES_GCM_TAG_BYTES, 16);
+  assert.equal(base64ToBytes(envelope.nonce).byteLength, 12);
+  const decrypted = await decryptClipboardItem({
+    userId,
+    identity: identityB,
+    sourceDevice: verifiedDevice(identityA),
+    envelope,
+  });
+  assert.equal(decrypted.plaintext, plaintext);
+});
+
+test("authenticated byte decryption leaves malformed UTF-8 to content dispatch", async () => {
+  const identityA = await makeFixedIdentity(deviceAId, 1);
+  const identityB = await makeFixedIdentity(deviceBId, 1, true);
+  const plaintextBytes = new Uint8Array([0xc3, 0x28]);
+  const envelope = await encryptClipboardItem({
+    userId,
+    identity: identityA,
+    plaintext: plaintextBytes,
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+    expiresAt,
+    recipients: [verifiedDevice(identityB)],
+  });
+  const input = {
+    userId,
+    identity: identityB,
+    sourceDevice: verifiedDevice(identityA),
+    envelope,
+  };
+  assert.deepEqual(await decryptClipboardItemBytes(input), { plaintextBytes });
+  await assert.rejects(decryptClipboardItem(input), TypeError);
+  await assert.rejects(decryptClipboardItemBytes({
+    ...input,
+    envelope: { ...envelope, contentType: "text/plain" },
+  }), /signature is invalid/);
 });
 
 test("negative cases reject before plaintext is returned", async () => {

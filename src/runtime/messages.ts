@@ -2,6 +2,7 @@ import type { IUser } from "../interfaces/user.interface.ts";
 import type { ClipboardItemEnvelope } from "../crypto/crypto-core.ts";
 import type { RuntimeErrorCode } from "./errors.ts";
 import type { SyncPreferences } from "./sync-preferences.ts";
+import { MAX_CLIPBOARD_PLAINTEXT_BYTES } from "../clipboard/limits.ts";
 
 export const RUNTIME_SOURCE = "service-worker" as const;
 export const POPUP_SOURCE = "popup" as const;
@@ -9,7 +10,7 @@ export const OFFSCREEN_SOURCE = "offscreen" as const;
 
 // Transport guard for plaintext crossing the extension messaging boundary.
 // This does not add a field to the encrypted Copyyt protocol.
-export const MAX_CLIPBOARD_TEXT_BYTES = 1024 * 1024;
+export const MAX_CLIPBOARD_TEXT_BYTES = MAX_CLIPBOARD_PLAINTEXT_BYTES;
 
 export type ClipboardWatchState = "stopped" | "starting" | "watching" | "error";
 

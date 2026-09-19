@@ -27,10 +27,11 @@ import type {
   ClientVerifiedDevice,
   LocalDeviceRecord,
 } from "./trust-store.ts";
+import { AES_GCM_TAG_BYTES } from "../clipboard/limits.ts";
 
 const ED25519 = { name: "Ed25519" } as Algorithm;
 const X25519 = { name: "X25519" } as Algorithm;
-const AES_GCM_TAG_LENGTH = 128;
+const AES_GCM_TAG_LENGTH = AES_GCM_TAG_BYTES * 8;
 const KEY_LENGTH_BYTES = 32;
 const NONCE_LENGTH_BYTES = 12;
 
@@ -564,6 +565,15 @@ export async function decryptClipboardItem(input: DecryptClipboardItemInput): Pr
   plaintext: string;
   plaintextBytes: Uint8Array;
 }> {
+  const { plaintextBytes } = await decryptClipboardItemBytes(input);
+  return { plaintext: utf8Decode(plaintextBytes), plaintextBytes };
+}
+
+// Authenticate first; callers that dispatch by content type decode these bytes
+// separately so malformed content is not reported as a cryptographic failure.
+export async function decryptClipboardItemBytes(input: DecryptClipboardItemInput): Promise<{
+  plaintextBytes: Uint8Array;
+}> {
   const { envelope, identity } = input;
   if (identity.userId !== input.userId) {
     throw new CryptoProtocolError("The recipient identity belongs to another account");
@@ -648,7 +658,7 @@ export async function decryptClipboardItem(input: DecryptClipboardItemInput): Pr
   } catch {
     throw new CryptoProtocolError("Clipboard payload authentication failed");
   }
-  return { plaintext: utf8Decode(plaintextBytes), plaintextBytes };
+  return { plaintextBytes };
 }
 
 export async function pairingFingerprint(

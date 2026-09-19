@@ -7,6 +7,8 @@ export type ProcessedItemDisposition =
   | "applied"
   | "self-echo"
   | "receive-disabled"
+  | "unsupported-content"
+  | "invalid-content"
   | "stale";
 
 const MAX_ITEM_AGE_MS = 24 * 60 * 60 * 1000;

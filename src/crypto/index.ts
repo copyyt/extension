@@ -1,5 +1,6 @@
 export {
   decryptClipboardItem,
+  decryptClipboardItemBytes,
   encryptClipboardItem,
   computePairingFingerprint,
   pairingFingerprint,
