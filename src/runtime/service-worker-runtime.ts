@@ -2002,10 +2002,7 @@ export class CopyytServiceWorkerRuntime {
     // the next offscreen poll without persisting any image plaintext.
     const fingerprint = await this.pngFingerprint(pngBytes);
     const suppressionExpiry = new Date(
-      Math.min(
-        expiresAt,
-        now + ASSISTED_PNG_SUPPRESSION_TTL_MS,
-      ),
+      now + ASSISTED_PNG_SUPPRESSION_TTL_MS,
     ).toISOString();
     await this.assistedPngSuppressionStore.put({
       userId: session.user.id,
