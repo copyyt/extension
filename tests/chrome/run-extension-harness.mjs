@@ -140,6 +140,64 @@ try {
   }
   process.stdout.write(`${status}${status === "MISSING" ? `\npage=${pageUrl}` : ""}\n`);
   if (status.startsWith("PASS")) {
+    await devTools.command("Page.navigate", {
+      url: `chrome-extension://${id}/png-clipboard-experiment.html`,
+    });
+    await devTools.command("Page.bringToFront");
+    await devTools.command("DOM.enable");
+    let buttonNode = { nodeId: 0 };
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const document = await devTools.command("DOM.getDocument");
+      buttonNode = await devTools.command("DOM.querySelector", {
+        nodeId: document.root.nodeId,
+        selector: "#copy-test-png",
+      });
+      if (buttonNode.nodeId) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (!buttonNode.nodeId) {
+      throw new Error("The focused PNG clipboard experiment page did not load its button");
+    }
+    const buttonBox = await devTools.command("DOM.getBoxModel", {
+      nodeId: buttonNode.nodeId,
+    });
+    const content = buttonBox.model?.content;
+    if (!content || content.length !== 8) {
+      throw new Error("The focused PNG clipboard experiment button has no visible box");
+    }
+    const clickX = (content[0] + content[2] + content[4] + content[6]) / 4;
+    const clickY = (content[1] + content[3] + content[5] + content[7]) / 4;
+    await devTools.command("Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x: clickX,
+      y: clickY,
+      button: "left",
+      clickCount: 1,
+    });
+    await devTools.command("Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x: clickX,
+      y: clickY,
+      button: "left",
+      clickCount: 1,
+    });
+
+    let experiment = { output: "MISSING", support: "MISSING", focus: false, visibility: "unknown" };
+    for (let attempt = 0; attempt < 160; attempt += 1) {
+      const evaluation = await devTools.command("Runtime.evaluate", {
+        expression: "JSON.stringify({output: document.querySelector('#output')?.textContent || 'MISSING', support: document.querySelector('#clipboard-item-support')?.textContent || 'MISSING', focus: document.hasFocus(), visibility: document.visibilityState})",
+        returnByValue: true,
+      });
+      experiment = JSON.parse(evaluation.result?.value || JSON.stringify(experiment));
+      if (experiment.output.startsWith("PASS") || experiment.output.startsWith("FAIL")) break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    process.stdout.write(`PNG experiment: ${experiment.output}\n`);
+    process.stdout.write(`PNG experiment page: ClipboardItem=${experiment.support}, visible=${experiment.visibility}, focused=${experiment.focus}\n`);
+    if (!experiment.output.startsWith("PASS")) {
+      throw new Error("The focused PNG clipboard experiment did not resolve successfully");
+    }
+
     const targetState = await browserDevTools.command("Target.getTargets");
     const worker = targetState.targetInfos.find(
       (target) => target.type === "service_worker" && target.url.startsWith(`chrome-extension://${id}/`),

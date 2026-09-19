@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Copyyt PNG clipboard experiment</title>
+  </head>
+  <body>
+    <main>
+      <h1>PNG clipboard experiment</h1>
+      <p>This development-only test writes a deterministic PNG from this focused Copyyt extension page.</p>
+      <button id="copy-test-png" type="button">Copy test PNG</button>
+      <p>Status: <output id="status">Ready</output></p>
+      <p>ClipboardItem: <output id="clipboard-item-support">Checking…</output></p>
+      <p>Read-back image/png: <output id="read-back">Not tested</output></p>
+      <pre id="output">Ready</pre>
+    </main>
+    <script type="module" src="/src/png-clipboard-experiment.ts"></script>
+  </body>
+</html>

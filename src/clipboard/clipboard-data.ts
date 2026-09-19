@@ -237,10 +237,6 @@ export function setChromeOffscreenClipboardDataFromPayload(
   return actual;
 }
 
-/** @deprecated Use setChromeOffscreenClipboardDataFromPayload explicitly. */
-export const setClipboardDataFromPayload =
-  setChromeOffscreenClipboardDataFromPayload;
-
 export function clipboardPayloadsEqual(
   left: ClipboardPayloadV1,
   right: ClipboardPayloadV1,

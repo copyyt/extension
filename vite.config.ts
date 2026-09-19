@@ -34,6 +34,9 @@ const extensionInputs = isExtensionWorkerBuild
   : {
       main: "./index.html",
       ...(isExtension ? { offscreen: "./src/offscreen.ts" } : {}),
+      ...(isExtension && extensionEnvironment === "dev"
+        ? { pngExperiment: "./png-clipboard-experiment.html" }
+        : {}),
     };
 
 // https://vite.dev/config/
@@ -71,7 +74,7 @@ export default defineConfig({
     emptyOutDir: !isExtensionWorkerBuild,
     ...(isExtension ? { modulePreload: false } : {}),
     rollupOptions: {
-      input: isPWA || isExtensionWorkerBuild ? extensionInputs : {
+      input: isPWA || isExtensionWorkerBuild || isExtension ? extensionInputs : {
         main: "./index.html",
         offscreen: "./src/offscreen.ts",
       },
