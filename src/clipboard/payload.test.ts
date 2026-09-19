@@ -4,6 +4,7 @@ import {
   AES_GCM_TAG_BYTES,
   MAX_CLIPBOARD_CIPHERTEXT_BYTES,
   MAX_CLIPBOARD_PLAINTEXT_BYTES,
+  MAX_LOCAL_CLIPBOARD_IMAGE_BYTES,
 } from "./limits.ts";
 import {
   CLIPBOARD_BUNDLE_V1_MIME,
@@ -12,11 +13,16 @@ import {
   decodeClipboardBundleV1,
   decodeClipboardPlainText,
   encodeClipboardBundleV1,
+  clipboardPayloadFromPngBytes,
+  getPngBytes,
+  getPngRepresentation,
+  hasPlainTextRepresentation,
   getHtmlRepresentation,
   getPlainTextRepresentation,
   validateClipboardPayloadV1,
   type ClipboardPayloadV1,
 } from "./payload.ts";
+import { bytesToBase64 } from "../crypto/bytes.ts";
 import {
   isClipboardText,
   MAX_CLIPBOARD_TEXT_BYTES,
@@ -27,12 +33,21 @@ const plainRepresentation = {
   mime: "text/plain",
   encoding: "utf-8",
   data: "text",
-};
+} as const;
 const htmlRepresentation = {
   mime: "text/html",
   encoding: "utf-8",
   data: "<p>text</p>",
-};
+} as const;
+const pngBytes = new Uint8Array([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  0x00, 0x01, 0x02, 0x03, 0x04,
+]);
+const pngRepresentation = {
+  mime: "image/png",
+  encoding: "base64",
+  data: bytesToBase64(pngBytes),
+} as const;
 
 function serialized(value: unknown): Uint8Array {
   return encoder.encode(JSON.stringify(value));
@@ -57,6 +72,75 @@ test("plain text payload construction creates only the mandatory fallback", () =
     getPlainTextRepresentation(clipboardPayloadFromPlainText("")).data,
     "",
   );
+});
+
+test("PNG payloads validate, round-trip exact bytes, and support image-only data", () => {
+  const imageOnly = clipboardPayloadFromPngBytes(pngBytes);
+  assert.equal(hasPlainTextRepresentation(imageOnly), false);
+  assert.deepEqual(getPngRepresentation(imageOnly), pngRepresentation);
+  assert.deepEqual(getPngBytes(imageOnly), pngBytes);
+  assert.deepEqual(
+    decodeClipboardBundleV1(encodeClipboardBundleV1(imageOnly)),
+    imageOnly,
+  );
+
+  const mixed: ClipboardPayloadV1 = {
+    version: 1,
+    representations: [
+      { ...plainRepresentation, data: "plain" },
+      { ...htmlRepresentation },
+      { ...pngRepresentation },
+    ],
+  };
+  validateClipboardPayloadV1(mixed);
+  assert.deepEqual(decodeClipboardBundleV1(encodeClipboardBundleV1(mixed)), mixed);
+});
+
+test("PNG validation rejects malformed, non-canonical, empty, and non-PNG data", () => {
+  const invalids: ClipboardPayloadV1[] = [
+    {
+      version: 1,
+      representations: [{ ...pngRepresentation, data: "%%%=" }],
+    },
+    {
+      version: 1,
+      representations: [{ ...pngRepresentation, data: pngRepresentation.data.replace(/=+$/, "") }],
+    },
+    {
+      version: 1,
+      representations: [{ ...pngRepresentation, data: "" }],
+    },
+    {
+      version: 1,
+      representations: [pngRepresentation, pngRepresentation],
+    },
+    {
+      version: 1,
+      representations: [
+        { ...pngRepresentation, data: bytesToBase64(new Uint8Array([1, 2, 3])) },
+      ],
+    },
+    {
+      version: 1,
+      representations: [{ ...pngRepresentation, encoding: "utf-8" as unknown as "base64" }],
+    },
+  ];
+  for (const invalid of invalids) {
+    assert.throws(() => validateClipboardPayloadV1(invalid));
+    assert.throws(() => encodeClipboardBundleV1(invalid));
+  }
+});
+
+test("local PNG ceiling is independent from the relay bundle ceiling", () => {
+  const largerThanWire = new Uint8Array(786_432);
+  largerThanWire.set(pngBytes);
+  const payload = clipboardPayloadFromPngBytes(largerThanWire);
+  validateClipboardPayloadV1(payload);
+  assert.throws(() => encodeClipboardBundleV1(payload));
+
+  const overLocalCeiling = new Uint8Array(MAX_LOCAL_CLIPBOARD_IMAGE_BYTES + 1);
+  overLocalCeiling.set(pngBytes);
+  assert.throws(() => clipboardPayloadFromPngBytes(overLocalCeiling));
 });
 
 test("whitespace, Unicode, emoji, decomposed accents and leading BOM remain exact", () => {

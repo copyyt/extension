@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { clipboardPayloadFromPlainText, type ClipboardPayloadV1 } from "../clipboard/payload.ts";
+import {
+  clipboardPayloadFromPlainText,
+  clipboardPayloadFromPngBytes,
+  type ClipboardPayloadV1,
+} from "../clipboard/payload.ts";
 import { ClipboardWatcher } from "./clipboard-watcher.ts";
 
 class FakeTimers {
@@ -247,6 +251,89 @@ function richPayload(plain: string, html: string): ClipboardPayloadV1 {
     ],
   };
 }
+
+function pngPayload(marker: number): ClipboardPayloadV1 {
+  return clipboardPayloadFromPngBytes(
+    new Uint8Array([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      marker,
+    ]),
+  );
+}
+
+test("typed watcher observes image-only changes and suppresses identical PNGs", async () => {
+  let clipboard = pngPayload(1);
+  const changed: ClipboardPayloadV1[] = [];
+  const timers = new FakeTimers();
+  const watcher = new ClipboardWatcher({
+    readPayload: () => clipboard,
+    onPayloadChanged: (payload) => { changed.push(payload); },
+    setIntervalFn: timers.setInterval,
+    clearIntervalFn: timers.clearInterval,
+  });
+
+  watcher.start();
+  await flush();
+  timers.tick();
+  await flush();
+  assert.deepEqual(changed, []);
+
+  clipboard = pngPayload(2);
+  timers.tick();
+  await flush();
+  assert.deepEqual(changed, [clipboard]);
+
+  timers.tick();
+  await flush();
+  assert.deepEqual(changed, [clipboard]);
+  watcher.stop();
+});
+
+test("typed watcher treats image and text/html differences as meaningful", async () => {
+  let clipboard: ClipboardPayloadV1 = {
+    version: 1,
+    representations: [
+      { mime: "text/plain", encoding: "utf-8", data: "same" },
+      { mime: "text/html", encoding: "utf-8", data: "<b>same</b>" },
+      ...pngPayload(1).representations,
+    ],
+  };
+  const changed: ClipboardPayloadV1[] = [];
+  const timers = new FakeTimers();
+  const watcher = new ClipboardWatcher({
+    readPayload: () => clipboard,
+    onPayloadChanged: (payload) => { changed.push(payload); },
+    setIntervalFn: timers.setInterval,
+    clearIntervalFn: timers.clearInterval,
+  });
+  watcher.start();
+  await flush();
+
+  clipboard = {
+    version: 1,
+    representations: [
+      ...pngPayload(2).representations,
+      { mime: "text/html", encoding: "utf-8", data: "<b>same</b>" },
+      { mime: "text/plain", encoding: "utf-8", data: "same" },
+    ],
+  };
+  timers.tick();
+  await flush();
+  assert.equal(changed.length, 1);
+
+  clipboard = {
+    version: 1,
+    representations: [
+      { mime: "text/plain", encoding: "utf-8", data: "same" },
+      { mime: "text/html", encoding: "utf-8", data: "<i>changed</i>" },
+      ...pngPayload(2).representations,
+    ],
+  };
+  timers.tick();
+  await flush();
+  assert.equal(changed.length, 2);
+  watcher.stop();
+});
 
 test("typed watcher establishes a rich baseline and emits plain or HTML changes", async () => {
   let clipboard = richPayload("same", "<b>same</b>");

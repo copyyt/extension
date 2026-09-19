@@ -96,8 +96,8 @@ test("registration refresh advertises bundle receive support and preserves ident
   });
 
   assert.equal(requests.length, 1);
-  assert.deepEqual(requests[0]!.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
-  assert.deepEqual(device.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+  assert.deepEqual(requests[0]!.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-v1"]);
+  assert.deepEqual(device.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-v1"]);
   assert.notEqual(requests[0]!.capabilities, CLIPBOARD_RECEIVE_CAPABILITIES);
   assert.equal(requests[0]!.deviceId, originalIdentity.deviceId);
   assert.equal(requests[0]!.encryptionPublicKey, originalIdentity.encryptionPublicKeyBase64);
@@ -110,7 +110,7 @@ test("registration refresh advertises bundle receive support and preserves ident
     signingPublicKey: approverIdentity.signingPublicKeyBase64,
     name: "Approver after capability update",
     platform: "chrome",
-    capabilities: ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
+    capabilities: ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-v1"],
     appVersion: "2.0.2",
     trustState: "trusted",
   });
@@ -118,7 +118,7 @@ test("registration refresh advertises bundle receive support and preserves ident
   assert.equal(refreshedApprover.pairedForDeviceId, pairingBefore?.pairedForDeviceId);
   assert.equal(refreshedApprover.pairingFingerprint, pairingBefore?.pairingFingerprint);
   assert.equal(refreshedApprover.pinnedAt, pairingBefore?.pinnedAt);
-  assert.deepEqual(refreshedApprover.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+  assert.deepEqual(refreshedApprover.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-v1"]);
   for (const changed of [
     { signingPublicKey: bytesToBase64(new Uint8Array(32).fill(9)) },
     { encryptionPublicKey: bytesToBase64(new Uint8Array(32).fill(9)) },
@@ -132,7 +132,7 @@ test("registration refresh advertises bundle receive support and preserves ident
         encryptionPublicKey: originalIdentity.encryptionPublicKeyBase64,
         signingPublicKey: originalIdentity.signingPublicKeyBase64,
         ...changed,
-        capabilities: ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
+        capabilities: ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-v1"],
         trustState: "trusted",
       }),
     );
@@ -147,7 +147,7 @@ test("registration refresh advertises bundle receive support and preserves ident
     assert.deepEqual(refreshed.encryptionPublicKey, originalIdentity.encryptionPublicKey);
     assert.deepEqual(refreshed.signingPublicKey, originalIdentity.signingPublicKey);
     assert.equal(refreshed.registration?.name, "Chrome after capability update");
-    assert.deepEqual(refreshed.registration?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+    assert.deepEqual(refreshed.registration?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-v1"]);
     assert.equal(
       await signSocketChallenge({ ...socketChallenge, identity: refreshed }),
       signatureBefore,
@@ -173,14 +173,14 @@ test("registration refresh advertises bundle receive support and preserves ident
   assert.equal(refreshedLocal?.pairedForDeviceId, trustedBefore?.pairedForDeviceId);
   assert.equal(refreshedLocal?.pairingFingerprint, trustedBefore?.pairingFingerprint);
   assert.equal(refreshedLocal?.pinnedAt, trustedBefore?.pinnedAt);
-  assert.deepEqual(refreshedLocal?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+  assert.deepEqual(refreshedLocal?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-v1"]);
   const reloadedApprover = await reloadedTrustStore.getDevice(userId, approverDeviceId);
   assert.equal(reloadedApprover?.trustState, pairingBefore?.trustState);
   assert.equal(reloadedApprover?.trustOrigin, pairingBefore?.trustOrigin);
   assert.equal(reloadedApprover?.pairedForDeviceId, pairingBefore?.pairedForDeviceId);
   assert.equal(reloadedApprover?.pairingFingerprint, pairingBefore?.pairingFingerprint);
   assert.equal(reloadedApprover?.pinnedAt, pairingBefore?.pinnedAt);
-  assert.deepEqual(reloadedApprover?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+  assert.deepEqual(reloadedApprover?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-v1"]);
   assert.equal((await reloadedTrustStore.listEncryptionRecipients(userId)).length, 2);
 });
 
@@ -196,9 +196,9 @@ test("registration capabilities and server trust labels do not establish local t
     trustStore,
   });
 
-  assert.deepEqual(requests[0]!.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+  assert.deepEqual(requests[0]!.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-v1"]);
   const local = await trustStore.getDevice(userId, localDeviceId);
-  assert.deepEqual(local?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+  assert.deepEqual(local?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-v1"]);
   assert.equal(local?.trustState, "unverified");
   assert.equal(local?.trustOrigin, undefined);
   assert.equal(local?.approvalCertificate, undefined);

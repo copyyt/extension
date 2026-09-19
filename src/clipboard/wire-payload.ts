@@ -3,6 +3,7 @@ import {
   encodeClipboardBundleV1,
   getHtmlRepresentation,
   getPlainTextRepresentation,
+  projectClipboardPayloadToText,
   type ClipboardPayloadV1,
 } from "./payload.ts";
 import {
@@ -63,9 +64,13 @@ export function selectClipboardWirePayload(input: {
   payload: ClipboardPayloadV1;
   recipients: readonly ClipboardWireRecipient[];
 }): ClipboardWirePayload {
-  const plainText = getPlainTextRepresentation(input.payload).data;
+  // Phase 2C.3.0 deliberately keeps the selector text-only. A local image
+  // may be present, but it must never enter the relay bundle or legacy wire
+  // plaintext until the later image transport phase.
+  const textPayload = projectClipboardPayloadToText(input.payload);
+  const plainText = getPlainTextRepresentation(textPayload).data;
   if (
-    !getHtmlRepresentation(input.payload) ||
+    !getHtmlRepresentation(textPayload) ||
     input.recipients.length === 0 ||
     !input.recipients.every(recipientSupportsRichClipboard)
   ) {
@@ -79,7 +84,7 @@ export function selectClipboardWirePayload(input: {
   try {
     return {
       contentType: CLIPBOARD_BUNDLE_V1_MIME,
-      plaintext: encodeClipboardBundleV1(input.payload),
+      plaintext: encodeClipboardBundleV1(textPayload),
       format: "bundle-v1",
     };
   } catch {
@@ -90,4 +95,3 @@ export function selectClipboardWirePayload(input: {
     };
   }
 }
-

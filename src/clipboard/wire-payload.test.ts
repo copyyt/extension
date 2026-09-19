@@ -7,6 +7,7 @@ import {
 import {
   CLIPBOARD_BUNDLE_V1_MIME,
   clipboardPayloadFromPlainText,
+  clipboardPayloadFromPngBytes,
   encodeClipboardBundleV1,
   type ClipboardPayloadV1,
 } from "./payload.ts";
@@ -84,6 +85,32 @@ test("keeps plain-only payloads on the legacy wire even when recipients are rich
   });
 });
 
+test("local PNG data is projected out of every Phase 2C.3.0 wire selection", () => {
+  const image = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9]),
+  );
+  const mixed: ClipboardPayloadV1 = {
+    version: 1,
+    representations: [
+      { mime: "text/plain", encoding: "utf-8", data: "plain" },
+      { mime: "text/html", encoding: "utf-8", data: "<b>plain</b>" },
+      ...image.representations,
+    ],
+  };
+  const selected = selectClipboardWirePayload({
+    payload: mixed,
+    recipients: [recipient(richCapabilities, richCapabilities)],
+  });
+  assert.equal(selected.contentType, CLIPBOARD_BUNDLE_V1_MIME);
+  const decoded = JSON.parse(new TextDecoder().decode(selected.plaintext as Uint8Array)) as ClipboardPayloadV1;
+  assert.deepEqual(decoded.representations.map((representation) => representation.mime), [
+    "text/plain",
+    "text/html",
+  ]);
+  assert.equal(decoded.representations.some((representation) => representation.mime === "image/png"), false);
+  assert.throws(() => selectClipboardWirePayload({ payload: image, recipients: [] }));
+});
+
 test("downgrades a bundle that exceeds the safe plaintext limit without truncating the fallback", () => {
   const plainText = "exact fallback";
   const oversized: ClipboardPayloadV1 = {
@@ -107,4 +134,3 @@ test("downgrades a bundle that exceeds the safe plaintext limit without truncati
     format: "legacy-text",
   });
 });
-

@@ -1,14 +1,40 @@
 import {
   clipboardPayloadFromPlainText,
-  encodeClipboardBundleV1,
-  getPlainTextRepresentation,
+  clipboardPayloadFromPngBytes,
+  getHtmlRepresentation,
+  getPngBytes,
+  getPngRepresentation,
+  findPlainTextRepresentation,
+  validateClipboardPayloadV1,
   type ClipboardPayloadV1,
   type ClipboardRepresentationV1,
 } from "./payload.ts";
+import type { ByteInput } from "../crypto/bytes.ts";
 
-/** The small part of ClipboardEvent.clipboardData used by the adapter. */
+/**
+ * The small part of a ClipboardEvent's data store used by the adapter. The
+ * item list is intentionally opaque here; DOM-specific access is kept in the
+ * narrow helpers below and the offscreen adapter.
+ */
+export interface ClipboardFileLike {
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+export interface ClipboardDataItemLike {
+  readonly kind: string;
+  readonly type: string;
+  getAsFile(): ClipboardFileLike | null;
+}
+
+export interface ClipboardDataItemsLike {
+  readonly length: number;
+  item(index: number): ClipboardDataItemLike | null;
+  add(data: Blob | File): unknown;
+}
+
 export interface ClipboardDataLike {
   readonly types: readonly string[];
+  readonly items?: ClipboardDataItemsLike | readonly ClipboardDataItemLike[];
   getData(type: string): string;
   setData(type: string, value: string): void;
 }
@@ -17,52 +43,216 @@ function hasType(data: ClipboardDataLike, mime: string): boolean {
   return data.types.some((type) => type === mime);
 }
 
+export interface ClipboardFormatValues {
+  plainText?: string;
+  html?: string;
+  pngBytes?: ByteInput;
+}
+
 /**
- * Reads clipboard formats as opaque strings. HTML is never parsed or passed
- * through a DOM; it is only retained when the future bundle can carry it.
+ * Assemble the supported clipboard representations without imposing relay
+ * bundle size. The caller controls presence: an absent plainText is distinct
+ * from an explicitly empty plainText.
+ */
+export function clipboardPayloadFromFormats(
+  values: ClipboardFormatValues,
+): ClipboardPayloadV1 {
+  const representations: ClipboardRepresentationV1[] = [];
+
+  if (values.plainText !== undefined) {
+    representations.push(
+      clipboardPayloadFromPlainText(values.plainText).representations[0]!,
+    );
+  }
+  if (values.html !== undefined) {
+    if (values.plainText === undefined) {
+      throw new Error("Clipboard HTML requires a text/plain fallback");
+    }
+    representations.push({
+      mime: "text/html",
+      encoding: "utf-8",
+      data: values.html,
+    });
+  }
+  if (values.pngBytes !== undefined) {
+    representations.push(
+      clipboardPayloadFromPngBytes(values.pngBytes).representations[0]!,
+    );
+  }
+  if (representations.length === 0) {
+    throw new Error("Clipboard data contains no supported representation");
+  }
+
+  const payload: ClipboardPayloadV1 = {
+    version: 1,
+    representations,
+  };
+  validateClipboardPayloadV1(payload);
+  return payload;
+}
+
+/**
+ * Reads text formats as opaque strings. HTML is never parsed or passed
+ * through a DOM; it is only retained as inert clipboard data.
  */
 export function clipboardPayloadFromClipboardData(
   data: ClipboardDataLike,
   textareaPlainText: string,
+  pngBytes?: ByteInput,
 ): ClipboardPayloadV1 {
-  const plainText = hasType(data, "text/plain")
-    ? data.getData("text/plain")
-    : textareaPlainText;
-  const plainOnly = clipboardPayloadFromPlainText(plainText);
+  const hasPlain = hasType(data, "text/plain");
+  const hasHtml = hasType(data, "text/html");
+  const hasPng = pngBytes !== undefined;
 
-  if (!hasType(data, "text/html")) return plainOnly;
+  // A paste of HTML can still obtain its required plain fallback from the
+  // textarea. An image-only paste must not acquire a synthetic empty text
+  // representation merely because the textarea starts empty.
+  const plainText = hasPlain || hasHtml || !hasPng
+    ? hasPlain
+      ? data.getData("text/plain")
+      : textareaPlainText
+    : undefined;
+  const html = hasHtml ? data.getData("text/html") : undefined;
 
-  const html = data.getData("text/html");
-  const rich: ClipboardPayloadV1 = {
-    version: 1,
-    representations: [
-      getPlainTextRepresentation(plainOnly),
-      { mime: "text/html", encoding: "utf-8", data: html },
-    ],
-  };
+  return clipboardPayloadFromFormats({ plainText, html, pngBytes });
+}
 
-  // A valid raw clipboard remains useful even when its rich future bundle
-  // would exceed the safe encrypted plaintext limit. HTML is never truncated.
+function hasUsableTextClipboardData(
+  data: ClipboardDataLike,
+  textareaPlainText: string,
+): boolean {
+  return (
+    hasType(data, "text/plain") ||
+    hasType(data, "text/html") ||
+    textareaPlainText.length > 0
+  );
+}
+
+/**
+ * Read one captured PNG File after the synchronous paste command. Oversized
+ * or malformed image data is omitted only when a supported text format can
+ * preserve the clipboard operation exactly.
+ */
+export async function clipboardPayloadFromClipboardFile(
+  data: ClipboardDataLike,
+  textareaPlainText: string,
+  pngFile: ClipboardFileLike | undefined,
+): Promise<ClipboardPayloadV1> {
+  if (!pngFile) {
+    return clipboardPayloadFromClipboardData(data, textareaPlainText);
+  }
+
+  let pngBytes: Uint8Array;
   try {
-    encodeClipboardBundleV1(rich);
-    return rich;
+    pngBytes = new Uint8Array(await pngFile.arrayBuffer());
   } catch {
-    return plainOnly;
+    if (hasUsableTextClipboardData(data, textareaPlainText)) {
+      return clipboardPayloadFromClipboardData(data, textareaPlainText);
+    }
+    throw new Error("The PNG clipboard data could not be read");
+  }
+
+  try {
+    return clipboardPayloadFromClipboardData(data, textareaPlainText, pngBytes);
+  } catch (error) {
+    if (hasUsableTextClipboardData(data, textareaPlainText)) {
+      return clipboardPayloadFromClipboardData(data, textareaPlainText);
+    }
+    throw error;
   }
 }
 
-/** Writes exact opaque clipboard representations from inside a copy event. */
+/** Return the first supported PNG clipboard item in item-list order. */
+export function getPngFileFromClipboardData(
+  data: ClipboardDataLike,
+): ClipboardFileLike | undefined {
+  const items = data.items;
+  if (!items) return undefined;
+  const length = items.length;
+  for (let index = 0; index < length; index += 1) {
+    const item = Array.isArray(items)
+      ? items[index]
+      : typeof (items as ClipboardDataItemsLike).item === "function"
+        ? (items as ClipboardDataItemsLike).item(index)
+        : (items as unknown as Record<number, ClipboardDataItemLike | undefined>)[index];
+    if (item?.kind === "file" && item.type === "image/png") {
+      const file = item.getAsFile();
+      if (file) return file;
+    }
+  }
+  return undefined;
+}
+
+function createPngClipboardFile(bytes: Uint8Array): Blob | File {
+  const FileConstructor = globalThis.File;
+  if (typeof FileConstructor === "function") {
+    return new FileConstructor([bytes], "copyyt.png", { type: "image/png" });
+  }
+  return new Blob([bytes], { type: "image/png" });
+}
+
+/**
+ * Apply all supported formats that can be applied by this clipboard data
+ * store, returning the exact valid payload that was actually accepted. Image
+ * application is deliberately best-effort when a text fallback exists.
+ */
 export function setClipboardDataFromPayload(
   data: ClipboardDataLike,
   payload: ClipboardPayloadV1,
-): void {
-  const plain = getPlainTextRepresentation(payload).data;
-  data.setData("text/plain", plain);
-  const html = payload.representations.find(
-    (representation): representation is Extract<ClipboardRepresentationV1, { mime: "text/html" }> =>
-      representation.mime === "text/html",
+): ClipboardPayloadV1 {
+  validateClipboardPayloadV1(payload);
+
+  const applied = new Set<string>();
+  const plain = findPlainTextRepresentation(payload);
+  if (plain) {
+    try {
+      data.setData("text/plain", plain.data);
+      applied.add("text/plain");
+    } catch {
+      // Keep trying independent formats. A successful image-only application
+      // is still a truthful result when the plain channel is unavailable.
+    }
+  }
+
+  const html = getHtmlRepresentation(payload);
+  if (html && applied.has("text/plain")) {
+    try {
+      data.setData("text/html", html.data);
+      applied.add("text/html");
+    } catch {
+      // Return the plain fallback if the richer text channel is unavailable.
+    }
+  }
+
+  const png = getPngRepresentation(payload);
+  if (png) {
+    try {
+      if (!data.items || Array.isArray(data.items)) {
+        throw new Error("Clipboard image items are unavailable");
+      }
+      (data.items as ClipboardDataItemsLike).add(
+        createPngClipboardFile(getPngBytes(payload)),
+      );
+      applied.add("image/png");
+    } catch {
+      // Text formats, if any, remain the actual applied clipboard value.
+    }
+  }
+
+  const appliedRepresentations = payload.representations.filter((representation) =>
+    applied.has(representation.mime),
   );
-  if (html) data.setData("text/html", html.data);
+  if (appliedRepresentations.length === 0) {
+    throw new Error("No supported clipboard representation could be applied");
+  }
+  // If HTML somehow became the only applied format, it cannot be represented
+  // by ClipboardPayloadV1; only return combinations that satisfy validation.
+  const actual: ClipboardPayloadV1 = {
+    version: 1,
+    representations: appliedRepresentations,
+  };
+  validateClipboardPayloadV1(actual);
+  return actual;
 }
 
 export function clipboardPayloadsEqual(
@@ -70,10 +260,16 @@ export function clipboardPayloadsEqual(
   right: ClipboardPayloadV1,
 ): boolean {
   const leftByMime = new Map(
-    left.representations.map((representation) => [representation.mime, representation.data]),
+    left.representations.map((representation) => [
+      representation.mime,
+      `${representation.encoding}\u0000${representation.data}`,
+    ]),
   );
   const rightByMime = new Map(
-    right.representations.map((representation) => [representation.mime, representation.data]),
+    right.representations.map((representation) => [
+      representation.mime,
+      `${representation.encoding}\u0000${representation.data}`,
+    ]),
   );
   return (
     leftByMime.size === rightByMime.size &&

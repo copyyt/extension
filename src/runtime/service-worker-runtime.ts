@@ -16,7 +16,8 @@ import {
   clipboardPayloadFromPlainText,
   decodeClipboardBundleV1,
   decodeClipboardPlainText,
-  getPlainTextRepresentation,
+  findPlainTextRepresentation,
+  projectClipboardPayloadToText,
   validateClipboardPayloadV1,
   type ClipboardPayloadV1,
 } from "../clipboard/payload.ts";
@@ -1146,7 +1147,11 @@ export class CopyytServiceWorkerRuntime {
     } catch {
       return;
     }
-    if (getPlainTextRepresentation(payload).data.length === 0) return;
+    const plain = findPlainTextRepresentation(payload);
+    if (!plain || (plain.data.length === 0 && payload.representations.length === 1)) {
+      this.pendingAutoObservation = null;
+      return;
+    }
     if (!this.status.syncPreferences.sendEnabled) {
       // Do not retain an observation while sending is disabled. The next
       // enable operation starts a fresh baseline instead of publishing the
@@ -1387,6 +1392,15 @@ export class CopyytServiceWorkerRuntime {
     }
     const session = this.requireSession();
     this.requireSocketReady();
+    let textPayload: ClipboardPayloadV1;
+    try {
+      textPayload = projectClipboardPayloadToText(payload);
+    } catch {
+      throw new RuntimeError(
+        "UNSUPPORTED_CLIPBOARD_CONTENT",
+        "This clipboard content cannot be sent by the current sync transport",
+      );
+    }
     await this.ensureAccountInitialized();
     const identity = await this.identityLoader(session.user.id);
     if (!identity || identity.keyVersion === null) {
@@ -1460,7 +1474,7 @@ export class CopyytServiceWorkerRuntime {
       }),
     );
     const wirePayload = selectClipboardWirePayload({
-      payload,
+      payload: textPayload,
       recipients: wireRecipients,
     });
     let envelope: ClipboardItemEnvelope;
@@ -1670,7 +1684,7 @@ export class CopyytServiceWorkerRuntime {
       }
       // HTML stays inert data in this phase. Decode and extract the fallback
       // before the final policy barrier, with no async gap before the OS write.
-      const text = getPlainTextRepresentation(clipboardPayload).data;
+      const plain = findPlainTextRepresentation(clipboardPayload);
       if (!this.isReceivePolicyCurrent(receivePolicyRevision)) {
         await this.dependencies.processedItemStore.mark({
           userId: session.user.id,
@@ -1681,11 +1695,25 @@ export class CopyytServiceWorkerRuntime {
         });
         return;
       }
+      if (!this.dependencies.clipboardAdapter.writePayload && !plain) {
+        await this.dependencies.processedItemStore.mark({
+          userId: session.user.id,
+          itemId: envelope.itemId,
+          processedAt: this.now().toISOString(),
+          sourceDeviceId: envelope.sourceDeviceId,
+          disposition: "unsupported-content",
+        });
+        this.recordSyncError(
+          "UNSUPPORTED_CLIPBOARD_CONTENT",
+          "This clipboard content cannot be applied by the current adapter",
+        );
+        return;
+      }
       try {
         if (this.dependencies.clipboardAdapter.writePayload) {
           await this.dependencies.clipboardAdapter.writePayload(clipboardPayload);
         } else {
-          await this.dependencies.clipboardAdapter.writeText(text);
+          await this.dependencies.clipboardAdapter.writeText(plain!.data);
         }
       } catch {
         throw new RuntimeError(

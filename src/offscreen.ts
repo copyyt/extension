@@ -7,11 +7,14 @@ import {
   type OffscreenResponse,
 } from "./runtime/messages.ts";
 import {
-  clipboardPayloadFromClipboardData,
+  clipboardPayloadFromClipboardFile,
+  getPngFileFromClipboardData,
   setClipboardDataFromPayload,
+  type ClipboardDataLike,
 } from "./clipboard/clipboard-data.ts";
 import {
   clipboardPayloadFromPlainText,
+  findPlainTextRepresentation,
   getPlainTextRepresentation,
   validateClipboardPayloadV1,
   type ClipboardPayloadV1,
@@ -46,29 +49,27 @@ function createClipboardTextarea(): HTMLTextAreaElement {
   return element;
 }
 
-function readClipboardPayload(): ClipboardPayloadV1 {
+async function readClipboardPayload(): Promise<ClipboardPayloadV1> {
   const element = createClipboardTextarea();
-  let payload: ClipboardPayloadV1 | undefined;
+  let clipboardTypes: string[] = [];
+  let plainFromPaste: string | undefined;
   let htmlFromPaste: string | undefined;
-  let htmlWasPresent = false;
-  let plainWasPresent = false;
+  let pngFile: Awaited<ReturnType<typeof getPngFileFromClipboardData>>;
   let pasteError: unknown;
   const onPaste = (event: ClipboardEvent): void => {
     if (!event.clipboardData) return;
     try {
-      plainWasPresent = event.clipboardData.types.some(
-        (type) => type === "text/plain",
-      );
-      htmlWasPresent = event.clipboardData.types.some(
-        (type) => type === "text/html",
-      );
-      if (htmlWasPresent) htmlFromPaste = event.clipboardData.getData("text/html");
-      if (plainWasPresent) {
-        payload = clipboardPayloadFromClipboardData(
-          event.clipboardData,
-          element.value,
-        );
+      const data = event.clipboardData as unknown as ClipboardDataLike;
+      clipboardTypes = [...data.types];
+      if (clipboardTypes.includes("text/plain")) {
+        plainFromPaste = data.getData("text/plain");
       }
+      if (clipboardTypes.includes("text/html")) {
+        htmlFromPaste = data.getData("text/html");
+      }
+      // Keep only the File reference until the synchronous paste command has
+      // returned. The bytes are read below, never rendered or object-URL'd.
+      pngFile = getPngFileFromClipboardData(data);
     } catch (error) {
       pasteError = error;
     }
@@ -86,26 +87,24 @@ function readClipboardPayload(): ClipboardPayloadV1 {
     }
 
     if (pasteError) throw pasteError;
-    if (!plainWasPresent && htmlWasPresent) {
-      payload = clipboardPayloadFromClipboardData(
-        {
-          types: ["text/plain", "text/html"],
-          getData: (type) =>
-            type === "text/plain" ? element.value : htmlFromPaste ?? "",
-          setData: () => undefined,
-        },
-        element.value,
-      );
-    }
-    return payload ?? clipboardPayloadFromPlainText(element.value);
+
+    const snapshot: ClipboardDataLike = {
+      types: clipboardTypes,
+      getData: (type) =>
+        type === "text/plain"
+          ? plainFromPaste ?? ""
+          : htmlFromPaste ?? "",
+      setData: () => undefined,
+    };
+    return clipboardPayloadFromClipboardFile(snapshot, element.value, pngFile);
   } finally {
     element.removeEventListener("paste", onPaste);
     element.remove();
   }
 }
 
-function readClipboardText(): string {
-  return getPlainTextRepresentation(readClipboardPayload()).data;
+async function readClipboardText(): Promise<string> {
+  return getPlainTextRepresentation(await readClipboardPayload()).data;
 }
 
 function writeClipboardTextFallback(text: string): void {
@@ -128,9 +127,8 @@ function writeClipboardTextFallback(text: string): void {
 
 function writeClipboardPayload(payload: ClipboardPayloadV1): ClipboardPayloadV1 {
   validateClipboardPayloadV1(payload);
-  const plainOnly = clipboardPayloadFromPlainText(
-    getPlainTextRepresentation(payload).data,
-  );
+  const plain = findPlainTextRepresentation(payload);
+  const plainOnly = plain ? clipboardPayloadFromPlainText(plain.data) : undefined;
   const element = createClipboardTextarea();
   let copyEventSeen = false;
   let copyError: unknown;
@@ -140,27 +138,33 @@ function writeClipboardPayload(payload: ClipboardPayloadV1): ClipboardPayloadV1 
         throw new Error("ClipboardData is unavailable");
       }
       copyEventSeen = true;
-      setClipboardDataFromPayload(event.clipboardData, payload);
+      const actualPayload = setClipboardDataFromPayload(
+        event.clipboardData as unknown as ClipboardDataLike,
+        payload,
+      );
       event.preventDefault();
+      appliedPayload = actualPayload;
     } catch (error) {
       copyError = error;
     }
   };
+  let appliedPayload: ClipboardPayloadV1 | undefined;
 
   try {
     element.addEventListener("copy", onCopy);
-    element.value = getPlainTextRepresentation(payload).data;
+    element.value = plain?.data ?? "";
     element.focus();
     element.select();
     const copied = document.execCommand("copy");
     if (copyError) throw copyError;
-    if (!copied || !copyEventSeen) {
+    if (!copied || !copyEventSeen || !appliedPayload) {
       throw new Error('document.execCommand("copy") did not apply clipboard data');
     }
-    return payload;
+    return appliedPayload;
   } catch (error) {
+    if (!plain || !plainOnly) throw error;
     try {
-      writeClipboardTextFallback(getPlainTextRepresentation(payload).data);
+      writeClipboardTextFallback(plain.data);
       return plainOnly;
     } catch {
       throw error;
@@ -250,10 +254,10 @@ chrome.runtime.onMessage.addListener(
       try {
         if (request.type === "READ_PAYLOAD") {
           return response(request, "READ_PAYLOAD_RESULT", {
-            payload: readClipboardPayload(),
+            payload: await readClipboardPayload(),
           });
         }
-        const text = readClipboardText();
+        const text = await readClipboardText();
         return response(request, "READ_TEXT_RESULT", { text });
       } catch (error) {
         console.error("COPYyt offscreen clipboard read failed", error);

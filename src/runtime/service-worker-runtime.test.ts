@@ -3,6 +3,7 @@ import test from "node:test";
 import type { AxiosResponse } from "axios";
 import {
   CLIPBOARD_BUNDLE_V1_MIME,
+  clipboardPayloadFromPngBytes,
   decodeClipboardBundleV1,
   encodeClipboardBundleV1,
   type ClipboardPayloadV1,
@@ -626,7 +627,7 @@ test("registration advertises clipboard, bundle-v1, and HTML receive capabilitie
       return { identity, device: registeredDevice };
     },
   });
-  assert.deepEqual(registrations, [["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]]);
+  assert.deepEqual(registrations, [["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-v1"]]);
   assert.equal(setup.runtime.getStatus().device.deviceId, identity.deviceId);
   assert.equal(setup.runtime.getStatus().syncReady, true);
 });
@@ -678,6 +679,112 @@ test("bundle-v1 receive writes only its exact plain text fallback once", async (
   assert.equal(decryptions, 1);
   assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "applied");
   assert.equal(setup.runtime.getStatus().lastSyncError, undefined);
+});
+
+test("image-only automatic observation and manual Send never encrypt or publish", async () => {
+  const image = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]),
+  );
+  let encryptCalls = 0;
+  const setup = await startReady({
+    clipboardAdapter: {
+      readText: async () => "",
+      readPayload: async () => image,
+      writeText: async () => undefined,
+    },
+    encrypt: async () => {
+      encryptCalls += 1;
+      return inboundEnvelope("unexpected-image-publish");
+    },
+  });
+
+  await setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: image,
+  });
+  assert.equal(encryptCalls, 0);
+  assert.equal(
+    setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
+    0,
+  );
+
+  const response = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:send-current-clipboard" }),
+  );
+  assert.equal(response.ok, false);
+  assert.equal(response.error?.code, "UNSUPPORTED_CLIPBOARD_CONTENT");
+  assert.equal(encryptCalls, 0);
+});
+
+test("mixed local image payloads project to exact text-only network content", async () => {
+  const image = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 2]),
+  );
+  const rich = {
+    version: 1 as const,
+    representations: [
+      { mime: "text/plain" as const, encoding: "utf-8" as const, data: "exact fallback" },
+      { mime: "text/html" as const, encoding: "utf-8" as const, data: "<b>rich</b>" },
+      ...image.representations,
+    ],
+  } satisfies ClipboardPayloadV1;
+  const encryptInputs: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0][] = [];
+  const setup = await startReady({
+    encrypt: async (input) => {
+      encryptInputs.push(input);
+      return {
+        ...inboundEnvelope("mixed-image-publish"),
+        contentType: input.contentType,
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+  await setup.runtime.publishClipboardPayload(rich);
+  assert.equal(encryptInputs.length, 1);
+  assert.equal(encryptInputs[0]!.contentType, "text/plain");
+  assert.equal(encryptInputs[0]!.plaintext, "exact fallback");
+  assert.equal(typeof encryptInputs[0]!.plaintext === "string" && encryptInputs[0]!.plaintext.includes(image.representations[0]!.data), false);
+});
+
+test("inbound development image bundles reach image adapters and never become placeholder text", async () => {
+  const image = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 3]),
+  );
+  const bundle = encodeClipboardBundleV1(image);
+  const applied: ClipboardPayloadV1[] = [];
+  const withImageAdapter = await startReady({
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+      writePayload: async (payload) => { applied.push(payload); },
+    },
+    decrypt: async () => ({ plaintextBytes: bundle }),
+  });
+  await withImageAdapter.runtime.receiveClipboardItem({
+    ...inboundEnvelope("inbound-image-adapter"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+  assert.deepEqual(applied, [image]);
+
+  const textWrites: string[] = [];
+  const withoutImageAdapter = await startReady({
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async (text) => { textWrites.push(text); },
+    },
+    decrypt: async () => ({ plaintextBytes: bundle }),
+  });
+  await withoutImageAdapter.runtime.receiveClipboardItem({
+    ...inboundEnvelope("inbound-image-no-adapter"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+  assert.deepEqual(textWrites, []);
+  assert.equal(
+    withoutImageAdapter.runtime.getStatus().lastSyncError?.code,
+    "UNSUPPORTED_CLIPBOARD_CONTENT",
+  );
 });
 
 test("unknown content types are consumed after crypto verification without decoding or retrying", async () => {

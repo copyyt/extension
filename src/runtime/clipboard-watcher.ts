@@ -1,6 +1,6 @@
 import {
   clipboardPayloadFromPlainText,
-  getPlainTextRepresentation,
+  findPlainTextRepresentation,
   validateClipboardPayloadV1,
   type ClipboardPayloadV1,
 } from "../clipboard/payload.ts";
@@ -32,6 +32,14 @@ export interface ClipboardWatcherOptions {
 
 export interface ClipboardWatchStartOptions {
   resetBaseline?: boolean;
+}
+
+function isMeaningfulClipboardPayload(payload: ClipboardPayloadV1): boolean {
+  const plain = findPlainTextRepresentation(payload);
+  // Preserve the existing empty-text suppression only for a payload that has
+  // no other supported representation. Image-only and mixed image payloads
+  // are meaningful even when their plain fallback is absent or empty.
+  return !(payload.representations.length === 1 && plain?.data.length === 0);
 }
 
 /**
@@ -143,7 +151,7 @@ export class ClipboardWatcher {
       // cannot cause the same observation to be emitted again.
       this.baseline = payload;
       this.hasBaseline = true;
-      if (!changed || getPlainTextRepresentation(payload).data.length === 0) {
+      if (!changed || !isMeaningfulClipboardPayload(payload)) {
         return;
       }
 
@@ -151,7 +159,8 @@ export class ClipboardWatcher {
         if (this.typedMode && this.onPayloadChanged) {
           await this.onPayloadChanged(payload);
         } else {
-          await this.onChanged!(getPlainTextRepresentation(payload).data);
+          const plain = findPlainTextRepresentation(payload);
+          if (plain) await this.onChanged!(plain.data);
         }
       } catch (error) {
         this.handleWatcherError(error);
