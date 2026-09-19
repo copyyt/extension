@@ -27,7 +27,10 @@ import type {
   ClientVerifiedDevice,
   LocalDeviceRecord,
 } from "./trust-store.ts";
-import { AES_GCM_TAG_BYTES } from "../clipboard/limits.ts";
+import {
+  AES_GCM_TAG_BYTES,
+  MAX_CLIPBOARD_PLAINTEXT_BYTES,
+} from "../clipboard/limits.ts";
 
 const ED25519 = { name: "Ed25519" } as Algorithm;
 const X25519 = { name: "X25519" } as Algorithm;
@@ -503,6 +506,9 @@ export async function encryptClipboardItem(
   assertLength(contentKey, KEY_LENGTH_BYTES, "Clipboard content key");
   assertLength(payloadNonce, NONCE_LENGTH_BYTES, "Payload nonce");
   const plaintext = typeof input.plaintext === "string" ? utf8Encode(input.plaintext) : new Uint8Array(input.plaintext);
+  if (plaintext.byteLength > MAX_CLIPBOARD_PLAINTEXT_BYTES) {
+    throw new CryptoProtocolError("Clipboard plaintext exceeds the encrypted payload size limit");
+  }
   const aesKey = await importAesKey(contentKey, ["encrypt", "decrypt"]);
   const ciphertext = new Uint8Array(
     await globalThis.crypto.subtle.encrypt(

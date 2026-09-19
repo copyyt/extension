@@ -17,6 +17,7 @@ import {
   decryptClipboardItem,
   decryptClipboardItemBytes,
   encryptClipboardItem,
+  CryptoProtocolError,
   pairingFingerprint,
   signDeviceApproval,
   signSocketChallenge,
@@ -426,6 +427,59 @@ test("safe plaintext maximum encrypts to exactly the backend ciphertext maximum"
     envelope,
   });
   assert.equal(decrypted.plaintext, plaintext);
+});
+
+test("crypto encryption rejects oversized and multibyte string plaintext", async () => {
+  const identityA = await makeFixedIdentity(deviceAId, 1);
+  const identityB = await makeFixedIdentity(deviceBId, 1, true);
+  const baseInput = {
+    userId,
+    identity: identityA,
+    contentType: "text/plain",
+    expiresAt,
+    recipients: [verifiedDevice(identityB)],
+  };
+  const oversized = "a".repeat(MAX_CLIPBOARD_PLAINTEXT_BYTES + 1);
+  await assert.rejects(
+    encryptClipboardItem({ ...baseInput, plaintext: oversized }),
+    (error: unknown) => {
+      assert.ok(error instanceof CryptoProtocolError);
+      assert.equal(
+        error.message,
+        "Clipboard plaintext exceeds the encrypted payload size limit",
+      );
+      return true;
+    },
+  );
+
+  const multibyte = "a".repeat(MAX_CLIPBOARD_PLAINTEXT_BYTES - 1) + "é";
+  assert.equal(multibyte.length, MAX_CLIPBOARD_PLAINTEXT_BYTES);
+  assert.equal(utf8Encode(multibyte).byteLength, MAX_CLIPBOARD_PLAINTEXT_BYTES + 1);
+  await assert.rejects(
+    encryptClipboardItem({ ...baseInput, plaintext: multibyte }),
+    CryptoProtocolError,
+  );
+});
+
+test("crypto encryption enforces the plaintext byte limit for Uint8Array input", async () => {
+  const identityA = await makeFixedIdentity(deviceAId, 1);
+  const identityB = await makeFixedIdentity(deviceBId, 1, true);
+  const baseInput = {
+    userId,
+    identity: identityA,
+    contentType: "text/plain",
+    expiresAt,
+    recipients: [verifiedDevice(identityB)],
+  };
+  const exact = new Uint8Array(MAX_CLIPBOARD_PLAINTEXT_BYTES);
+  const exactEnvelope = await encryptClipboardItem({ ...baseInput, plaintext: exact });
+  assert.equal(base64ToBytes(exactEnvelope.ciphertext).byteLength, MAX_CLIPBOARD_CIPHERTEXT_BYTES);
+
+  const oversized = new Uint8Array(MAX_CLIPBOARD_PLAINTEXT_BYTES + 1);
+  await assert.rejects(
+    encryptClipboardItem({ ...baseInput, plaintext: oversized }),
+    CryptoProtocolError,
+  );
 });
 
 test("authenticated byte decryption leaves malformed UTF-8 to content dispatch", async () => {
