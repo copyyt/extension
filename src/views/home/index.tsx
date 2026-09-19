@@ -19,6 +19,8 @@ import {
   type ClipboardSyncMode,
 } from "./sync-preferences";
 
+const DIRECT_EXPERIMENT_ENABLED = import.meta.env.VITE_EXTENSION_ENV === "dev";
+
 function statusLabel(status: RuntimeStatus): string {
   switch (status.connectionState) {
     case "ready":
@@ -44,6 +46,8 @@ function Home() {
   const [trusting, setTrusting] = useState(false);
   const [pairingBusy, setPairingBusy] = useState(false);
   const [syncPreferencesBusy, setSyncPreferencesBusy] = useState(false);
+  const [directTargetId, setDirectTargetId] = useState("");
+  const [directBusy, setDirectBusy] = useState(false);
   const [confirmedFingerprint, setConfirmedFingerprint] = useState("");
   const [message, setMessage] = useState<string | null>(null);
 
@@ -183,6 +187,29 @@ function Home() {
       );
     } finally {
       setSyncPreferencesBusy(false);
+    }
+  };
+
+  const startDirectTest = async () => {
+    if (!directTargetId) {
+      setMessage("Select a trusted Chrome target first.");
+      return;
+    }
+    setDirectBusy(true);
+    setMessage(null);
+    try {
+      const result = await sendRuntimeCommand<{
+        transferId: string;
+      }>({
+        type: "runtime:start-direct-test",
+        recipientDeviceId: directTargetId,
+      });
+      setMessage(`Direct test started: ${result.transferId.slice(0, 8)}…`);
+      await reload();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to start direct test");
+    } finally {
+      setDirectBusy(false);
     }
   };
 
@@ -346,6 +373,53 @@ function Home() {
           <Button variant="outlined" className="mt-2 w-full" onClick={refreshOnboarding} disabled={pairingBusy}>
             Refresh pairing
           </Button>
+        </div>
+      ) : null}
+
+      {DIRECT_EXPERIMENT_ENABLED ? (
+        <div className="mt-3 rounded-lg border border-[#D1D5DB] p-4 text-xs">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-sm font-semibold">Direct transport experiment</span>
+            <span className="text-[#4B5563]">development only</span>
+          </div>
+          <select
+            className="mt-3 w-full rounded border border-[#D1D5DB] px-2 py-2"
+            value={directTargetId}
+            onChange={(event) => setDirectTargetId(event.target.value)}
+            aria-label="Direct transport target"
+          >
+            <option value="">Select trusted Chrome B…</option>
+            {(status?.directTargets ?? []).map((target) => (
+              <option key={target.deviceId} value={target.deviceId}>
+                {target.name} · {target.platform}
+              </option>
+            ))}
+          </select>
+          <Button
+            variant="outlined"
+            className="mt-3 w-full"
+            onClick={() => void startDirectTest()}
+            disabled={
+              directBusy ||
+              !directTargetId ||
+              !status?.syncReady ||
+              !localDeviceTrusted
+            }
+          >
+            {directBusy ? "Starting direct test…" : "Send 2 MiB test"}
+          </Button>
+          {(status?.directTransfers ?? []).slice(0, 1).map((transfer) => (
+            <div key={transfer.transferId} className="mt-3 text-[#4B5563]">
+              <p>Transfer: {transfer.transferId.slice(0, 8)}…</p>
+              <p className="mt-1">State: {transfer.state}</p>
+              {transfer.byteLength ? (
+                <p className="mt-1">
+                  Bytes: {transfer.bytesReceived ?? transfer.bytesSent ?? 0} / {transfer.byteLength}
+                </p>
+              ) : null}
+              {transfer.error ? <p className="mt-1 text-[#FF2635]">{transfer.error}</p> : null}
+            </div>
+          ))}
         </div>
       ) : null}
 

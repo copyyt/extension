@@ -2,6 +2,7 @@ import { io, type Socket } from "socket.io-client";
 import { IndexedDBTrustStore } from "./crypto/trust-store.ts";
 import { createRuntimeApi } from "./runtime/api.ts";
 import { OffscreenClipboardAdapter } from "./runtime/clipboard-adapter.ts";
+import { OffscreenDirectTransport } from "./runtime/direct-transport.ts";
 import {
   IndexedDBAssistedPngSuppressionStore,
   IndexedDBOutboundItemStore,
@@ -39,6 +40,7 @@ const runtime = new CopyytServiceWorkerRuntime({
   statusStore: new ChromeStatusStore(),
   trustStore: new IndexedDBTrustStore(),
   clipboardAdapter: new OffscreenClipboardAdapter(),
+  directTransport: new OffscreenDirectTransport(),
   processedItemStore: new IndexedDBProcessedItemStore(),
   outboundItemStore: new IndexedDBOutboundItemStore(),
   pendingAssistedImageStore: new IndexedDBPendingAssistedImageStore(),

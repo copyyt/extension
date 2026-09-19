@@ -48,6 +48,11 @@ import type {
   LocalDeviceRecord,
 } from "../crypto/trust-store.ts";
 import { TrustStoreError } from "../crypto/trust-store.ts";
+import {
+  isDirectSignalDelivery,
+  type DirectSignalRequest,
+  type DirectTransportStatus,
+} from "../direct/protocol.ts";
 import type {
   SignInResponse,
   ILoginResponse,
@@ -63,6 +68,7 @@ import {
   envelopeFromSocketPayload,
   isClipboardText,
   isOffscreenClipboardObservation,
+  isOffscreenDirectTransportEvent,
   isSyncPreferencesCommand,
   isRuntimeRequest,
   POPUP_SOURCE,
@@ -76,6 +82,7 @@ import {
   type PendingAssistedImageSummary,
 } from "./messages.ts";
 import type { ClipboardAdapter } from "./clipboard-adapter.ts";
+import type { DirectTransport } from "./direct-transport.ts";
 import {
   InMemoryAssistedPngSuppressionStore,
   InMemoryPendingAssistedImageStore,
@@ -156,6 +163,7 @@ export interface RuntimeDependencies {
   statusStore: StatusStore<RuntimeStatus>;
   trustStore: ClientTrustStore;
   clipboardAdapter: ClipboardAdapter;
+  directTransport?: DirectTransport;
   processedItemStore: ProcessedItemStore;
   outboundItemStore: OutboundItemStore;
   pendingAssistedImageStore?: PendingAssistedImageStore;
@@ -196,6 +204,8 @@ const DEFAULT_STATUS: RuntimeStatus = {
   },
   syncReady: false,
   pendingAssistedImages: [],
+  directTargets: [],
+  directTransfers: [],
   syncPreferences: { ...DEFAULT_SYNC_PREFERENCES },
   clipboardWatch: "stopped",
   onboarding: {
@@ -571,6 +581,20 @@ function isAcknowledgement(value: unknown, itemId: string): boolean {
   return candidate.itemId === undefined || candidate.itemId === itemId;
 }
 
+function isDirectAcknowledgement(value: unknown, transferId: string): boolean {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as {
+    accepted?: unknown;
+    transferId?: unknown;
+    error?: unknown;
+  };
+  return (
+    candidate.accepted === true &&
+    candidate.transferId === transferId &&
+    !candidate.error
+  );
+}
+
 function challengeParts(
   payload: unknown,
   fallbackSocketId: string,
@@ -606,6 +630,9 @@ function commandFallbackErrorCode(command: RuntimeCommand): RuntimeErrorCode {
       return "SOCKET_PUBLISH_FAILED";
     case "runtime:test-clipboard":
       return "CLIPBOARD_WRITE_FAILED";
+    case "runtime:start-direct-test":
+    case "runtime:cancel-direct-test":
+      return "DIRECT_TRANSPORT_FAILED";
     case "runtime:bootstrap-trust-anchor":
     case "runtime:refresh-onboarding":
     case "runtime:approve-pending-device":
@@ -1269,6 +1296,190 @@ export class CopyytServiceWorkerRuntime {
     });
     this.autoPublishInFlight = trackedOperation;
     await trackedOperation;
+  }
+
+  async handleDirectTransportEvent(message: unknown): Promise<void> {
+    if (!isOffscreenDirectTransportEvent(message)) return;
+    const event = message.event;
+    if (event.kind === "status") {
+      const previous = this.status.directTransfers ?? [];
+      const next: DirectTransportStatus = {
+        transferId: event.transferId,
+        remoteDeviceId: event.remoteDeviceId,
+        state: event.state,
+        ...(event.bytesSent !== undefined ? { bytesSent: event.bytesSent } : {}),
+        ...(event.bytesReceived !== undefined
+          ? { bytesReceived: event.bytesReceived }
+          : {}),
+        ...(event.byteLength !== undefined ? { byteLength: event.byteLength } : {}),
+        ...(event.startedAt ? { startedAt: event.startedAt } : {}),
+        ...(event.finishedAt ? { finishedAt: event.finishedAt } : {}),
+        ...(event.error ? { error: event.error } : {}),
+      };
+      const withoutTransfer = previous.filter(
+        (transfer) => transfer.transferId !== event.transferId,
+      );
+      this.setStatus({
+        ...this.status,
+        directTransfers: [next, ...withoutTransfer].slice(0, 4),
+      });
+      if (
+        event.state === "failed" &&
+        event.error &&
+        this.status.connectionState === "ready"
+      ) {
+        // Direct transport health is diagnostic only. Do not change socket or
+        // clipboard readiness when a peer experiment fails.
+        return;
+      }
+      return;
+    }
+
+    const transport = this.dependencies.directTransport;
+    if (!transport) {
+      return;
+    }
+    if (!this.isSocketTransportReady()) {
+      void transport
+        .cancelTransfer(event.transferId, "Copyyt socket is unavailable")
+        .catch(() => undefined);
+      return;
+    }
+    const request: DirectSignalRequest = {
+      transferId: event.transferId,
+      recipientDeviceId: event.remoteDeviceId,
+      ...event.signal,
+    };
+    try {
+      await this.emitDirectSignal(request);
+    } catch (error) {
+      if (event.signal.kind === "cancel") return;
+      await transport
+        .cancelTransfer(
+          event.transferId,
+          error instanceof Error ? error.message : "Direct signalling failed",
+        )
+        .catch(() => undefined);
+    }
+  }
+
+  async startDirectTestTransfer(
+    recipientDeviceId: string,
+  ): Promise<DirectTransportStatus> {
+    const session = this.requireSession();
+    const transport = this.dependencies.directTransport;
+    if (!transport) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_UNAVAILABLE",
+        "The direct transport is not available in this build",
+      );
+    }
+    this.requireSocketReady();
+    const identity = await this.identityLoader(session.user.id);
+    if (!identity || identity.keyVersion === null) {
+      throw new RuntimeError(
+        "DEVICE_NOT_REGISTERED",
+        "The device must be registered before starting a direct transfer",
+      );
+    }
+    const localDevice = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      identity.deviceId,
+    );
+    if (!isLocallyVerified(localDevice)) {
+      throw new RuntimeError(
+        "DEVICE_NOT_LOCALLY_TRUSTED",
+        "Trust this device before starting a direct transfer",
+      );
+    }
+    if (recipientDeviceId === identity.deviceId) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "A direct transfer cannot target this device",
+      );
+    }
+    const snapshot = await this.fetchDeviceSnapshot(session);
+    const recipient = snapshot.trustedDevices.find(
+      (device) => device.deviceId === recipientDeviceId,
+    );
+    const localRecipient = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      recipientDeviceId,
+    );
+    if (
+      !recipient ||
+      !localRecipient ||
+      !isLocallyVerified(localRecipient) ||
+      localRecipient.keyVersion !== recipient.keyVersion ||
+      localRecipient.signingPublicKey !== recipient.signingPublicKey ||
+      localRecipient.encryptionPublicKey !== recipient.encryptionPublicKey
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The selected device is not an active locally trusted device",
+      );
+    }
+    const transferId = globalThis.crypto.randomUUID();
+    try {
+      await transport.startTestTransfer({ transferId, recipientDeviceId });
+    } catch (error) {
+      throw error instanceof RuntimeError
+        ? error
+        : new RuntimeError(
+            "DIRECT_TRANSPORT_FAILED",
+            "The direct transport could not start",
+          );
+    }
+    const status: DirectTransportStatus = {
+      transferId,
+      remoteDeviceId: recipientDeviceId,
+      state: "connecting",
+      startedAt: this.now().toISOString(),
+    };
+    this.setStatus({
+      ...this.status,
+      directTransfers: [
+        status,
+        ...(this.status.directTransfers ?? []).filter(
+          (transfer) => transfer.transferId !== transferId,
+        ),
+      ].slice(0, 4),
+    });
+    return status;
+  }
+
+  async cancelDirectTestTransfer(transferId: string): Promise<void> {
+    if (!this.dependencies.directTransport) return;
+    await this.dependencies.directTransport.cancelTransfer(
+      transferId,
+      "Cancelled by the local device",
+    );
+  }
+
+  private async receiveDirectSignal(payload: unknown): Promise<void> {
+    if (!isDirectSignalDelivery(payload) || !this.session) return;
+    if (!this.status.socket.deviceAuthenticated || !this.dependencies.directTransport) {
+      return;
+    }
+    const localSource = await this.dependencies.trustStore.getDevice(
+      this.session.user.id,
+      payload.sourceDeviceId,
+    );
+    if (
+      !isLocallyVerified(localSource) ||
+      localSource.keyVersion !== payload.sourceKeyVersion
+    ) {
+      return;
+    }
+    const snapshot = await this.fetchDeviceSnapshot(this.session).catch(() => null);
+    const serverSource = snapshot?.trustedDevices.find(
+      (device) =>
+        device.deviceId === payload.sourceDeviceId &&
+        device.keyVersion === payload.sourceKeyVersion &&
+        device.revokedAt == null,
+    );
+    if (!serverSource) return;
+    await this.dependencies.directTransport.handleSignal(payload).catch(() => undefined);
   }
 
   async handleMessage(message: unknown): Promise<RuntimeResponse> {
@@ -2174,6 +2385,11 @@ export class CopyytServiceWorkerRuntime {
         return this.logout();
       case "runtime:test-clipboard":
         return this.testClipboard(command.marker);
+      case "runtime:start-direct-test":
+        return this.startDirectTestTransfer(command.recipientDeviceId);
+      case "runtime:cancel-direct-test":
+        await this.cancelDirectTestTransfer(command.transferId);
+        return this.getStatus();
     }
   }
 
@@ -3581,6 +3797,10 @@ export class CopyytServiceWorkerRuntime {
       if (this.socket !== socket) return;
       void this.receiveClipboardItem(payload);
     };
+    const onDirectSignal = (payload: unknown): void => {
+      if (this.socket !== socket) return;
+      void this.receiveDirectSignal(payload);
+    };
 
     this.attachSocketListeners(socket, [
       ["connect", onConnect],
@@ -3590,6 +3810,7 @@ export class CopyytServiceWorkerRuntime {
       ["auth:ready", onReady],
       ["auth:failure", onAuthFailure],
       ["clipboard:item", onClipboardItem],
+      ["direct:signal", onDirectSignal],
     ]);
     socket.connect();
   }
@@ -3712,6 +3933,17 @@ export class CopyytServiceWorkerRuntime {
     const isCurrent = this.socket === socket;
     this.detachSocketListeners(socket);
     if (isCurrent) {
+      const hasActiveDirectTransfer = (this.status.directTransfers ?? []).some(
+        (transfer) =>
+          transfer.state !== "succeeded" &&
+          transfer.state !== "failed" &&
+          transfer.state !== "cancelled",
+      );
+      if (hasActiveDirectTransfer && this.dependencies.directTransport) {
+        void this.dependencies.directTransport
+          .cancelAll("Copyyt socket is unavailable")
+          .catch(() => undefined);
+      }
       this.socket = null;
       this.socketAccountId = null;
       this.socketReady = false;
@@ -3792,6 +4024,17 @@ export class CopyytServiceWorkerRuntime {
     }
     const identity = await this.identityLoader(session.user.id);
     if (identity) {
+      this.setStatus({
+        ...this.status,
+        directTargets: snapshot.trustedDevices
+          .filter((device) => device.deviceId !== identity.deviceId)
+          .map((device) => ({
+            deviceId: device.deviceId,
+            name: device.name,
+            platform: device.platform,
+            keyVersion: device.keyVersion,
+          })),
+      });
       const currentPending = snapshot.pendingDevices.find(
         (device) => device.deviceId === identity.deviceId,
       );
@@ -3866,6 +4109,49 @@ export class CopyytServiceWorkerRuntime {
           new RuntimeError(
             "SOCKET_PUBLISH_FAILED",
             "The clipboard publish failed",
+          ),
+        );
+      }
+    });
+  }
+
+  private async emitDirectSignal(signal: DirectSignalRequest): Promise<void> {
+    this.requireSocketReady();
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(
+          new RuntimeError(
+            "DIRECT_TRANSPORT_FAILED",
+            "The direct signalling acknowledgement timed out",
+          ),
+        );
+      }, 10_000);
+      const finish = (ack: unknown): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (isDirectAcknowledgement(ack, signal.transferId)) {
+          resolve();
+        } else {
+          reject(
+            new RuntimeError(
+              "DIRECT_TRANSPORT_FAILED",
+              "The server rejected the direct signal",
+            ),
+          );
+        }
+      };
+      try {
+        this.socket!.emit("direct:signal", signal, finish);
+      } catch {
+        clearTimeout(timer);
+        reject(
+          new RuntimeError(
+            "DIRECT_TRANSPORT_FAILED",
+            "The direct signal could not be sent",
           ),
         );
       }

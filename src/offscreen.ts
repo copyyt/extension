@@ -1,11 +1,14 @@
 import {
   isClipboardText,
   isOffscreenRequest,
+  type OffscreenDirectTransportEvent,
   OFFSCREEN_SOURCE,
   RUNTIME_SOURCE,
   type OffscreenRequest,
   type OffscreenResponse,
 } from "./runtime/messages.ts";
+import { WebRtcPeerManager, DirectTransportError } from "./direct/webrtc-peer-manager.ts";
+import type { DirectManagerEvent } from "./direct/protocol.ts";
 import {
   clipboardPayloadFromClipboardFile,
   getPngFileFromClipboardData,
@@ -22,6 +25,20 @@ import {
 import { createOffscreenClipboardWatcher } from "./runtime/offscreen-watcher.ts";
 
 export const CLIPBOARD_WATCH_INTERVAL_MS = 800;
+
+function directEvent(event: DirectManagerEvent): OffscreenDirectTransportEvent {
+  return {
+    source: OFFSCREEN_SOURCE,
+    target: RUNTIME_SOURCE,
+    type: "DIRECT_EVENT",
+    event,
+  };
+}
+
+const directPeerManager = new WebRtcPeerManager({
+  emit: (event) =>
+    chrome.runtime.sendMessage(directEvent(event)).catch(() => undefined),
+});
 
 function response(
   request: OffscreenRequest,
@@ -205,6 +222,62 @@ chrome.runtime.onMessage.addListener(
     void (async () => {
       if (request.type === "PING") {
         return response(request, "PONG");
+      }
+
+      if (request.type === "DIRECT_START_TEST") {
+        try {
+          await directPeerManager.startTestTransfer({
+            transferId: request.transferId!,
+            remoteDeviceId: request.remoteDeviceId!,
+          });
+          return response(request, "DIRECT_START_RESULT", {
+            accepted: true,
+            transferId: request.transferId,
+          });
+        } catch (error) {
+          return response(request, "ERROR", {
+            error: {
+              code: "DIRECT_TRANSPORT_FAILED",
+              message:
+                error instanceof DirectTransportError || error instanceof Error
+                  ? error.message
+                  : "The direct transport could not start",
+            },
+          });
+        }
+      }
+
+      if (request.type === "DIRECT_HANDLE_SIGNAL") {
+        try {
+          await directPeerManager.handleSignal(request.signal!);
+          return response(request, "DIRECT_HANDLE_SIGNAL_RESULT", {
+            accepted: true,
+            transferId: request.signal?.transferId,
+          });
+        } catch (error) {
+          return response(request, "ERROR", {
+            error: {
+              code: "DIRECT_TRANSPORT_FAILED",
+              message:
+                error instanceof Error
+                  ? error.message
+                  : "The direct signal could not be applied",
+            },
+          });
+        }
+      }
+
+      if (request.type === "DIRECT_CANCEL") {
+        await directPeerManager.cancelTransfer(request.transferId!, request.reason);
+        return response(request, "DIRECT_CANCEL_RESULT", {
+          accepted: true,
+          transferId: request.transferId,
+        });
+      }
+
+      if (request.type === "DIRECT_CANCEL_ALL") {
+        await directPeerManager.cancelAll(request.reason);
+        return response(request, "DIRECT_CANCEL_ALL_RESULT", { accepted: true });
       }
 
       if (request.type === "WRITE_TEXT" || request.type === "WRITE_PAYLOAD") {

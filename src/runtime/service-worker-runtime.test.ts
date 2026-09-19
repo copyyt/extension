@@ -4983,12 +4983,12 @@ test("repeated recovery calls use one socket and one listener set per live socke
   await Promise.all([firstRecovery, secondRecovery]);
 
   assert.equal(sockets.length, 2);
-  assert.equal(sockets[1].events.size, 7);
+  assert.equal(sockets[1].events.size, 8);
   await setup.runtime.reconcileConnectivity("third", {
     forceSocketRecycle: true,
   });
   assert.equal(sockets.length, 3);
-  assert.equal(sockets[2].events.size, 7);
+  assert.equal(sockets[2].events.size, 8);
 });
 
 test("a concurrent forced socket recycle is escalated into one follow-up", async () => {
@@ -5034,7 +5034,7 @@ test("a concurrent forced socket recycle is escalated into one follow-up", async
 
   assert.equal(sockets.length, 2);
   assert.equal(sockets[0].events.size, 0);
-  assert.equal(sockets[1].events.size, 7);
+  assert.equal(sockets[1].events.size, 8);
 
   sockets[1].trigger("auth:challenge", {
     socketId: "replacement-socket",
@@ -5107,7 +5107,7 @@ test("a concurrent forced token refresh is escalated into one follow-up", async 
   assert.equal(sockets.length, 3);
   assert.equal(sockets[0].events.size, 0);
   assert.equal(sockets[1].events.size, 0);
-  assert.equal(sockets[2].events.size, 7);
+  assert.equal(sockets[2].events.size, 8);
 
   sockets[2].trigger("auth:challenge", {
     socketId: "refreshed-socket",
@@ -5146,7 +5146,7 @@ test("a connected but not-ready socket is replaced exactly once", async () => {
   assert.equal(sockets[0].connected, false);
   assert.equal(sockets[0].events.size, 0);
   assert.equal(sockets[1].connected, true);
-  assert.equal(sockets[1].events.size, 7);
+  assert.equal(sockets[1].events.size, 8);
 
   sockets[1].trigger("auth:challenge", {
     socketId: "replacement-socket",

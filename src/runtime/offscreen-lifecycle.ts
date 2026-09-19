@@ -1,7 +1,8 @@
 import { RuntimeError } from "./errors.ts";
 
 const OFFSCREEN_PATH = "offscreen.html";
-const OFFSCREEN_JUSTIFICATION = "Copyyt needs to read and write the operating-system clipboard.";
+const OFFSCREEN_JUSTIFICATION =
+  "Copyyt needs clipboard access and WebRTC for direct encrypted device-to-device transfers.";
 
 type ChromeOffscreenApi = Pick<typeof chrome, "runtime" | "offscreen">;
 
@@ -32,7 +33,10 @@ export async function ensureOffscreenDocument(
       try {
         await api.offscreen.createDocument({
           url: OFFSCREEN_PATH,
-          reasons: ["CLIPBOARD" as chrome.offscreen.Reason],
+          reasons: [
+            "CLIPBOARD" as chrome.offscreen.Reason,
+            "WEB_RTC" as chrome.offscreen.Reason,
+          ],
           justification: OFFSCREEN_JUSTIFICATION,
         });
       } catch {

@@ -7,6 +7,14 @@ import {
 import type { RuntimeErrorCode } from "./errors.ts";
 import type { SyncPreferences } from "./sync-preferences.ts";
 import { MAX_CLIPBOARD_PLAINTEXT_BYTES } from "../clipboard/limits.ts";
+import {
+  isDirectSignalBody,
+  isDirectSignalDelivery,
+  isUuid,
+  type DirectManagerEvent,
+  type DirectSignalDelivery,
+  type DirectTransportStatus,
+} from "../direct/protocol.ts";
 
 export const RUNTIME_SOURCE = "service-worker" as const;
 export const POPUP_SOURCE = "popup" as const;
@@ -104,6 +112,16 @@ export interface RuntimeStatus {
   /** Diagnostic only: this is never used as protocol or trust authority. */
   lastRecoveredAt?: string;
   lastRecoveryReason?: string;
+  /** Development-only direct transport diagnostics; never clipboard bytes. */
+  directTargets?: DirectTarget[];
+  directTransfers?: DirectTransportStatus[];
+}
+
+export interface DirectTarget {
+  deviceId: string;
+  name: string;
+  platform: string;
+  keyVersion: number;
 }
 
 export interface PendingAssistedImageSummary {
@@ -163,7 +181,9 @@ export type RuntimeCommand =
   | { type: "runtime:auth-resend-email-otp"; email: string }
   | { type: "runtime:auth-refresh" }
   | { type: "runtime:logout" }
-  | { type: "runtime:test-clipboard"; marker: string };
+  | { type: "runtime:test-clipboard"; marker: string }
+  | { type: "runtime:start-direct-test"; recipientDeviceId: string }
+  | { type: "runtime:cancel-direct-test"; transferId: string };
 
 export interface RuntimeRequest {
   source: typeof POPUP_SOURCE;
@@ -219,10 +239,18 @@ export interface OffscreenRequest {
     | "REBASELINE_FROM_CLIPBOARD"
     | "WATCH_START"
     | "WATCH_STOP"
-    | "PING";
+    | "PING"
+    | "DIRECT_START_TEST"
+    | "DIRECT_HANDLE_SIGNAL"
+    | "DIRECT_CANCEL"
+    | "DIRECT_CANCEL_ALL";
   text?: string;
   payload?: ClipboardPayloadV1;
   resetBaseline?: boolean;
+  transferId?: string;
+  remoteDeviceId?: string;
+  signal?: DirectSignalDelivery;
+  reason?: string;
 }
 
 export interface OffscreenResponse {
@@ -238,13 +266,22 @@ export interface OffscreenResponse {
     | "WATCH_START_RESULT"
     | "WATCH_STOP_RESULT"
     | "PONG"
+    | "DIRECT_START_RESULT"
+    | "DIRECT_HANDLE_SIGNAL_RESULT"
+    | "DIRECT_CANCEL_RESULT"
+    | "DIRECT_CANCEL_ALL_RESULT"
     | "ERROR";
   text?: string;
   error?: {
-    code: "CLIPBOARD_READ_FAILED" | "CLIPBOARD_WRITE_FAILED";
+    code:
+      | "CLIPBOARD_READ_FAILED"
+      | "CLIPBOARD_WRITE_FAILED"
+      | "DIRECT_TRANSPORT_FAILED";
     message: string;
   };
   payload?: ClipboardPayloadV1;
+  accepted?: true;
+  transferId?: string;
 }
 
 export interface TypedOffscreenClipboardObservation {
@@ -266,6 +303,13 @@ export interface LegacyOffscreenClipboardObservation {
 export type OffscreenClipboardObservation =
   | TypedOffscreenClipboardObservation
   | LegacyOffscreenClipboardObservation;
+
+export interface OffscreenDirectTransportEvent {
+  source: typeof OFFSCREEN_SOURCE;
+  target: typeof RUNTIME_SOURCE;
+  type: "DIRECT_EVENT";
+  event: DirectManagerEvent;
+}
 
 function isClipboardTextWithinLimit(value: string): boolean {
   return new TextEncoder().encode(value).byteLength <= MAX_CLIPBOARD_TEXT_BYTES;
@@ -305,7 +349,11 @@ export function isOffscreenRequest(value: unknown): value is OffscreenRequest {
       candidate.type === "REBASELINE_FROM_CLIPBOARD" ||
       candidate.type === "WATCH_START" ||
       candidate.type === "WATCH_STOP" ||
-      candidate.type === "PING");
+      candidate.type === "PING" ||
+      candidate.type === "DIRECT_START_TEST" ||
+      candidate.type === "DIRECT_HANDLE_SIGNAL" ||
+      candidate.type === "DIRECT_CANCEL" ||
+      candidate.type === "DIRECT_CANCEL_ALL");
   if (!validRequestHeader) {
     return false;
   }
@@ -319,7 +367,19 @@ export function isOffscreenRequest(value: unknown): value is OffscreenRequest {
         ? ["source", "target", "requestId", "type", "payload"]
         : type === "WATCH_START" && candidate.resetBaseline !== undefined
           ? ["source", "target", "requestId", "type", "resetBaseline"]
-          : ["source", "target", "requestId", "type"];
+          : type === "DIRECT_START_TEST"
+            ? ["source", "target", "requestId", "type", "transferId", "remoteDeviceId"]
+            : type === "DIRECT_HANDLE_SIGNAL"
+              ? ["source", "target", "requestId", "type", "signal"]
+              : type === "DIRECT_CANCEL"
+                ? candidate.reason === undefined
+                  ? ["source", "target", "requestId", "type", "transferId"]
+                  : ["source", "target", "requestId", "type", "transferId", "reason"]
+                : type === "DIRECT_CANCEL_ALL"
+                  ? candidate.reason === undefined
+                    ? ["source", "target", "requestId", "type"]
+                    : ["source", "target", "requestId", "type", "reason"]
+                  : ["source", "target", "requestId", "type"];
   if (
     keys.length !== expectedKeys.length ||
     !keys.every(
@@ -337,10 +397,57 @@ export function isOffscreenRequest(value: unknown): value is OffscreenRequest {
       return false;
     }
   }
+  if (type === "DIRECT_START_TEST") {
+    return isUuid(candidate.transferId) &&
+      isUuid(candidate.remoteDeviceId);
+  }
+  if (type === "DIRECT_HANDLE_SIGNAL") {
+    return isDirectSignalDelivery(candidate.signal);
+  }
+  if (type === "DIRECT_CANCEL") {
+    return isUuid(candidate.transferId) &&
+      (candidate.reason === undefined ||
+        (typeof candidate.reason === "string" && candidate.reason.length <= 256));
+  }
+  if (type === "DIRECT_CANCEL_ALL") {
+    return candidate.reason === undefined ||
+      (typeof candidate.reason === "string" && candidate.reason.length <= 256);
+  }
   return (
     type !== "WATCH_START" ||
     candidate.resetBaseline === undefined ||
     typeof candidate.resetBaseline === "boolean"
+  );
+}
+
+export function isOffscreenDirectTransportEvent(
+  value: unknown,
+): value is OffscreenDirectTransportEvent {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<OffscreenDirectTransportEvent>;
+  if (
+    candidate.source !== OFFSCREEN_SOURCE ||
+    candidate.target !== RUNTIME_SOURCE ||
+    candidate.type !== "DIRECT_EVENT" ||
+    !candidate.event ||
+    typeof candidate.event !== "object"
+  ) {
+    return false;
+  }
+  const event = candidate.event as Partial<DirectManagerEvent>;
+  if (
+    event.kind === "signal" &&
+    typeof event.transferId === "string" &&
+    isUuid(event.remoteDeviceId) &&
+    isDirectSignalBody(event.signal)
+  ) {
+    return true;
+  }
+  return (
+    event.kind === "status" &&
+    typeof event.transferId === "string" &&
+    isUuid(event.remoteDeviceId) &&
+    typeof event.state === "string"
   );
 }
 

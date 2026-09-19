@@ -8,6 +8,9 @@ export const CLIPBOARD_HTML_V1_CAPABILITY = "clipboard-html-v1";
  */
 export const CLIPBOARD_IMAGE_PNG_ASSISTED_WRITE_V1_CAPABILITY =
   "clipboard-image-png-assisted-write-v1";
+/** Defined for the experimental transport only; intentionally not advertised yet. */
+export const CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY =
+  "clipboard-direct-webrtc-v1";
 
 /** Clipboard capabilities this Chrome client advertises to other devices. */
 export const CLIPBOARD_RECEIVE_CAPABILITIES = [
