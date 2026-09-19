@@ -1,5 +1,9 @@
 import type { IUser } from "../interfaces/user.interface.ts";
 import type { ClipboardItemEnvelope } from "../crypto/crypto-core.ts";
+import {
+  validateClipboardPayloadV1,
+  type ClipboardPayloadV1,
+} from "../clipboard/payload.ts";
 import type { RuntimeErrorCode } from "./errors.ts";
 import type { SyncPreferences } from "./sync-preferences.ts";
 import { MAX_CLIPBOARD_PLAINTEXT_BYTES } from "../clipboard/limits.ts";
@@ -187,8 +191,16 @@ export interface OffscreenRequest {
   source: typeof RUNTIME_SOURCE;
   target: typeof OFFSCREEN_SOURCE;
   requestId: string;
-  type: "READ_TEXT" | "WRITE_TEXT" | "WATCH_START" | "WATCH_STOP" | "PING";
+  type:
+    | "READ_TEXT"
+    | "WRITE_TEXT"
+    | "READ_PAYLOAD"
+    | "WRITE_PAYLOAD"
+    | "WATCH_START"
+    | "WATCH_STOP"
+    | "PING";
   text?: string;
+  payload?: ClipboardPayloadV1;
   resetBaseline?: boolean;
 }
 
@@ -199,6 +211,8 @@ export interface OffscreenResponse {
   type:
     | "READ_TEXT_RESULT"
     | "WRITE_TEXT_RESULT"
+    | "READ_PAYLOAD_RESULT"
+    | "WRITE_PAYLOAD_RESULT"
     | "WATCH_START_RESULT"
     | "WATCH_STOP_RESULT"
     | "PONG"
@@ -208,14 +222,28 @@ export interface OffscreenResponse {
     code: "CLIPBOARD_READ_FAILED" | "CLIPBOARD_WRITE_FAILED";
     message: string;
   };
+  payload?: ClipboardPayloadV1;
 }
 
-export interface OffscreenClipboardObservation {
+export interface TypedOffscreenClipboardObservation {
+  source: typeof OFFSCREEN_SOURCE;
+  target: typeof RUNTIME_SOURCE;
+  type: "CLIPBOARD_CHANGED";
+  payload: ClipboardPayloadV1;
+  text?: never;
+}
+
+export interface LegacyOffscreenClipboardObservation {
   source: typeof OFFSCREEN_SOURCE;
   target: typeof RUNTIME_SOURCE;
   type: "CLIPBOARD_CHANGED";
   text: string;
+  payload?: never;
 }
+
+export type OffscreenClipboardObservation =
+  | TypedOffscreenClipboardObservation
+  | LegacyOffscreenClipboardObservation;
 
 function isClipboardTextWithinLimit(value: string): boolean {
   return new TextEncoder().encode(value).byteLength <= MAX_CLIPBOARD_TEXT_BYTES;
@@ -243,19 +271,53 @@ export function isOffscreenRequest(value: unknown): value is OffscreenRequest {
     return false;
   }
   const candidate = value as Partial<OffscreenRequest>;
-  return (
+  const validRequestHeader =
     candidate.source === RUNTIME_SOURCE &&
     candidate.target === OFFSCREEN_SOURCE &&
     typeof candidate.requestId === "string" &&
+    candidate.requestId.length > 0 &&
     (candidate.type === "READ_TEXT" ||
       candidate.type === "WRITE_TEXT" ||
+      candidate.type === "READ_PAYLOAD" ||
+      candidate.type === "WRITE_PAYLOAD" ||
       candidate.type === "WATCH_START" ||
       candidate.type === "WATCH_STOP" ||
-      candidate.type === "PING") &&
-    (candidate.type !== "WRITE_TEXT" || isClipboardText(candidate.text)) &&
-    (candidate.type !== "WATCH_START" ||
-      candidate.resetBaseline === undefined ||
-      typeof candidate.resetBaseline === "boolean")
+      candidate.type === "PING");
+  if (!validRequestHeader) {
+    return false;
+  }
+
+  const keys = Reflect.ownKeys(value);
+  const type = candidate.type;
+  const expectedKeys =
+    type === "WRITE_TEXT"
+      ? ["source", "target", "requestId", "type", "text"]
+      : type === "WRITE_PAYLOAD"
+        ? ["source", "target", "requestId", "type", "payload"]
+        : type === "WATCH_START" && candidate.resetBaseline !== undefined
+          ? ["source", "target", "requestId", "type", "resetBaseline"]
+          : ["source", "target", "requestId", "type"];
+  if (
+    keys.length !== expectedKeys.length ||
+    !keys.every(
+      (key) => typeof key === "string" && expectedKeys.includes(key),
+    )
+  ) {
+    return false;
+  }
+  if (type === "WRITE_TEXT") return isClipboardText(candidate.text);
+  if (type === "WRITE_PAYLOAD") {
+    try {
+      validateClipboardPayloadV1(candidate.payload);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return (
+    type !== "WATCH_START" ||
+    candidate.resetBaseline === undefined ||
+    typeof candidate.resetBaseline === "boolean"
   );
 }
 
@@ -264,12 +326,61 @@ export function isOffscreenClipboardObservation(
 ): value is OffscreenClipboardObservation {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<OffscreenClipboardObservation>;
-  return (
+  if (
     candidate.source === OFFSCREEN_SOURCE &&
     candidate.target === RUNTIME_SOURCE &&
-    candidate.type === "CLIPBOARD_CHANGED" &&
-    isClipboardText(candidate.text)
-  );
+    candidate.type === "CLIPBOARD_CHANGED"
+  ) {
+    const keys = Reflect.ownKeys(value);
+    const hasText = Object.prototype.hasOwnProperty.call(value, "text");
+    const hasPayload = Object.prototype.hasOwnProperty.call(value, "payload");
+    if (hasText && hasPayload) {
+      if (!isClipboardText(candidate.text)) return false;
+      try {
+        validateClipboardPayloadV1(candidate.payload);
+      } catch {
+        return false;
+      }
+      return (
+        keys.length === 5 &&
+        keys.every(
+          (key) =>
+            typeof key === "string" &&
+            ["source", "target", "type", "text", "payload"].includes(key),
+        ) &&
+        candidate.payload.representations.some(
+          (representation) =>
+            representation.mime === "text/plain" &&
+            representation.data === candidate.text,
+        )
+      );
+    }
+    if (hasPayload) {
+      try {
+        validateClipboardPayloadV1(candidate.payload);
+      } catch {
+        return false;
+      }
+      return (
+        keys.length === 4 &&
+        keys.every(
+          (key) =>
+            typeof key === "string" &&
+            ["source", "target", "type", "payload"].includes(key),
+        )
+      );
+    }
+    return (
+      keys.length === 4 &&
+      keys.every(
+        (key) =>
+          typeof key === "string" &&
+          ["source", "target", "type", "text"].includes(key),
+      ) &&
+      isClipboardText(candidate.text)
+    );
+  }
+  return false;
 }
 
 export function isClipboardEnvelope(value: unknown): value is ClipboardItemEnvelope {

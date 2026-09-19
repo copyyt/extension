@@ -9,9 +9,11 @@ import {
   type ClipboardSetInterval,
   type ClipboardWatcherOptions,
 } from "./clipboard-watcher.ts";
+import type { ClipboardPayloadV1 } from "../clipboard/payload.ts";
 
 export interface OffscreenWatcherDependencies {
-  readText: ClipboardWatcherOptions["readText"];
+  readText?: ClipboardWatcherOptions["readText"];
+  readPayload?: ClipboardWatcherOptions["readPayload"];
   runtime: {
     sendMessage(message: OffscreenClipboardObservation): Promise<unknown>;
   };
@@ -32,22 +34,35 @@ export function createOffscreenClipboardWatcher(
     dependencies.runtime.sendMessage(message);
 
   return new ClipboardWatcher({
-    readText: dependencies.readText,
+    ...(dependencies.readPayload
+      ? { readPayload: dependencies.readPayload }
+      : { readText: dependencies.readText }),
     intervalMs: dependencies.intervalMs,
     setIntervalFn: dependencies.setIntervalFn,
     clearIntervalFn: dependencies.clearIntervalFn,
-    onChanged: (text) => {
-      const observation: OffscreenClipboardObservation = {
-        source: OFFSCREEN_SOURCE,
-        target: RUNTIME_SOURCE,
-        type: "CLIPBOARD_CHANGED",
-        text,
-      };
-      // The service worker validates the observation and waits for its
-      // startup promise before handling it. Delivery is intentionally
-      // fire-and-forget, but the rejection is explicitly consumed.
-      void sendMessage(observation).catch(() => undefined);
-    },
+    ...(dependencies.readPayload
+      ? {
+          onPayloadChanged: (payload: ClipboardPayloadV1) => {
+            const observation: OffscreenClipboardObservation = {
+              source: OFFSCREEN_SOURCE,
+              target: RUNTIME_SOURCE,
+              type: "CLIPBOARD_CHANGED",
+              payload,
+            };
+            void sendMessage(observation).catch(() => undefined);
+          },
+        }
+      : {
+          onChanged: (text: string) => {
+            const observation: OffscreenClipboardObservation = {
+              source: OFFSCREEN_SOURCE,
+              target: RUNTIME_SOURCE,
+              type: "CLIPBOARD_CHANGED",
+              text,
+            };
+            void sendMessage(observation).catch(() => undefined);
+          },
+        }),
     onError: dependencies.onError,
   });
 }

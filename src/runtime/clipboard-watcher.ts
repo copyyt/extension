@@ -1,3 +1,11 @@
+import {
+  clipboardPayloadFromPlainText,
+  getPlainTextRepresentation,
+  validateClipboardPayloadV1,
+  type ClipboardPayloadV1,
+} from "../clipboard/payload.ts";
+import { clipboardPayloadsEqual } from "../clipboard/clipboard-data.ts";
+
 export type ClipboardTimerId = ReturnType<typeof globalThis.setInterval>;
 export type ClipboardSetInterval = (
   handler: () => void,
@@ -6,8 +14,16 @@ export type ClipboardSetInterval = (
 export type ClipboardClearInterval = (id: ClipboardTimerId) => void;
 
 export interface ClipboardWatcherOptions {
-  readText: () => string | Promise<string>;
-  onChanged: (text: string) => void | Promise<void>;
+  /** Legacy adapter hook retained for diagnostics and compatibility tests. */
+  readText?: () => string | Promise<string>;
+  /** Typed adapter hook used by the production offscreen watcher. */
+  readPayload?: () => ClipboardPayloadV1 | Promise<ClipboardPayloadV1>;
+  /** Legacy callback receives the plain fallback. */
+  onChanged?: (text: string) => void | Promise<void>;
+  /** Typed callback receives the complete in-memory payload. */
+  onPayloadChanged?: (
+    payload: ClipboardPayloadV1,
+  ) => void | Promise<void>;
   onError?: (error: unknown) => void;
   intervalMs?: number;
   setIntervalFn?: ClipboardSetInterval;
@@ -23,23 +39,35 @@ export interface ClipboardWatchStartOptions {
  * content outside this offscreen document.
  */
 export class ClipboardWatcher {
-  private readonly readText: ClipboardWatcherOptions["readText"];
+  private readonly readPayload: () => ClipboardPayloadV1 | Promise<ClipboardPayloadV1>;
   private readonly onChanged: ClipboardWatcherOptions["onChanged"];
+  private readonly onPayloadChanged: ClipboardWatcherOptions["onPayloadChanged"];
   private readonly onError: (error: unknown) => void;
   private readonly intervalMs: number;
   private readonly setIntervalFn: ClipboardSetInterval;
   private readonly clearIntervalFn: ClipboardClearInterval;
+  private readonly typedMode: boolean;
   private timer: ClipboardTimerId | null = null;
   private running = false;
   private reading = false;
   private generation = 0;
   private baselineVersion = 0;
   private hasBaseline = false;
-  private baseline = "";
+  private baseline: ClipboardPayloadV1 | null = null;
 
   constructor(options: ClipboardWatcherOptions) {
-    this.readText = options.readText;
+    if (!options.readPayload && !options.readText) {
+      throw new Error("Clipboard watcher requires a clipboard reader");
+    }
+    if (!options.onChanged && !options.onPayloadChanged) {
+      throw new Error("Clipboard watcher requires a change callback");
+    }
+    this.typedMode = Boolean(options.readPayload);
+    this.readPayload =
+      options.readPayload ??
+      (async () => clipboardPayloadFromPlainText(await options.readText!()));
     this.onChanged = options.onChanged;
+    this.onPayloadChanged = options.onPayloadChanged;
     this.onError = options.onError ?? (() => undefined);
     this.intervalMs = options.intervalMs ?? 800;
     this.setIntervalFn =
@@ -58,7 +86,7 @@ export class ClipboardWatcher {
     if (options.resetBaseline) {
       this.baselineVersion += 1;
       this.hasBaseline = false;
-      this.baseline = "";
+      this.baseline = null;
     }
     if (this.running) return;
 
@@ -79,17 +107,16 @@ export class ClipboardWatcher {
       this.timer = null;
     }
     this.hasBaseline = false;
-    this.baseline = "";
+    this.baseline = null;
   }
 
-  /**
-   * Establishes the value written by a trusted remote item before the next
-   * sample. This is synchronous with the successful clipboard write in the
-   * offscreen message handler.
-   */
-  noteExternalWrite(text: string): void {
+  /** Establishes the value written by a trusted remote item. */
+  noteExternalWrite(value: ClipboardPayloadV1 | string): void {
+    const payload =
+      typeof value === "string" ? clipboardPayloadFromPlainText(value) : value;
+    validateClipboardPayloadV1(payload);
     this.baselineVersion += 1;
-    this.baseline = text;
+    this.baseline = payload;
     this.hasBaseline = true;
   }
 
@@ -98,25 +125,34 @@ export class ClipboardWatcher {
     this.reading = true;
     const baselineVersion = this.baselineVersion;
     try {
-      const text = await this.readText();
+      const payload = await this.readPayload();
+      validateClipboardPayloadV1(payload);
       if (
         !this.running ||
         generation !== this.generation ||
-        baselineVersion !== this.baselineVersion ||
-        typeof text !== "string"
+        baselineVersion !== this.baselineVersion
       ) {
         return;
       }
 
-      const changed = this.hasBaseline && text !== this.baseline;
+      const changed =
+        this.hasBaseline &&
+        this.baseline !== null &&
+        !clipboardPayloadsEqual(payload, this.baseline);
       // Set the baseline before notifying the service worker. A slow worker
       // cannot cause the same observation to be emitted again.
-      this.baseline = text;
+      this.baseline = payload;
       this.hasBaseline = true;
-      if (!changed || text.length === 0) return;
+      if (!changed || getPlainTextRepresentation(payload).data.length === 0) {
+        return;
+      }
 
       try {
-        await this.onChanged(text);
+        if (this.typedMode && this.onPayloadChanged) {
+          await this.onPayloadChanged(payload);
+        } else {
+          await this.onChanged!(getPlainTextRepresentation(payload).data);
+        }
       } catch (error) {
         this.handleWatcherError(error);
       }

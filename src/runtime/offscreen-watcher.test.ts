@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ClipboardPayloadV1 } from "../clipboard/payload.ts";
 import {
   createOffscreenClipboardWatcher,
   type OffscreenWatcherDependencies,
@@ -63,6 +64,45 @@ test("offscreen observation uses a receiver-safe runtime.sendMessage wrapper", a
       target: "service-worker",
       type: "CLIPBOARD_CHANGED",
       text: "changed",
+    },
+  ]);
+  watcher.stop();
+});
+
+test("production offscreen watcher emits a typed payload observation", async () => {
+  let clipboard: ClipboardPayloadV1 = {
+    version: 1,
+    representations: [
+      { mime: "text/plain", encoding: "utf-8", data: "baseline" },
+      { mime: "text/html", encoding: "utf-8", data: "<b>baseline</b>" },
+    ],
+  };
+  const observations: unknown[] = [];
+  const timers = new FakeTimers();
+  const watcher = createOffscreenClipboardWatcher({
+    readPayload: () => clipboard,
+    runtime: { sendMessage: async (message) => { observations.push(message); } },
+    setIntervalFn: (handler) =>
+      timers.setInterval(handler) as unknown as ReturnType<typeof globalThis.setInterval>,
+    clearIntervalFn: (handle) => timers.clearInterval(handle as unknown as number),
+  });
+  watcher.start();
+  await flush();
+  clipboard = {
+    version: 1,
+    representations: [
+      { mime: "text/plain", encoding: "utf-8", data: "changed" },
+      { mime: "text/html", encoding: "utf-8", data: "<i>changed</i>" },
+    ],
+  };
+  timers.tick();
+  await flush();
+  assert.deepEqual(observations, [
+    {
+      source: "offscreen",
+      target: "service-worker",
+      type: "CLIPBOARD_CHANGED",
+      payload: clipboard,
     },
   ]);
   watcher.stop();

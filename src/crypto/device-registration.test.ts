@@ -96,8 +96,8 @@ test("registration refresh advertises bundle receive support and preserves ident
   });
 
   assert.equal(requests.length, 1);
-  assert.deepEqual(requests[0]!.capabilities, ["clipboard", "clipboard-bundle-v1"]);
-  assert.deepEqual(device.capabilities, ["clipboard", "clipboard-bundle-v1"]);
+  assert.deepEqual(requests[0]!.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
+  assert.deepEqual(device.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
   assert.notEqual(requests[0]!.capabilities, CLIPBOARD_RECEIVE_CAPABILITIES);
   assert.equal(requests[0]!.deviceId, originalIdentity.deviceId);
   assert.equal(requests[0]!.encryptionPublicKey, originalIdentity.encryptionPublicKeyBase64);
@@ -112,7 +112,7 @@ test("registration refresh advertises bundle receive support and preserves ident
     assert.deepEqual(refreshed.encryptionPublicKey, originalIdentity.encryptionPublicKey);
     assert.deepEqual(refreshed.signingPublicKey, originalIdentity.signingPublicKey);
     assert.equal(refreshed.registration?.name, "Chrome after capability update");
-    assert.deepEqual(refreshed.registration?.capabilities, ["clipboard", "clipboard-bundle-v1"]);
+    assert.deepEqual(refreshed.registration?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
     assert.equal(
       await signSocketChallenge({ ...socketChallenge, identity: refreshed }),
       signatureBefore,
@@ -148,9 +148,9 @@ test("registration capabilities and server trust labels do not establish local t
     trustStore,
   });
 
-  assert.deepEqual(requests[0]!.capabilities, ["clipboard", "clipboard-bundle-v1"]);
+  assert.deepEqual(requests[0]!.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
   const local = await trustStore.getDevice(userId, localDeviceId);
-  assert.deepEqual(local?.capabilities, ["clipboard", "clipboard-bundle-v1"]);
+  assert.deepEqual(local?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
   assert.equal(local?.trustState, "unverified");
   assert.equal(local?.trustOrigin, undefined);
   assert.equal(local?.approvalCertificate, undefined);

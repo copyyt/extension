@@ -641,7 +641,7 @@ export class CopyytServiceWorkerRuntime {
   private autoPublishInFlight: Promise<void> | null = null;
   private automaticPublishAuthRecoveryInFlight = false;
   private pendingAutoObservation: {
-    text: string;
+    payload: ClipboardPayloadV1;
     sequence: number;
   } | null = null;
 
@@ -1129,10 +1129,15 @@ export class CopyytServiceWorkerRuntime {
 
   /** Handles a validated, fire-and-forget observation from the offscreen document. */
   async handleClipboardObservation(message: unknown): Promise<void> {
-    if (!isOffscreenClipboardObservation(message) || message.text.length === 0) {
+    if (!isOffscreenClipboardObservation(message)) return;
+    let payload: ClipboardPayloadV1;
+    try {
+      payload = message.payload ?? clipboardPayloadFromPlainText(message.text);
+      validateClipboardPayloadV1(payload);
+    } catch {
       return;
     }
-    if (!isClipboardText(message.text)) return;
+    if (getPlainTextRepresentation(payload).data.length === 0) return;
     if (!this.status.syncPreferences.sendEnabled) {
       // Do not retain an observation while sending is disabled. The next
       // enable operation starts a fresh baseline instead of publishing the
@@ -1150,7 +1155,7 @@ export class CopyytServiceWorkerRuntime {
         // this bounded publish retry; ordinary socket recovery still drops
         // observations and establishes a fresh clipboard baseline.
         const observation = {
-          text: message.text,
+          payload,
           sequence: ++this.autoObservationSequence,
         };
         this.pendingAutoObservation = observation;
@@ -1169,7 +1174,7 @@ export class CopyytServiceWorkerRuntime {
     }
 
     const observation = {
-      text: message.text,
+      payload,
       sequence: ++this.autoObservationSequence,
     };
     if (this.autoPublishInFlight) {
@@ -1246,7 +1251,7 @@ export class CopyytServiceWorkerRuntime {
   }
 
   private async drainAutoObservations(first: {
-    text: string;
+    payload: ClipboardPayloadV1;
     sequence: number;
   }): Promise<void> {
     let current = first;
@@ -1260,7 +1265,7 @@ export class CopyytServiceWorkerRuntime {
       if (!this.isAutomaticSyncEligible(!authRecoveryAttempted)) return;
       try {
         this.requireSendPolicy(sendPolicyRevision);
-        await this.publishClipboardText(current.text);
+        await this.publishClipboardPayload(current.payload);
         this.setStatus({
           ...this.status,
           lastAutoSyncAt: this.now().toISOString(),
@@ -1371,7 +1376,7 @@ export class CopyytServiceWorkerRuntime {
         "The clipboard payload is invalid",
       );
     }
-    // Phase 2C.0 advertises bundle reception only. Every recipient, including
+    // Phase 2C.1 can retain rich data locally, but every recipient, including
     // public 2.0.x clients, still receives the exact raw text/plain fallback.
     const text = getPlainTextRepresentation(payload).data;
     const session = this.requireSession();
@@ -1655,14 +1660,18 @@ export class CopyytServiceWorkerRuntime {
         });
         return;
       }
-      await this.dependencies.clipboardAdapter
-        .writeText(text)
-        .catch(() => {
-          throw new RuntimeError(
-            "CLIPBOARD_WRITE_FAILED",
-            "The operating-system clipboard could not be written",
-          );
-        });
+      try {
+        if (this.dependencies.clipboardAdapter.writePayload) {
+          await this.dependencies.clipboardAdapter.writePayload(clipboardPayload);
+        } else {
+          await this.dependencies.clipboardAdapter.writeText(text);
+        }
+      } catch {
+        throw new RuntimeError(
+          "CLIPBOARD_WRITE_FAILED",
+          "The operating-system clipboard could not be written",
+        );
+      }
       await this.dependencies.processedItemStore.mark({
         userId: session.user.id,
         itemId: envelope.itemId,
@@ -1722,9 +1731,13 @@ export class CopyytServiceWorkerRuntime {
             "Copyyt is still reconnecting; the device connection is not ready",
           );
         }
-        let text: string;
+        let payload: ClipboardPayloadV1;
         try {
-          text = await this.dependencies.clipboardAdapter.readText();
+          payload = this.dependencies.clipboardAdapter.readPayload
+            ? await this.dependencies.clipboardAdapter.readPayload()
+            : clipboardPayloadFromPlainText(
+                await this.dependencies.clipboardAdapter.readText(),
+              );
         } catch {
           throw new RuntimeError(
             "CLIPBOARD_READ_FAILED",
@@ -1732,7 +1745,7 @@ export class CopyytServiceWorkerRuntime {
           );
         }
         try {
-          return await this.publishClipboardText(text);
+          return await this.publishClipboardPayload(payload);
         } catch (error) {
           const runtimeError =
             error instanceof RuntimeError
@@ -1756,7 +1769,7 @@ export class CopyytServiceWorkerRuntime {
             forceSocketRecycle: true,
             waitForReady: true,
           });
-          return this.publishClipboardText(text);
+          return this.publishClipboardPayload(payload);
         }
       }
       case "runtime:bootstrap-trust-anchor":

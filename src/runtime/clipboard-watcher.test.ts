@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { clipboardPayloadFromPlainText, type ClipboardPayloadV1 } from "../clipboard/payload.ts";
 import { ClipboardWatcher } from "./clipboard-watcher.ts";
 
 class FakeTimers {
@@ -235,4 +236,98 @@ test("polling failures cannot become unhandled Promise rejections", async () => 
 
   assert.equal(errorReports, 2);
   assert.equal(unhandled, undefined);
+});
+
+function richPayload(plain: string, html: string): ClipboardPayloadV1 {
+  return {
+    version: 1,
+    representations: [
+      { mime: "text/plain", encoding: "utf-8", data: plain },
+      { mime: "text/html", encoding: "utf-8", data: html },
+    ],
+  };
+}
+
+test("typed watcher establishes a rich baseline and emits plain or HTML changes", async () => {
+  let clipboard = richPayload("same", "<b>same</b>");
+  const changed: ClipboardPayloadV1[] = [];
+  const timers = new FakeTimers();
+  const watcher = new ClipboardWatcher({
+    readPayload: () => clipboard,
+    onPayloadChanged: (payload) => { changed.push(payload); },
+    setIntervalFn: timers.setInterval,
+    clearIntervalFn: timers.clearInterval,
+  });
+
+  watcher.start();
+  await flush();
+  clipboard = richPayload("same", "<i>different</i>");
+  timers.tick();
+  await flush();
+  clipboard = richPayload("different", "<i>different</i>");
+  timers.tick();
+  await flush();
+  assert.deepEqual(changed, [
+    richPayload("same", "<i>different</i>"),
+    richPayload("different", "<i>different</i>"),
+  ]);
+  watcher.stop();
+});
+
+test("typed watcher ignores representation order and suppresses rich remote echoes", async () => {
+  let clipboard = richPayload("baseline", "<b>baseline</b>");
+  const changed: ClipboardPayloadV1[] = [];
+  const timers = new FakeTimers();
+  const watcher = new ClipboardWatcher({
+    readPayload: () => clipboard,
+    onPayloadChanged: (payload) => { changed.push(payload); },
+    setIntervalFn: timers.setInterval,
+    clearIntervalFn: timers.clearInterval,
+  });
+  watcher.start();
+  await flush();
+
+  clipboard = {
+    version: 1,
+    representations: [
+      { mime: "text/html", encoding: "utf-8", data: "<b>baseline</b>" },
+      { mime: "text/plain", encoding: "utf-8", data: "baseline" },
+    ],
+  };
+  timers.tick();
+  await flush();
+  assert.deepEqual(changed, []);
+
+  const remote = richPayload("remote", "<b>remote</b>");
+  clipboard = remote;
+  watcher.noteExternalWrite(remote);
+  timers.tick();
+  await flush();
+  assert.deepEqual(changed, []);
+
+  clipboard = clipboardPayloadFromPlainText("human copy");
+  timers.tick();
+  await flush();
+  assert.deepEqual(changed, [clipboard]);
+  watcher.stop();
+});
+
+test("typed watcher discards an invalidated asynchronous rich read", async () => {
+  let release!: (payload: ClipboardPayloadV1) => void;
+  const pending = new Promise<ClipboardPayloadV1>((resolve) => {
+    release = resolve;
+  });
+  const timers = new FakeTimers();
+  const changed: ClipboardPayloadV1[] = [];
+  const watcher = new ClipboardWatcher({
+    readPayload: () => pending,
+    onPayloadChanged: (payload) => { changed.push(payload); },
+    setIntervalFn: timers.setInterval,
+    clearIntervalFn: timers.clearInterval,
+  });
+  watcher.start();
+  watcher.stop();
+  release(richPayload("stale", "<b>stale</b>"));
+  await flush();
+  assert.deepEqual(changed, []);
 });

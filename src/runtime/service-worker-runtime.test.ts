@@ -617,7 +617,7 @@ function richClipboardBundle(plainText = "\uFEFF  fallback café e\u0301 🦊\r\
   return { payload, plainText, html, bytes: encodeClipboardBundleV1(payload) };
 }
 
-test("registration advertises both clipboard and bundle-v1 receive capabilities", async () => {
+test("registration advertises clipboard, bundle-v1, and HTML receive capabilities", async () => {
   const registrations: string[][] = [];
   const setup = await startReady({
     registerDevice: async (_api, options) => {
@@ -625,7 +625,7 @@ test("registration advertises both clipboard and bundle-v1 receive capabilities"
       return { identity, device: registeredDevice };
     },
   });
-  assert.deepEqual(registrations, [["clipboard", "clipboard-bundle-v1"]]);
+  assert.deepEqual(registrations, [["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]]);
   assert.equal(setup.runtime.getStatus().device.deviceId, identity.deviceId);
   assert.equal(setup.runtime.getStatus().syncReady, true);
 });
@@ -3519,6 +3519,71 @@ test("automatic observations and manual Send use typed payloads but encrypt exac
     .map((emission) => emission.args[0] as { contentType: string });
   assert.deepEqual(publishedEnvelopes.map((envelope) => envelope.contentType), ["text/plain", "text/plain"]);
   assert.equal(typeof setup.runtime.getStatus().lastAutoSyncAt, "string");
+});
+
+test("rich automatic and manual observations stay legacy on the network", async () => {
+  const rich = richClipboardBundle("  exact plain fallback\r\n");
+  const encryptInputs: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0][] = [];
+  const applied: ClipboardPayloadV1[] = [];
+  const setup = await startReady({
+    clipboardAdapter: {
+      readText: async () => rich.plainText,
+      readPayload: async () => rich.payload,
+      writeText: async () => undefined,
+      writePayload: async (payload) => { applied.push(payload); },
+    },
+    encrypt: async (input) => {
+      encryptInputs.push(input);
+      return {
+        ...inboundEnvelope(`rich-${encryptInputs.length}`),
+        contentType: input.contentType,
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+
+  const manual = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:send-current-clipboard" }),
+  );
+  assert.equal(manual.ok, true);
+  await setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: rich.payload,
+  });
+  assert.deepEqual(encryptInputs.map((input) => input.plaintext), [
+    rich.plainText,
+    rich.plainText,
+  ]);
+  assert.deepEqual(encryptInputs.map((input) => input.contentType), [
+    "text/plain",
+    "text/plain",
+  ]);
+  assert.equal(
+    setup.socket.emissions
+      .filter((emission) => emission.event === "clipboard:publish")
+      .every((emission) =>
+        (emission.args[0] as { contentType: string }).contentType ===
+        "text/plain",
+      ),
+    true,
+  );
+
+  const inbound = {
+    ...inboundEnvelope("rich-inbound"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  };
+  const receive = await startReady({
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+      writePayload: async (payload) => { applied.push(payload); },
+    },
+    decrypt: async () => ({ plaintextBytes: rich.bytes }),
+  });
+  await receive.runtime.receiveClipboardItem(inbound);
+  assert.deepEqual(applied[applied.length - 1], rich.payload);
 });
 
 test("an offscreen clipboard change routes to automatic publish without popup involvement", async () => {
