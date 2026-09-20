@@ -22,6 +22,10 @@ import {
   type DirectTransferState,
 } from "./protocol.ts";
 import { base64ToBytes, bytesToBase64 } from "../crypto/bytes.ts";
+import {
+  isDirectClipboardStartV1,
+  type DirectClipboardStartV1,
+} from "../crypto/direct-clipboard.ts";
 
 interface DataChannelLike {
   label: string;
@@ -111,6 +115,7 @@ interface TransferState {
   testBytes?: Uint8Array;
   expectedByteLength?: number;
   expectedSha256?: string;
+  expectedClipboardPlaintextByteLength?: number;
   receivedChunks?: ArrayBuffer[];
   expectedChunkCount?: number;
   receivedChunkCount?: number;
@@ -246,6 +251,16 @@ function isClipboardStartControl(value: unknown): value is {
     value.protocol === DIRECT_CLIPBOARD_PROTOCOL &&
     typeof value.transferId === "string"
   );
+}
+
+function parseClipboardStartManifest(
+  value: unknown,
+  transferId: string,
+): DirectClipboardStartV1 {
+  if (!isDirectClipboardStartV1(value) || value.transferId !== transferId) {
+    throw new DirectTransportError("The direct clipboard manifest is invalid");
+  }
+  return value;
 }
 
 function isClipboardVerifiedControl(
@@ -408,6 +423,16 @@ export class WebRtcPeerManager {
     if (typeof input.manifest !== "string" || input.manifest.length === 0) {
       throw new DirectTransportError("The direct clipboard manifest is missing");
     }
+    let manifest: DirectClipboardStartV1;
+    try {
+      manifest = parseClipboardStartManifest(
+        JSON.parse(input.manifest) as unknown,
+        input.transferId,
+      );
+    } catch (error) {
+      if (error instanceof DirectTransportError) throw error;
+      throw new DirectTransportError("The direct clipboard manifest is invalid");
+    }
     for (const chunk of input.encryptedChunks) {
       try {
         if (base64ToBytes(chunk).byteLength > DIRECT_APPLICATION_MAX_FRAME_BYTES) {
@@ -423,6 +448,7 @@ export class WebRtcPeerManager {
       "initiator",
     );
     state.applicationMode = "clipboard";
+    state.expectedClipboardPlaintextByteLength = manifest.plaintextByteLength;
     state.clipboardPackage = {
       manifest: input.manifest,
       encryptedChunks: [...input.encryptedChunks],
@@ -457,15 +483,17 @@ export class WebRtcPeerManager {
       !state ||
       state.role !== "responder" ||
       state.applicationMode !== "clipboard" ||
-      state.completionPhase !== "transferring" ||
-      !state.dataChannel ||
-      state.dataChannel.readyState !== "open"
+      state.completionPhase !== "transferring"
     ) {
       throw new DirectTransportError(
         "The direct clipboard transfer is not ready for verification",
       );
     }
-    if (!Number.isSafeInteger(input.plaintextByteLength) || input.plaintextByteLength <= 0) {
+    if (
+      !Number.isSafeInteger(input.plaintextByteLength) ||
+      input.plaintextByteLength <= 0 ||
+      input.plaintextByteLength !== state.expectedClipboardPlaintextByteLength
+    ) {
       throw new DirectTransportError("The direct clipboard byte length is invalid");
     }
     const control: ClipboardVerifiedControl = {
@@ -474,7 +502,6 @@ export class WebRtcPeerManager {
       transferId: input.transferId,
       plaintextByteLength: input.plaintextByteLength,
     };
-    state.dataChannel.send(JSON.stringify(control));
     this.markApplicationSucceeded(state);
     state.completionPhase = "awaiting-verified-ack";
     state.state = "verified";
@@ -483,6 +510,21 @@ export class WebRtcPeerManager {
       byteLength: input.plaintextByteLength,
     });
     this.startCleanupTimer(state);
+    try {
+      if (!state.dataChannel || state.dataChannel.readyState !== "open") {
+        throw new DirectTransportError(
+          "The data channel closed before clipboard verification",
+        );
+      }
+      state.dataChannel.send(JSON.stringify(control));
+    } catch (error) {
+      this.handleTransportFailure(
+        state,
+        error instanceof Error
+          ? error.message
+          : "The clipboard verification could not be sent",
+      );
+    }
   }
 
   async handleSignal(signal: DirectSignalDelivery): Promise<void> {
@@ -999,7 +1041,9 @@ export class WebRtcPeerManager {
           state.role !== "initiator" ||
           state.applicationMode !== "clipboard" ||
           state.completionPhase !== "awaiting-verified" ||
-          parsed.transferId !== state.transferId
+          parsed.transferId !== state.transferId ||
+          parsed.plaintextByteLength !==
+            state.expectedClipboardPlaintextByteLength
         ) {
           throw new DirectTransportError(
             "The direct clipboard verification acknowledgement is invalid",
@@ -1055,7 +1099,10 @@ export class WebRtcPeerManager {
         ) {
           throw new DirectTransportError("The direct clipboard start frame is invalid");
         }
+        const manifest = parseClipboardStartManifest(parsed, state.transferId);
         state.applicationMode = "clipboard";
+        state.expectedClipboardPlaintextByteLength =
+          manifest.plaintextByteLength;
         state.receivedStart = true;
         state.state = "receiving";
         await this.emitApplicationFrame(state, {

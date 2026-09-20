@@ -4,11 +4,15 @@ import {
   DIRECT_BUFFER_HIGH_WATER,
   DIRECT_CHUNK_SIZE,
   DIRECT_DATA_CHANNEL_LABEL,
+  DIRECT_APPLICATION_PLAINTEXT_CHUNK_SIZE,
+  DIRECT_CLIPBOARD_CONTENT_TYPE,
+  DIRECT_CLIPBOARD_PROTOCOL,
   DIRECT_TEST_PAYLOAD_BYTES,
   deterministicTestBytes,
   sha256Hex,
   type DirectManagerEvent,
 } from "./protocol.ts";
+import { bytesToBase64 } from "../crypto/bytes.ts";
 import {
   WebRtcPeerManager,
   type DataChannelLike,
@@ -36,6 +40,7 @@ class FakeChannel implements DataChannelLike {
   backpressureWaits = 0;
   deferredControlTypes = new Set<string>();
   deferredControls: string[] = [];
+  sendError: Error | null = null;
   closeCalls = 0;
 
   constructor(label: string) {
@@ -48,6 +53,7 @@ class FakeChannel implements DataChannelLike {
   }
 
   send(data: string | ArrayBuffer): void {
+    if (this.sendError) throw this.sendError;
     this.sent.push(data);
     if (typeof data === "string") {
       const type = (JSON.parse(data) as { type?: unknown }).type;
@@ -90,6 +96,34 @@ class FakeChannel implements DataChannelLike {
     const remote = this.remote;
     if (remote) queueMicrotask(() => remote.onmessage?.({ data: control }));
   }
+}
+
+function clipboardManifest(plaintextByteLength = 123): {
+  manifest: string;
+  plaintextByteLength: number;
+} {
+  return {
+    manifest: JSON.stringify({
+      type: "clipboard-secure-start",
+      protocol: DIRECT_CLIPBOARD_PROTOCOL,
+      transferId,
+      userId: "11111111-1111-4111-8111-111111111111",
+      sourceDeviceId,
+      sourceKeyVersion: 1,
+      recipientDeviceId,
+      recipientKeyVersion: 1,
+      contentType: DIRECT_CLIPBOARD_CONTENT_TYPE,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      plaintextByteLength,
+      chunkPlaintextSize: DIRECT_APPLICATION_PLAINTEXT_CHUNK_SIZE,
+      chunkCount: 1,
+      noncePrefix: bytesToBase64(new Uint8Array(8)),
+      wrapNonce: bytesToBase64(new Uint8Array(12)),
+      wrappedKey: bytesToBase64(new Uint8Array(48)),
+      sourceSignature: bytesToBase64(new Uint8Array(64)),
+    }),
+    plaintextByteLength,
+  };
 }
 
 class FakePeerConnection implements PeerConnectionLike {
@@ -290,6 +324,113 @@ async function createConnectedTransfer(
   };
 }
 
+async function createConnectedClipboardTransfer(
+  options: { transferTimeoutMs?: number; cleanupTimeoutMs?: number } = {},
+): Promise<{
+  managerA: WebRtcPeerManager;
+  managerB: WebRtcPeerManager;
+  initiatorEvents: DirectManagerEvent[];
+  responderEvents: DirectManagerEvent[];
+  initiatorChannel: FakeChannel;
+  responderChannel: FakeChannel;
+  expectedPlaintextByteLength: number;
+}> {
+  const initiatorEvents: DirectManagerEvent[] = [];
+  const responderEvents: DirectManagerEvent[] = [];
+  const peers: FakePeerConnection[] = [];
+  const packageToSend = clipboardManifest();
+  const managerA = new WebRtcPeerManager({
+    peerConnectionFactory: () => {
+      const peer = new FakePeerConnection();
+      peers.push(peer);
+      if (peers.length === 2 && peers[0]?.dataChannel) {
+        const remote = new FakeChannel(DIRECT_DATA_CHANNEL_LABEL);
+        peers[0].dataChannel.remote = remote;
+        remote.remote = peers[0].dataChannel;
+        peer.pendingRemoteChannel = remote;
+      }
+      return peer;
+    },
+    emit: (event) => {
+      initiatorEvents.push(event);
+    },
+    transferTimeoutMs: options.transferTimeoutMs,
+    cleanupTimeoutMs: options.cleanupTimeoutMs,
+  });
+  const managerB = new WebRtcPeerManager({
+    peerConnectionFactory: () => {
+      const peer = new FakePeerConnection();
+      peers.push(peer);
+      if (peers.length === 2 && peers[0]?.dataChannel) {
+        const remote = new FakeChannel(DIRECT_DATA_CHANNEL_LABEL);
+        peers[0].dataChannel.remote = remote;
+        remote.remote = peers[0].dataChannel;
+        peer.pendingRemoteChannel = remote;
+      }
+      return peer;
+    },
+    emit: (event) => {
+      responderEvents.push(event);
+    },
+    transferTimeoutMs: options.transferTimeoutMs,
+    cleanupTimeoutMs: options.cleanupTimeoutMs,
+  });
+
+  await managerA.startClipboardTransfer({
+    transferId,
+    remoteDeviceId: recipientDeviceId,
+    manifest: packageToSend.manifest,
+    encryptedChunks: [bytesToBase64(new Uint8Array([1, 2, 3]))],
+  });
+  const offer = initiatorEvents.find(
+    (event): event is Extract<DirectManagerEvent, { kind: "signal" }> =>
+      event.kind === "signal" && event.signal.kind === "offer",
+  );
+  assert.ok(offer);
+  await managerB.handleSignal({
+    transferId,
+    sourceDeviceId,
+    sourceKeyVersion: 1,
+    kind: "offer",
+    sdp: offer.signal.sdp,
+  });
+  const answer = responderEvents.find(
+    (event): event is Extract<DirectManagerEvent, { kind: "signal" }> =>
+      event.kind === "signal" && event.signal.kind === "answer",
+  );
+  assert.ok(answer);
+  await managerA.handleSignal({
+    transferId,
+    sourceDeviceId: recipientDeviceId,
+    sourceKeyVersion: 1,
+    kind: "answer",
+    sdp: answer.signal.sdp,
+  });
+  const initiatorChannel = peers[0]?.dataChannel;
+  const responderChannel = peers[1]?.receivedDataChannel;
+  assert.ok(initiatorChannel);
+  assert.ok(responderChannel);
+  responderChannel.open();
+  initiatorChannel.open();
+  await waitFor(
+    () =>
+      responderEvents.some(
+        (event) =>
+          event.kind === "application-frame" &&
+          event.frame.type === "clipboard-secure-start",
+      ),
+  );
+  return {
+    managerA,
+    managerB,
+    initiatorEvents,
+    responderEvents,
+    initiatorChannel,
+    responderChannel,
+    expectedPlaintextByteLength: packageToSend.plaintextByteLength,
+  };
+}
+
 function hasStatus(
   events: DirectManagerEvent[],
   state: Extract<DirectManagerEvent, { kind: "status" }>["state"],
@@ -306,6 +447,15 @@ function countStatus(
   return events.filter(
     (event) => event.kind === "status" && event.state === state,
   ).length;
+}
+
+function hasApplicationFrame(
+  events: DirectManagerEvent[],
+  type: "clipboard-secure-start" | "clipboard-secure-chunk",
+): boolean {
+  return events.some(
+    (event) => event.kind === "application-frame" && event.frame.type === type,
+  );
 }
 
 test("direct test bytes are deterministic and hashable", async () => {
@@ -572,6 +722,103 @@ test("peer manager chunks the 2 MiB experiment and completes with verification",
   assert.ok(initiatorChannel.backpressureWaits > 0);
   assert.equal(managerA.size, 0);
   assert.equal(managerB.size, 0);
+});
+
+test("initiator rejects verified clipboard length mismatches without success or ack", async () => {
+  const harness = await createConnectedClipboardTransfer();
+  await waitFor(() => hasApplicationFrame(harness.responderEvents, "clipboard-secure-chunk"));
+
+  harness.initiatorChannel.onmessage?.({
+    data: JSON.stringify({
+      type: "clipboard-secure-verified",
+      protocol: DIRECT_CLIPBOARD_PROTOCOL,
+      transferId,
+      plaintextByteLength: harness.expectedPlaintextByteLength + 1,
+    }),
+  });
+  await waitFor(() => harness.managerA.size === 0);
+  assert.equal(countStatus(harness.initiatorEvents, "failed"), 1);
+  assert.equal(countStatus(harness.initiatorEvents, "succeeded"), 0);
+  assert.equal(
+    harness.initiatorChannel.sent.some(
+      (message) =>
+        typeof message === "string" &&
+        JSON.parse(message).type === "clipboard-secure-verified-ack",
+    ),
+    false,
+  );
+  await harness.managerB.cancelAll();
+});
+
+test("responder rejects a wrong clipboard verification length without sending", async () => {
+  const harness = await createConnectedClipboardTransfer();
+  await assert.rejects(
+    harness.managerB.sendClipboardVerified({
+      transferId,
+      plaintextByteLength: harness.expectedPlaintextByteLength + 1,
+    }),
+    /byte length is invalid/,
+  );
+  assert.equal(countStatus(harness.responderEvents, "succeeded"), 0);
+  assert.equal(
+    harness.responderChannel.sent.some(
+      (message) =>
+        typeof message === "string" &&
+        JSON.parse(message).type === "clipboard-secure-verified",
+    ),
+    false,
+  );
+  await harness.managerA.cancelAll();
+  await harness.managerB.cancelAll();
+});
+
+test("exact clipboard manifest length preserves verified success", async () => {
+  const harness = await createConnectedClipboardTransfer();
+  await harness.managerB.sendClipboardVerified({
+    transferId,
+    plaintextByteLength: harness.expectedPlaintextByteLength,
+  });
+  await waitFor(
+    () => harness.managerA.size === 0 && harness.managerB.size === 0,
+  );
+  assert.equal(countStatus(harness.initiatorEvents, "succeeded"), 1);
+  assert.equal(countStatus(harness.responderEvents, "succeeded"), 1);
+  assert.equal(countStatus(harness.initiatorEvents, "failed"), 0);
+  assert.equal(countStatus(harness.responderEvents, "failed"), 0);
+});
+
+test("responder success survives a verification send failure", async () => {
+  const harness = await createConnectedClipboardTransfer({
+    transferTimeoutMs: 25,
+  });
+  harness.responderChannel.sendError = new Error("send failed");
+  await harness.managerB.sendClipboardVerified({
+    transferId,
+    plaintextByteLength: harness.expectedPlaintextByteLength,
+  });
+  await waitFor(() => harness.managerB.size === 0);
+  await waitFor(() => harness.managerA.size === 0);
+  assert.equal(countStatus(harness.responderEvents, "succeeded"), 1);
+  assert.equal(countStatus(harness.responderEvents, "failed"), 0);
+  assert.equal(countStatus(harness.initiatorEvents, "succeeded"), 0);
+  assert.equal(countStatus(harness.initiatorEvents, "failed"), 1);
+});
+
+test("responder success survives a channel closing before verification send", async () => {
+  const harness = await createConnectedClipboardTransfer({
+    transferTimeoutMs: 25,
+  });
+  harness.responderChannel.readyState = "closed";
+  await harness.managerB.sendClipboardVerified({
+    transferId,
+    plaintextByteLength: harness.expectedPlaintextByteLength,
+  });
+  await waitFor(() => harness.managerB.size === 0);
+  await waitFor(() => harness.managerA.size === 0);
+  assert.equal(countStatus(harness.responderEvents, "succeeded"), 1);
+  assert.equal(countStatus(harness.responderEvents, "failed"), 0);
+  assert.equal(countStatus(harness.initiatorEvents, "succeeded"), 0);
+  assert.equal(countStatus(harness.initiatorEvents, "failed"), 1);
 });
 
 test("responder success is final before the initiator receives verified", async () => {

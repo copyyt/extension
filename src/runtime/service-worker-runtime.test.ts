@@ -45,10 +45,12 @@ import {
   type SocketLike,
   type SocketOptions,
 } from "./service-worker-runtime.ts";
-import type {
-  PendingAssistedImageCopyResult,
-  RuntimeCommand,
-  RuntimeStatus,
+import {
+  OFFSCREEN_SOURCE,
+  RUNTIME_SOURCE,
+  type PendingAssistedImageCopyResult,
+  type RuntimeCommand,
+  type RuntimeStatus,
 } from "./messages.ts";
 import {
   InMemorySyncPreferencesStore,
@@ -3350,6 +3352,56 @@ test("a direct signal from a source no longer trusted by the server is not forwa
   await flushRuntimeWork();
   await flushRuntimeWork();
   assert.equal(direct.handled.length, 0);
+});
+
+async function assertDirectReceiveAccumulatorCleanup(
+  state: "failed" | "cancelled",
+): Promise<void> {
+  const pendingAssistedImageStore = new InMemoryPendingAssistedImageStore();
+  const directTransport: DirectTransport = {
+    startTestTransfer: async () => undefined,
+    handleSignal: async () => undefined,
+    cancelTransfer: async () => undefined,
+    cancelAll: async () => undefined,
+  };
+  const setup = await startReady({
+    directTransport,
+    pendingAssistedImageStore,
+  });
+  const transferId = "55555555-5555-4555-8555-555555555555";
+  const receives = (
+    setup.runtime as unknown as {
+      directClipboardReceives: Map<string, unknown>;
+    }
+  ).directClipboardReceives;
+  receives.set(transferId, {
+    manifest: { plaintextByteLength: 123 },
+    encryptedChunks: ["encrypted-chunk-1", "encrypted-chunk-2"],
+    sourceDeviceId: directSourceDevice.deviceId,
+  });
+
+  await setup.runtime.handleDirectTransportEvent({
+    source: OFFSCREEN_SOURCE,
+    target: RUNTIME_SOURCE,
+    type: "DIRECT_EVENT",
+    event: {
+      kind: "status",
+      transferId,
+      remoteDeviceId: directSourceDevice.deviceId,
+      state,
+    },
+  });
+
+  assert.equal(receives.has(transferId), false);
+  assert.deepEqual(await pendingAssistedImageStore.list(user.id), []);
+}
+
+test("failed partial direct receives release encrypted chunk accumulators", async () => {
+  await assertDirectReceiveAccumulatorCleanup("failed");
+});
+
+test("cancelled partial direct receives release encrypted chunk accumulators", async () => {
+  await assertDirectReceiveAccumulatorCleanup("cancelled");
 });
 
 test("sync failures preserve a ready authenticated socket and a later publish succeeds", async () => {

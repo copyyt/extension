@@ -1367,6 +1367,9 @@ export class CopyytServiceWorkerRuntime {
         ...this.status,
         directTransfers: [next, ...withoutTransfer].slice(0, 4),
       });
+      if (event.state === "failed" || event.state === "cancelled") {
+        this.directClipboardReceives.delete(event.transferId);
+      }
       if (
         event.state === "failed" &&
         event.error &&
