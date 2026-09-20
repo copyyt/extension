@@ -82,7 +82,12 @@ export interface RuntimeStatus {
   /** Device-local clipboard participation preferences. */
   syncPreferences: SyncPreferences;
   clipboardWatch?: ClipboardWatchState;
+  /** Legacy name: the automatic publish was accepted, not remotely verified. */
   lastAutoSyncAt?: string;
+  /** Explicit name for the automatic publish-accepted timestamp. */
+  lastAutoPublishAcceptedAt?: string;
+  /** Set only after a direct transfer reaches terminal verified/succeeded state. */
+  lastDirectDeliveryAt?: string;
   lastAutoSyncError?: {
     code: RuntimeErrorCode;
     message: string;

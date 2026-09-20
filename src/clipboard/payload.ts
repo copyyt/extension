@@ -35,6 +35,13 @@ export interface ClipboardPayloadV1 {
   representations: ClipboardRepresentationV1[];
 }
 
+declare const clipboardBundleV1BytesBrand: unique symbol;
+
+/** Bytes returned by the canonical bundle encoder, safe to reuse internally. */
+export type ClipboardBundleV1Bytes = Uint8Array & {
+  readonly [clipboardBundleV1BytesBrand]: true;
+};
+
 const utf8Encoder = new TextEncoder();
 // ignoreBOM preserves a leading U+FEFF as clipboard data instead of stripping it.
 const strictUtf8Decoder = new TextDecoder("utf-8", {
@@ -255,13 +262,13 @@ export function decodeClipboardPlainText(
 export function encodeClipboardBundleV1(
   payload: ClipboardPayloadV1,
   maxBytes = MAX_CLIPBOARD_PLAINTEXT_BYTES,
-): Uint8Array {
+): ClipboardBundleV1Bytes {
   validateClipboardPayloadV1(payload);
   const bytes = utf8Encoder.encode(JSON.stringify(payload));
   if (bytes.byteLength > maxBytes) {
     throw new Error("Clipboard bundle exceeds the configured byte limit");
   }
-  return bytes;
+  return bytes as ClipboardBundleV1Bytes;
 }
 
 /** Decode a strict bundle-v1 payload with opaque, inert text/PNG data. */

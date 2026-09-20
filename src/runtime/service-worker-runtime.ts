@@ -26,6 +26,7 @@ import {
   getPngRepresentation,
   projectClipboardPayloadToText,
   validateClipboardPayloadV1,
+  type ClipboardBundleV1Bytes,
   type ClipboardPayloadV1,
 } from "../clipboard/payload.ts";
 import {
@@ -234,6 +235,8 @@ const CONNECTIVITY_RECONCILIATION_TIMEOUT_MS = 15_000;
 const MAX_CONNECTIVITY_RECONCILIATION_FOLLOW_UPS = 2;
 const LOGOUT_REQUEST_TIMEOUT_MS = 5_000;
 const DIRECT_CLIPBOARD_TERMINAL_TOMBSTONE_TTL_MS = 5_000;
+const DIRECT_SIGNAL_VALIDATION_TTL_MS = 15_000;
+const DIRECT_SIGNAL_VALIDATION_MAX = 8;
 
 export const LIVE_CLIPBOARD_TTL_MS = 60_000;
 export const MAX_CLOCK_SKEW_MS = 5 * 60_000;
@@ -734,6 +737,15 @@ export class CopyytServiceWorkerRuntime {
     string,
     ReturnType<typeof setTimeout>
   >();
+  private readonly directSignalValidations = new Map<
+    string,
+    {
+      sourceDeviceId: string;
+      sourceKeyVersion: number;
+      expiresAt: number;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
 
   constructor(dependencies: RuntimeDependencies) {
     this.dependencies = dependencies;
@@ -1143,6 +1155,12 @@ export class CopyytServiceWorkerRuntime {
             ...(persistedStatus.lastAutoSyncAt
               ? { lastAutoSyncAt: persistedStatus.lastAutoSyncAt }
               : {}),
+            ...(persistedStatus.lastAutoPublishAcceptedAt
+              ? { lastAutoPublishAcceptedAt: persistedStatus.lastAutoPublishAcceptedAt }
+              : {}),
+            ...(persistedStatus.lastDirectDeliveryAt
+              ? { lastDirectDeliveryAt: persistedStatus.lastDirectDeliveryAt }
+              : {}),
             ...(persistedStatus.lastAutoSyncError
               ? { lastAutoSyncError: persistedStatus.lastAutoSyncError }
               : {}),
@@ -1386,9 +1404,15 @@ export class CopyytServiceWorkerRuntime {
       if (event.state === "failed" || event.state === "cancelled") {
         this.markTerminalDirectClipboardTransfer(event.transferId);
         this.directClipboardReceives.delete(event.transferId);
+        this.clearDirectSignalValidation(event.transferId);
       }
       if (event.state === "succeeded") {
         this.markTerminalDirectClipboardTransfer(event.transferId);
+        this.clearDirectSignalValidation(event.transferId);
+        this.setStatus({
+          ...this.status,
+          lastDirectDeliveryAt: this.now().toISOString(),
+        });
       }
       if (
         event.state === "failed" &&
@@ -1751,6 +1775,46 @@ export class CopyytServiceWorkerRuntime {
     this.terminalDirectClipboardTransferTimers.set(transferId, timer);
   }
 
+  private clearDirectSignalValidation(transferId: string): void {
+    const validation = this.directSignalValidations.get(transferId);
+    if (!validation) return;
+    clearTimeout(validation.timer);
+    this.directSignalValidations.delete(transferId);
+  }
+
+  private clearAllDirectSignalValidations(): void {
+    for (const transferId of this.directSignalValidations.keys()) {
+      this.clearDirectSignalValidation(transferId);
+    }
+  }
+
+  private rememberDirectSignalValidation(
+    transferId: string,
+    sourceDeviceId: string,
+    sourceKeyVersion: number,
+  ): void {
+    this.clearDirectSignalValidation(transferId);
+    while (this.directSignalValidations.size >= DIRECT_SIGNAL_VALIDATION_MAX) {
+      const oldestTransferId = this.directSignalValidations.keys().next().value;
+      if (typeof oldestTransferId !== "string") break;
+      this.clearDirectSignalValidation(oldestTransferId);
+    }
+    const expiresAt = this.now().getTime() + DIRECT_SIGNAL_VALIDATION_TTL_MS;
+    const timer = setTimeout(() => {
+      const current = this.directSignalValidations.get(transferId);
+      if (current?.expiresAt === expiresAt) {
+        this.directSignalValidations.delete(transferId);
+      }
+    }, DIRECT_SIGNAL_VALIDATION_TTL_MS);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.directSignalValidations.set(transferId, {
+      sourceDeviceId,
+      sourceKeyVersion,
+      expiresAt,
+      timer,
+    });
+  }
+
   private async requireActiveTrustedDirectSource(
     session: RuntimeSession,
     sourceDeviceId: string,
@@ -1772,7 +1836,10 @@ export class CopyytServiceWorkerRuntime {
         device.encryptionPublicKey === localSource.encryptionPublicKey &&
         device.revokedAt == null,
     );
-    if (!serverSource) {
+    if (
+      !serverSource ||
+      !serverSource.capabilities?.includes(CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY)
+    ) {
       throw new RuntimeError("SOURCE_UNTRUSTED", "The direct clipboard source is no longer active and trusted");
     }
     return localSource;
@@ -1886,17 +1953,53 @@ export class CopyytServiceWorkerRuntime {
     ) {
       return;
     }
-    const snapshot = await this.fetchDeviceSnapshot(this.session).catch(() => null);
-    const serverSource = snapshot?.trustedDevices.find(
-      (device) =>
-        device.deviceId === payload.sourceDeviceId &&
-        device.keyVersion === payload.sourceKeyVersion &&
-        device.signingPublicKey === localSource.signingPublicKey &&
-        device.encryptionPublicKey === localSource.encryptionPublicKey &&
-        device.revokedAt == null,
+
+    const cached = this.directSignalValidations.get(payload.transferId);
+    if (cached) {
+      if (
+        cached.expiresAt <= this.now().getTime() ||
+        cached.sourceDeviceId !== payload.sourceDeviceId ||
+        cached.sourceKeyVersion !== payload.sourceKeyVersion
+      ) {
+        // A source mismatch is a forged signal for an already-bound transfer;
+        // do not let it replace the original validation binding.
+        if (
+          cached.sourceDeviceId !== payload.sourceDeviceId ||
+          cached.sourceKeyVersion !== payload.sourceKeyVersion
+        ) {
+          return;
+        }
+        this.clearDirectSignalValidation(payload.transferId);
+      } else {
+        await this.dependencies.directTransport.handleSignal(payload).catch(() => undefined);
+        if (payload.kind === "cancel") {
+          this.clearDirectSignalValidation(payload.transferId);
+        }
+        return;
+      }
+    }
+
+    // The first signal for a transfer (offer, answer, or pre-offer ICE) is
+    // authoritative. Ordinary subsequent ICE candidates reuse only this
+    // transfer-scoped, short-lived source binding.
+    try {
+      await this.requireActiveTrustedDirectSource(
+        this.session,
+        payload.sourceDeviceId,
+        payload.sourceKeyVersion,
+      );
+    } catch {
+      return;
+    }
+    this.rememberDirectSignalValidation(
+      payload.transferId,
+      payload.sourceDeviceId,
+      payload.sourceKeyVersion,
     );
-    if (!serverSource) return;
     await this.dependencies.directTransport.handleSignal(payload).catch(() => undefined);
+    if (payload.kind === "cancel") {
+      this.clearDirectSignalValidation(payload.transferId);
+    }
   }
 
   async handleMessage(message: unknown): Promise<RuntimeResponse> {
@@ -1974,6 +2077,7 @@ export class CopyytServiceWorkerRuntime {
         this.setStatus({
           ...this.status,
           lastAutoSyncAt: this.now().toISOString(),
+          lastAutoPublishAcceptedAt: this.now().toISOString(),
           lastAutoSyncError: undefined,
         });
       } catch (error) {
@@ -2081,6 +2185,7 @@ export class CopyytServiceWorkerRuntime {
     identity: DeviceIdentity;
     recipient: ClientVerifiedDevice;
     payload: ClipboardPayloadV1;
+    canonicalPlaintext: ClipboardBundleV1Bytes;
     sendPolicyRevision: number;
     observationSequence?: number;
   }): Promise<string | null> {
@@ -2112,6 +2217,7 @@ export class CopyytServiceWorkerRuntime {
         identity: input.identity,
         recipient: input.recipient,
         payload: input.payload,
+        canonicalPlaintext: input.canonicalPlaintext,
         transferId,
         expiresAt: new Date(this.now().getTime() + LIVE_CLIPBOARD_TTL_MS),
       });
@@ -2336,6 +2442,7 @@ export class CopyytServiceWorkerRuntime {
         identity,
         recipient,
         payload: direct.payload,
+        canonicalPlaintext: direct.plaintext,
         sendPolicyRevision,
         observationSequence,
       });
@@ -4473,6 +4580,7 @@ export class CopyytServiceWorkerRuntime {
     const isCurrent = this.socket === socket;
     this.detachSocketListeners(socket);
     if (isCurrent) {
+      this.clearAllDirectSignalValidations();
       const hasActiveDirectTransfer = (this.status.directTransfers ?? []).some(
         (transfer) =>
           transfer.state !== "succeeded" &&
@@ -4546,6 +4654,8 @@ export class CopyytServiceWorkerRuntime {
   private async refreshServerDevices(
     session: RuntimeSession,
   ): Promise<RegisteredDeviceResponse[]> {
+    // A full trust refresh is an invalidation boundary for signaling bindings.
+    this.clearAllDirectSignalValidations();
     const snapshot = await this.fetchDeviceSnapshot(session);
     const devices = [...snapshot.trustedDevices, ...snapshot.pendingDevices];
     for (const device of devices) {

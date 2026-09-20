@@ -15,6 +15,7 @@ import {
   decodeClipboardBundleV1,
   encodeClipboardBundleV1,
   validateClipboardPayloadV1,
+  type ClipboardBundleV1Bytes,
   type ClipboardPayloadV1,
 } from "../clipboard/payload.ts";
 import {
@@ -241,11 +242,12 @@ export async function prepareDirectClipboardTransfer(input: {
   identity: DeviceIdentity;
   recipient: ClientVerifiedDevice | VerifiedRecipient;
   payload: ClipboardPayloadV1;
+  /** Canonical bytes produced by the direct routing projection, when present. */
+  canonicalPlaintext?: ClipboardBundleV1Bytes;
   transferId: string;
   expiresAt: Date | string;
   randomBytes?: (length: number) => Uint8Array;
 }): Promise<PreparedDirectClipboardTransfer> {
-  validateClipboardPayloadV1(input.payload);
   if (input.identity.userId !== input.userId) {
     throw new CryptoProtocolError("The direct source identity belongs to another account");
   }
@@ -259,10 +261,26 @@ export async function prepareDirectClipboardTransfer(input: {
     throw new CryptoProtocolError("The direct recipient is invalid");
   }
   const expiresAt = canonicalIsoExpiry(input.expiresAt);
-  const plaintext = encodeClipboardBundleV1(
-    input.payload,
-    DIRECT_CLIPBOARD_MAX_PLAINTEXT_BYTES,
-  );
+  let plaintext: Uint8Array;
+  if (input.canonicalPlaintext) {
+    try {
+      // Decode the branded bytes before encryption so this optimization cannot
+      // introduce an alternate or unchecked direct clipboard serialization.
+      decodeClipboardBundleV1(
+        input.canonicalPlaintext,
+        DIRECT_CLIPBOARD_MAX_PLAINTEXT_BYTES,
+      );
+      plaintext = input.canonicalPlaintext;
+    } catch {
+      throw new CryptoProtocolError("The direct clipboard bundle is invalid");
+    }
+  } else {
+    validateClipboardPayloadV1(input.payload);
+    plaintext = encodeClipboardBundleV1(
+      input.payload,
+      DIRECT_CLIPBOARD_MAX_PLAINTEXT_BYTES,
+    );
+  }
   if (plaintext.byteLength === 0 || plaintext.byteLength > DIRECT_CLIPBOARD_MAX_PLAINTEXT_BYTES) {
     throw new CryptoProtocolError("The direct clipboard bundle is too large");
   }

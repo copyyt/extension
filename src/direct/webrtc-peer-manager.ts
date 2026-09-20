@@ -11,6 +11,8 @@ import {
   DIRECT_TEST_PAYLOAD_BYTES,
   DIRECT_CLIPBOARD_PROTOCOL,
   DIRECT_APPLICATION_MAX_FRAME_BYTES,
+  DIRECT_PROGRESS_BYTES,
+  DIRECT_PROGRESS_INTERVAL_MS,
   DIRECT_TRANSFER_TIMEOUT_MS,
   deterministicTestBytes,
   isDirectIceCandidate,
@@ -129,6 +131,9 @@ interface TransferState {
     encryptedChunks: readonly string[];
   };
   applicationFrameChain?: Promise<void>;
+  progressBytes?: number;
+  progressAt?: number;
+  progressEmissionChain?: Promise<void>;
 }
 
 type CompletionPhase =
@@ -455,6 +460,11 @@ export class WebRtcPeerManager {
     } catch (error) {
       if (error instanceof DirectTransportError) throw error;
       throw new DirectTransportError("The direct clipboard manifest is invalid");
+    }
+    if (input.encryptedChunks.length !== manifest.chunkCount) {
+      throw new DirectTransportError(
+        "The direct clipboard chunk count does not match the manifest",
+      );
     }
     for (const chunk of input.encryptedChunks) {
       try {
@@ -945,6 +955,7 @@ export class WebRtcPeerManager {
       state.dataChannel.send(JSON.stringify(start));
       state.state = "sending";
       await this.emitStatus(state, "sending", { byteLength: bytes.byteLength });
+      this.noteProgress(state, 0);
       for (
         let offset = 0;
         offset < bytes.byteLength;
@@ -959,14 +970,26 @@ export class WebRtcPeerManager {
           Math.min(offset + this.dependencies.chunkSize, bytes.byteLength),
         );
         state.dataChannel.send(chunk.buffer);
-        await this.emitStatus(state, "sending", {
-          bytesSent: Math.min(offset + chunk.byteLength, bytes.byteLength),
+        const bytesSent = Math.min(offset + chunk.byteLength, bytes.byteLength);
+        this.queueProgress(state, "sending", {
+          bytesSent,
           byteLength: bytes.byteLength,
         });
+        if (bytesSent === bytes.byteLength) {
+          // The receiver may verify synchronously from its final chunk. Be
+          // willing to accept that control before any final status persistence.
+          state.completionPhase = "awaiting-verified";
+          await this.queueProgress(state, "sending", {
+            bytesSent,
+            byteLength: bytes.byteLength,
+          }, true);
+        }
       }
       const end: ControlEnd = { type: "end", transferId: state.transferId };
       state.dataChannel.send(JSON.stringify(end));
-      state.completionPhase = "awaiting-verified";
+      if (state.completionPhase !== "awaiting-verified") {
+        state.completionPhase = "awaiting-verified";
+      }
     } catch (error) {
       this.handleTransportFailure(
         state,
@@ -996,7 +1019,13 @@ export class WebRtcPeerManager {
       }, 0);
       let sentBytes = 0;
       await this.emitStatus(state, "sending", { byteLength: totalBytes });
-      for (const encodedChunk of packageToSend.encryptedChunks) {
+      this.noteProgress(state, 0);
+      for (
+        let index = 0;
+        index < packageToSend.encryptedChunks.length;
+        index += 1
+      ) {
+        const encodedChunk = packageToSend.encryptedChunks[index]!;
         await this.waitForBufferLow(state.dataChannel);
         if (state.dataChannel.readyState !== "open") {
           throw new DirectTransportError("Data channel closed during sending");
@@ -1007,12 +1036,23 @@ export class WebRtcPeerManager {
         }
         state.dataChannel.send(bytes.buffer);
         sentBytes += bytes.byteLength;
-        await this.emitStatus(state, "sending", {
+        this.queueProgress(state, "sending", {
           bytesSent: sentBytes,
           byteLength: totalBytes,
         });
+        if (index === packageToSend.encryptedChunks.length - 1) {
+          // Set this before the forced final progress update: verified can
+          // arrive while that status write is still pending.
+          state.completionPhase = "awaiting-verified";
+          await this.queueProgress(state, "sending", {
+            bytesSent: sentBytes,
+            byteLength: totalBytes,
+          }, true);
+        }
       }
-      state.completionPhase = "awaiting-verified";
+      if (state.completionPhase !== "awaiting-verified") {
+        state.completionPhase = "awaiting-verified";
+      }
     } catch (error) {
       this.handleTransportFailure(
         state,
@@ -1036,19 +1076,30 @@ export class WebRtcPeerManager {
         else resolve();
       };
       channel.onbufferedamountlow = () => {
-        previousLow?.();
-        if (channel.bufferedAmount <= DIRECT_BUFFER_HIGH_WATER) finish();
+        try {
+          previousLow?.();
+        } finally {
+          if (channel.bufferedAmount <= DIRECT_BUFFER_HIGH_WATER) finish();
+        }
       };
       channel.onclose = () => {
-        previousClose?.();
-        finish(
-          new DirectTransportError("Data channel closed while backpressured"),
-        );
+        try {
+          previousClose?.();
+        } finally {
+          finish(
+            new DirectTransportError("Data channel closed while backpressured"),
+          );
+        }
       };
       if (channel.readyState !== "open") {
         finish(
           new DirectTransportError("Data channel closed while backpressured"),
         );
+      } else if (channel.bufferedAmount <= DIRECT_BUFFER_HIGH_WATER) {
+        // The buffer can cross the threshold between the initial check and
+        // handler installation. Re-check while our handlers are active so a
+        // missed low event cannot strand the sender.
+        finish();
       }
     });
   }
@@ -1137,9 +1188,16 @@ export class WebRtcPeerManager {
         state.clipboardExpiresAtMs = expiresAtMs;
         state.expectedClipboardPlaintextByteLength =
           manifest.plaintextByteLength;
+        state.receivedByteLength = 0;
+        state.expectedChunkCount = manifest.chunkCount;
+        state.receivedChunkCount = 0;
+        this.noteProgress(state, 0);
         if (!this.armClipboardTransferTimer(state)) return;
         state.receivedStart = true;
         state.state = "receiving";
+        await this.emitStatus(state, "receiving", {
+          byteLength: manifest.plaintextByteLength,
+        });
         await this.emitApplicationFrame(state, {
           type: "clipboard-secure-start",
           manifest: raw,
@@ -1227,6 +1285,7 @@ export class WebRtcPeerManager {
       state.receivedChunks = [];
       state.receivedChunkCount = 0;
       state.receivedByteLength = 0;
+      this.noteProgress(state, 0);
       state.receivedStart = true;
       state.state = "receiving";
       await this.emitStatus(state, "receiving", {
@@ -1242,10 +1301,25 @@ export class WebRtcPeerManager {
       if (chunk.byteLength > DIRECT_APPLICATION_MAX_FRAME_BYTES) {
         throw new DirectTransportError("The direct clipboard chunk is too large");
       }
+      if (
+        state.receivedChunkCount !== undefined &&
+        state.expectedChunkCount !== undefined &&
+        state.receivedChunkCount >= state.expectedChunkCount
+      ) {
+        throw new DirectTransportError(
+          "The direct clipboard transfer has an extra chunk",
+        );
+      }
       await this.emitApplicationFrame(state, {
         type: "clipboard-secure-chunk",
         data: bytesToBase64(new Uint8Array(chunk)),
       });
+      state.receivedByteLength = (state.receivedByteLength ?? 0) + chunk.byteLength;
+      state.receivedChunkCount = (state.receivedChunkCount ?? 0) + 1;
+      await this.queueProgress(state, "receiving", {
+        bytesReceived: state.receivedByteLength,
+        byteLength: state.expectedClipboardPlaintextByteLength,
+      }, state.receivedChunkCount === state.expectedChunkCount);
       return;
     }
     if (!chunk || !state.receivedStart || state.receivedChunks === undefined) {
@@ -1268,7 +1342,7 @@ export class WebRtcPeerManager {
     state.receivedChunks.push(chunk);
     state.receivedChunkCount = (state.receivedChunkCount ?? 0) + 1;
     state.receivedByteLength = nextByteLength;
-    await this.emitStatus(state, "receiving", {
+    await this.queueProgress(state, "receiving", {
       bytesReceived: nextByteLength,
       byteLength: state.expectedByteLength,
     });
@@ -1305,6 +1379,10 @@ export class WebRtcPeerManager {
     if (hash !== state.expectedSha256) {
       throw new DirectTransportError("The direct SHA-256 verification failed");
     }
+    await this.queueProgress(state, "receiving", {
+      bytesReceived: total,
+      byteLength: state.expectedByteLength,
+    }, true);
     const acknowledged: ControlVerified = {
       type: "verified",
       transferId: state.transferId,
@@ -1357,6 +1435,42 @@ export class WebRtcPeerManager {
       remoteDeviceId: state.remoteDeviceId,
       frame,
     });
+  }
+
+  private noteProgress(state: TransferState, bytes: number): void {
+    state.progressBytes = bytes;
+    state.progressAt = this.dependencies.now().getTime();
+  }
+
+  private queueProgress(
+    state: TransferState,
+    status: "sending" | "receiving",
+    details: Partial<DirectManagerEvent & { kind: "status" }>,
+    force = false,
+  ): Promise<void> {
+    if (this.transfers.get(state.transferId) !== state) return Promise.resolve();
+    const bytes = details.bytesSent ?? details.bytesReceived;
+    const now = this.dependencies.now().getTime();
+    const shouldEmit =
+      force ||
+      state.progressBytes === undefined ||
+      (bytes !== undefined && bytes - state.progressBytes >= DIRECT_PROGRESS_BYTES) ||
+      state.progressAt === undefined ||
+      now - state.progressAt >= DIRECT_PROGRESS_INTERVAL_MS;
+    if (!shouldEmit) return state.progressEmissionChain ?? Promise.resolve();
+
+    if (bytes !== undefined) state.progressBytes = bytes;
+    state.progressAt = now;
+    const previous = state.progressEmissionChain ?? Promise.resolve();
+    const emission = previous
+      .catch(() => undefined)
+      .then(() => {
+        if (this.transfers.get(state.transferId) !== state) return;
+        return this.emitStatus(state, status, details);
+      });
+    state.progressEmissionChain = emission;
+    void emission.catch(() => undefined);
+    return emission;
   }
 
   private verificationDetails(state: TransferState): Record<string, unknown> {

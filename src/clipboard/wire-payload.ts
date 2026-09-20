@@ -6,6 +6,7 @@ import {
   getPngRepresentation,
   getPlainTextRepresentation,
   type ClipboardPayloadV1,
+  type ClipboardBundleV1Bytes,
 } from "./payload.ts";
 import {
   CLIPBOARD_BUNDLE_V1_CAPABILITY,
@@ -48,7 +49,7 @@ export interface ClipboardWireProjection {
 
 export interface ClipboardDirectProjection {
   payload: ClipboardPayloadV1;
-  plaintext: Uint8Array;
+  plaintext: ClipboardBundleV1Bytes;
   recipient: ClipboardWireRecipient;
 }
 
@@ -138,7 +139,7 @@ function projectForRecipient(
   return { version: 1, representations };
 }
 
-function bundleBytesForDirect(payload: ClipboardPayloadV1): Uint8Array {
+function bundleBytesForDirect(payload: ClipboardPayloadV1): ClipboardBundleV1Bytes {
   return encodeClipboardBundleV1(payload, DIRECT_CLIPBOARD_MAX_PLAINTEXT_BYTES);
 }
 
@@ -235,13 +236,24 @@ export function selectClipboardDeliveryRoutes(input: {
       try {
         const plaintext = bundleBytesForDirect(fullProjection);
         direct.push({ payload: fullProjection, plaintext, recipient });
-        continue;
       } catch {
         // The direct maximum is bounded. It is not a reason to attempt a
         // relay publish that would violate the existing plaintext limit.
         unsupported.push(recipient);
         continue;
       }
+
+      // Direct delivery is opportunistic. Keep an independently valid
+      // text/HTML projection for the same recipient so a failed local-network
+      // connection does not discard a relay-compatible fallback.
+      const fallbackProjection = projectForRecipient(input.payload, recipient, false);
+      if (fallbackProjection) {
+        const key = projectionKey(fallbackProjection);
+        const group = relayGroups.get(key);
+        if (group) group.recipients.push(recipient);
+        else relayGroups.set(key, { payload: fallbackProjection, recipients: [recipient] });
+      }
+      continue;
     }
 
     let relayProjection = fullProjection;

@@ -16,7 +16,10 @@ import {
   DIRECT_APPLICATION_PLAINTEXT_CHUNK_SIZE,
   DIRECT_CLIPBOARD_CONTENT_TYPE,
 } from "../direct/protocol.ts";
-import { clipboardPayloadFromPngBytes } from "../clipboard/payload.ts";
+import {
+  clipboardPayloadFromPngBytes,
+  encodeClipboardBundleV1,
+} from "../clipboard/payload.ts";
 import type { ClientVerifiedDevice } from "./trust-store.ts";
 
 const userId = "11111111-1111-4111-8111-111111111111";
@@ -106,6 +109,24 @@ test("direct clipboard chunks round trip with fresh wrapped CEK and unique nonce
     encryptedChunks: prepared.encryptedChunks,
   });
   assert.deepEqual(decrypted.payload, oversizedPngPayload());
+});
+
+test("direct preparation reuses validated canonical routing bytes", async () => {
+  const source = await identity(sourceDeviceId, 0);
+  const recipient = await identity(recipientDeviceId, 0);
+  const payload = oversizedPngPayload();
+  const canonicalPlaintext = encodeClipboardBundleV1(payload, 16 * 1024 * 1024);
+  const prepared = await prepareDirectClipboardTransfer({
+    userId,
+    identity: source,
+    recipient: trustedDevice(recipient),
+    payload,
+    canonicalPlaintext,
+    transferId,
+    expiresAt: new Date(Date.now() + 60_000),
+  });
+
+  assert.equal(prepared.manifest.plaintextByteLength, canonicalPlaintext.byteLength);
 });
 
 test("direct manifest, AAD, source, recipient, and chunk order are authenticated", async () => {

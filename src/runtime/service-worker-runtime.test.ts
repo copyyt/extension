@@ -20,7 +20,10 @@ import type { RegisteredDeviceResponse } from "../crypto/device-registration.ts"
 import type { ClientTrustStore, ClientVerifiedDevice, LocalDeviceRecord } from "../crypto/trust-store.ts";
 import type { IUser } from "../interfaces/user.interface.ts";
 import type { ILoginResponse, SignInResponse } from "../interfaces/auth.interface.ts";
-import { CLIPBOARD_RECEIVE_CAPABILITIES } from "../clipboard/capabilities.ts";
+import {
+  CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY,
+  CLIPBOARD_RECEIVE_CAPABILITIES,
+} from "../clipboard/capabilities.ts";
 import { RuntimeError } from "./errors.ts";
 import type { ClipboardAdapter } from "./clipboard-adapter.ts";
 import type { ClipboardWatcherOptions } from "./clipboard-watcher.ts";
@@ -3222,6 +3225,7 @@ const directSourceDevice: RegisteredDeviceResponse = {
   name: "Direct Source",
   encryptionPublicKey: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
   signingPublicKey: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+  capabilities: [CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY],
 };
 
 function directSignal(
@@ -3242,9 +3246,11 @@ async function startDirectSignalRuntime(): Promise<{
   handled: DirectSignalDelivery[];
   pairing: ReturnType<typeof makePairingTrustStore>;
   setServerSource: (device: RegisteredDeviceResponse | null) => void;
+  getSnapshotCalls: () => number;
 }> {
   const pairing = makePairingTrustStore();
   const handled: DirectSignalDelivery[] = [];
+  let snapshotCalls = 0;
   const directTransport: DirectTransport = {
     startTestTransfer: async () => undefined,
     handleSignal: async (signal) => {
@@ -3257,9 +3263,14 @@ async function startDirectSignalRuntime(): Promise<{
   const setup = await startReady({
     trustStore: pairing.trustStore,
     directTransport,
-    listDevices: async () =>
-      response([registeredDevice, ...(serverSource ? [serverSource] : [])]),
-    listPendingDevices: async () => response([]),
+    listDevices: async () => {
+      snapshotCalls += 1;
+      return response([registeredDevice, ...(serverSource ? [serverSource] : [])]);
+    },
+    listPendingDevices: async () => {
+      snapshotCalls += 1;
+      return response([]);
+    },
   });
   await waitForRuntimeCondition(
     () => setup.runtime.getStatus().socket.deviceAuthenticated,
@@ -3272,6 +3283,7 @@ async function startDirectSignalRuntime(): Promise<{
     setServerSource: (device) => {
       serverSource = device;
     },
+    getSnapshotCalls: () => snapshotCalls,
   };
 }
 
@@ -3286,6 +3298,41 @@ test("a valid locally pinned direct signal is forwarded to offscreen", async () 
     "valid direct signal was not forwarded",
   );
   assert.deepEqual(direct.handled, [signal]);
+});
+
+test("ordinary direct ICE reuses transfer-scoped source validation", async () => {
+  const direct = await startDirectSignalRuntime();
+  putLocalRecord(direct.pairing.records, directSourceDevice, "verified");
+  const baselineSnapshotCalls = direct.getSnapshotCalls();
+
+  direct.setup.socket.trigger(
+    "direct:signal",
+    directSignal({ kind: "offer", reason: undefined, sdp: "offer-sdp" }),
+  );
+  await waitForRuntimeCondition(
+    () => direct.handled.length === 1,
+    "direct offer was not forwarded",
+  );
+  const afterOfferSnapshotCalls = direct.getSnapshotCalls();
+  assert.ok(afterOfferSnapshotCalls > baselineSnapshotCalls);
+
+  direct.setup.socket.trigger(
+    "direct:signal",
+    directSignal({
+      kind: "ice-candidate",
+      reason: undefined,
+      candidate: {
+        candidate: "candidate:1 1 UDP 1 192.0.2.1 9 typ host",
+        sdpMid: "0",
+        sdpMLineIndex: 0,
+      },
+    }),
+  );
+  await waitForRuntimeCondition(
+    () => direct.handled.length === 2,
+    "direct ICE candidate was not forwarded",
+  );
+  assert.equal(direct.getSnapshotCalls(), afterOfferSnapshotCalls);
 });
 
 test("a direct signal from a locally unverified source is not forwarded", async () => {
