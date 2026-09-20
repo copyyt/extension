@@ -98,7 +98,10 @@ class FakeChannel implements DataChannelLike {
   }
 }
 
-function clipboardManifest(plaintextByteLength = 123): {
+function clipboardManifest(
+  plaintextByteLength = 123,
+  expiresAtMs = Date.now() + 60_000,
+): {
   manifest: string;
   plaintextByteLength: number;
 } {
@@ -113,7 +116,7 @@ function clipboardManifest(plaintextByteLength = 123): {
       recipientDeviceId,
       recipientKeyVersion: 1,
       contentType: DIRECT_CLIPBOARD_CONTENT_TYPE,
-      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      expiresAt: new Date(expiresAtMs).toISOString(),
       plaintextByteLength,
       chunkPlaintextSize: DIRECT_APPLICATION_PLAINTEXT_CHUNK_SIZE,
       chunkCount: 1,
@@ -325,7 +328,12 @@ async function createConnectedTransfer(
 }
 
 async function createConnectedClipboardTransfer(
-  options: { transferTimeoutMs?: number; cleanupTimeoutMs?: number } = {},
+  options: {
+    transferTimeoutMs?: number;
+    cleanupTimeoutMs?: number;
+    now?: () => Date;
+    expiresAtMs?: number;
+  } = {},
 ): Promise<{
   managerA: WebRtcPeerManager;
   managerB: WebRtcPeerManager;
@@ -338,7 +346,10 @@ async function createConnectedClipboardTransfer(
   const initiatorEvents: DirectManagerEvent[] = [];
   const responderEvents: DirectManagerEvent[] = [];
   const peers: FakePeerConnection[] = [];
-  const packageToSend = clipboardManifest();
+  const packageToSend = clipboardManifest(
+    123,
+    options.expiresAtMs ?? (options.now?.() ?? new Date()).getTime() + 60_000,
+  );
   const managerA = new WebRtcPeerManager({
     peerConnectionFactory: () => {
       const peer = new FakePeerConnection();
@@ -354,6 +365,7 @@ async function createConnectedClipboardTransfer(
     emit: (event) => {
       initiatorEvents.push(event);
     },
+    now: options.now,
     transferTimeoutMs: options.transferTimeoutMs,
     cleanupTimeoutMs: options.cleanupTimeoutMs,
   });
@@ -372,6 +384,7 @@ async function createConnectedClipboardTransfer(
     emit: (event) => {
       responderEvents.push(event);
     },
+    now: options.now,
     transferTimeoutMs: options.transferTimeoutMs,
     cleanupTimeoutMs: options.cleanupTimeoutMs,
   });
@@ -787,6 +800,49 @@ test("exact clipboard manifest length preserves verified success", async () => {
   assert.equal(countStatus(harness.responderEvents, "failed"), 0);
 });
 
+test("clipboard transfers outlive the diagnostic timeout but stop at signed expiry", async () => {
+  const nowMs = Date.now();
+  const harness = await createConnectedClipboardTransfer({
+    transferTimeoutMs: 25,
+    now: () => new Date(nowMs),
+    expiresAtMs: nowMs + 120,
+  });
+  await new Promise<void>((resolve) => setTimeout(resolve, 40));
+  assert.equal(harness.managerA.size, 1);
+  assert.equal(harness.managerB.size, 1);
+  assert.equal(countStatus(harness.initiatorEvents, "failed"), 0);
+  assert.equal(countStatus(harness.responderEvents, "failed"), 0);
+
+  await harness.managerB.sendClipboardVerified({
+    transferId,
+    plaintextByteLength: harness.expectedPlaintextByteLength,
+  });
+  await waitFor(
+    () => harness.managerA.size === 0 && harness.managerB.size === 0,
+  );
+  assert.equal(countStatus(harness.initiatorEvents, "succeeded"), 1);
+  assert.equal(countStatus(harness.responderEvents, "succeeded"), 1);
+});
+
+test("clipboard transfer expiry is an absolute deadline", async () => {
+  const nowMs = Date.now();
+  const harness = await createConnectedClipboardTransfer({
+    transferTimeoutMs: 250,
+    now: () => new Date(nowMs),
+    expiresAtMs: nowMs + 40,
+  });
+  await waitFor(() => harness.managerA.size === 0 && harness.managerB.size === 0);
+  assert.equal(countStatus(harness.initiatorEvents, "failed"), 1);
+  assert.equal(countStatus(harness.responderEvents, "failed"), 1);
+  assert.equal(
+    harness.initiatorEvents.some(
+      (event) => event.kind === "status" && event.state === "failed" &&
+        event.error === "Direct clipboard transfer expired",
+    ),
+    true,
+  );
+});
+
 test("responder success survives a verification send failure", async () => {
   const harness = await createConnectedClipboardTransfer({
     transferTimeoutMs: 25,
@@ -813,6 +869,9 @@ test("responder success survives a channel closing before verification send", as
     transferId,
     plaintextByteLength: harness.expectedPlaintextByteLength,
   });
+  // The fake channel is manually closed and therefore cannot notify its
+  // remote peer. Model the real peer-side close explicitly.
+  harness.initiatorChannel.onerror?.();
   await waitFor(() => harness.managerB.size === 0);
   await waitFor(() => harness.managerA.size === 0);
   assert.equal(countStatus(harness.responderEvents, "succeeded"), 1);

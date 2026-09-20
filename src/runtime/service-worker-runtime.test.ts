@@ -3404,6 +3404,158 @@ test("cancelled partial direct receives release encrypted chunk accumulators", a
   await assertDirectReceiveAccumulatorCleanup("cancelled");
 });
 
+test("late direct clipboard frames are ignored only for terminal transfers", async () => {
+  for (const terminalState of ["failed", "cancelled"] as const) {
+    let nowMs = Date.now();
+    let cancelCalls = 0;
+    const pendingAssistedImageStore = new InMemoryPendingAssistedImageStore();
+    const directTransport: DirectTransport = {
+      startTestTransfer: async () => undefined,
+      handleSignal: async () => undefined,
+      cancelTransfer: async () => {
+        cancelCalls += 1;
+      },
+      cancelAll: async () => undefined,
+    };
+    const setup = await startReady({
+      directTransport,
+      now: () => new Date(nowMs),
+      pendingAssistedImageStore,
+    });
+    const transferId = terminalState === "failed"
+      ? "66666666-6666-4666-8666-666666666666"
+      : "77777777-7777-4777-8777-777777777777";
+    const receives = (
+      setup.runtime as unknown as {
+        directClipboardReceives: Map<string, unknown>;
+      }
+    ).directClipboardReceives;
+    receives.set(transferId, {
+      manifest: { plaintextByteLength: 123 },
+      encryptedChunks: ["encrypted-chunk-1"],
+      sourceDeviceId: directSourceDevice.deviceId,
+    });
+
+    await setup.runtime.handleDirectTransportEvent({
+      source: OFFSCREEN_SOURCE,
+      target: RUNTIME_SOURCE,
+      type: "DIRECT_EVENT",
+      event: {
+        kind: "status",
+        transferId,
+        remoteDeviceId: directSourceDevice.deviceId,
+        state: terminalState,
+      },
+    });
+    await setup.runtime.handleDirectTransportEvent({
+      source: OFFSCREEN_SOURCE,
+      target: RUNTIME_SOURCE,
+      type: "DIRECT_EVENT",
+      event: {
+        kind: "application-frame",
+        transferId,
+        remoteDeviceId: directSourceDevice.deviceId,
+        frame: { type: "clipboard-secure-chunk", data: "late-frame" },
+      },
+    });
+    assert.equal(cancelCalls, 0);
+    assert.equal(setup.runtime.getStatus().lastSyncError, undefined);
+    assert.deepEqual(await pendingAssistedImageStore.list(user.id), []);
+
+    nowMs += 6_000;
+    await setup.runtime.handleDirectTransportEvent({
+      source: OFFSCREEN_SOURCE,
+      target: RUNTIME_SOURCE,
+      type: "DIRECT_EVENT",
+      event: {
+        kind: "application-frame",
+        transferId,
+        remoteDeviceId: directSourceDevice.deviceId,
+        frame: { type: "clipboard-secure-chunk", data: "late-after-tombstone" },
+      },
+    });
+    assert.equal(cancelCalls, 1);
+    assert.match(
+      setup.runtime.getStatus().lastSyncError?.message ?? "",
+      /chunk has no manifest/i,
+    );
+  }
+});
+
+test("ordinary direct clipboard chunks avoid repeated control-plane validation", async () => {
+  let identityCalls = 0;
+  let trustCalls = 0;
+  let snapshotCalls = 0;
+  const pairing = makePairingTrustStore();
+  const directTransport: DirectTransport = {
+    startTestTransfer: async () => undefined,
+    handleSignal: async () => undefined,
+    cancelTransfer: async () => undefined,
+    cancelAll: async () => undefined,
+  };
+  const setup = await startReady({
+    directTransport,
+    trustStore: {
+      ...pairing.trustStore,
+      getDevice: async (userId, deviceId) => {
+        trustCalls += 1;
+        return pairing.trustStore.getDevice(userId, deviceId);
+      },
+    },
+    identityLoader: async () => {
+      identityCalls += 1;
+      return identity;
+    },
+    apiFactory: (_accessToken, api) => ({
+      ...api,
+      devices: {
+        ...api.devices,
+        listDevices: async () => {
+          snapshotCalls += 1;
+          return api.devices.listDevices();
+        },
+        listPendingDevices: async () => {
+          snapshotCalls += 1;
+          return api.devices.listPendingDevices();
+        },
+      },
+    }),
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const baseline = { identityCalls, trustCalls, snapshotCalls };
+  const transferId = "88888888-8888-4888-8888-888888888888";
+  const receives = (
+    setup.runtime as unknown as {
+      directClipboardReceives: Map<string, unknown>;
+    }
+  ).directClipboardReceives;
+  receives.set(transferId, {
+    manifest: { chunkCount: 101, plaintextByteLength: 123 },
+    encryptedChunks: [],
+    sourceDeviceId: directSourceDevice.deviceId,
+    receivePolicyRevision: 0,
+  });
+
+  for (let index = 0; index < 100; index += 1) {
+    await setup.runtime.handleDirectTransportEvent({
+      source: OFFSCREEN_SOURCE,
+      target: RUNTIME_SOURCE,
+      type: "DIRECT_EVENT",
+      event: {
+        kind: "application-frame",
+        transferId,
+        remoteDeviceId: directSourceDevice.deviceId,
+        frame: { type: "clipboard-secure-chunk", data: `chunk-${index}` },
+      },
+    });
+  }
+
+  assert.equal(identityCalls, baseline.identityCalls);
+  assert.equal(trustCalls, baseline.trustCalls);
+  assert.equal(snapshotCalls, baseline.snapshotCalls);
+  assert.equal(receives.get(transferId) !== undefined, true);
+});
+
 test("sync failures preserve a ready authenticated socket and a later publish succeeds", async () => {
   const setup = await startReady({
     clipboardAdapter: {

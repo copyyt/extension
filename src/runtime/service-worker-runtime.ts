@@ -233,6 +233,7 @@ const STARTUP_CONNECTIVITY_KICK_TIMEOUT_MS = 250;
 const CONNECTIVITY_RECONCILIATION_TIMEOUT_MS = 15_000;
 const MAX_CONNECTIVITY_RECONCILIATION_FOLLOW_UPS = 2;
 const LOGOUT_REQUEST_TIMEOUT_MS = 5_000;
+const DIRECT_CLIPBOARD_TERMINAL_TOMBSTONE_TTL_MS = 5_000;
 
 export const LIVE_CLIPBOARD_TTL_MS = 60_000;
 export const MAX_CLOCK_SKEW_MS = 5 * 60_000;
@@ -725,7 +726,13 @@ export class CopyytServiceWorkerRuntime {
       manifest: DirectClipboardStartV1;
       encryptedChunks: string[];
       sourceDeviceId: string;
+      receivePolicyRevision: number;
     }
+  >();
+  private readonly terminalDirectClipboardTransfers = new Map<string, number>();
+  private readonly terminalDirectClipboardTransferTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
   >();
 
   constructor(dependencies: RuntimeDependencies) {
@@ -1328,9 +1335,18 @@ export class CopyytServiceWorkerRuntime {
     if (!isOffscreenDirectTransportEvent(message)) return;
     const event = message.event;
     if (event.kind === "application-frame") {
+      if (
+        !this.directClipboardReceives.has(event.transferId) &&
+        this.isTerminalDirectClipboardTransfer(event.transferId)
+      ) {
+        // A frame can already be crossing offscreen -> worker when the
+        // transport reaches a terminal state. Preserve the terminal result.
+        return;
+      }
       try {
         await this.handleDirectClipboardFrame(event);
       } catch (error) {
+        this.markTerminalDirectClipboardTransfer(event.transferId);
         this.directClipboardReceives.delete(event.transferId);
         await this.dependencies.directTransport
           ?.cancelTransfer(
@@ -1368,7 +1384,11 @@ export class CopyytServiceWorkerRuntime {
         directTransfers: [next, ...withoutTransfer].slice(0, 4),
       });
       if (event.state === "failed" || event.state === "cancelled") {
+        this.markTerminalDirectClipboardTransfer(event.transferId);
         this.directClipboardReceives.delete(event.transferId);
+      }
+      if (event.state === "succeeded") {
+        this.markTerminalDirectClipboardTransfer(event.transferId);
       }
       if (
         event.state === "failed" &&
@@ -1410,7 +1430,41 @@ export class CopyytServiceWorkerRuntime {
     }
   }
 
-  private async handleDirectClipboardFrame(event: Extract<DirectManagerEvent, { kind: "application-frame" }>): Promise<void> {
+  private async handleDirectClipboardFrame(
+    event: Extract<DirectManagerEvent, { kind: "application-frame" }>,
+  ): Promise<void> {
+    if (event.frame.type === "clipboard-secure-chunk") {
+      const pending = this.directClipboardReceives.get(event.transferId);
+      if (!pending) {
+        throw new RuntimeError(
+          "DIRECT_TRANSPORT_FAILED",
+          "The direct clipboard chunk has no manifest",
+        );
+      }
+      if (!this.isReceivePolicyCurrent(pending.receivePolicyRevision)) {
+        throw new RuntimeError(
+          "CLIPBOARD_WRITE_FAILED",
+          "Clipboard receiving is disabled for this device",
+        );
+      }
+      if (event.remoteDeviceId !== pending.sourceDeviceId) {
+        throw new RuntimeError(
+          "DIRECT_TRANSPORT_FAILED",
+          "The direct clipboard chunk source changed",
+        );
+      }
+      if (pending.encryptedChunks.length >= pending.manifest.chunkCount) {
+        throw new RuntimeError(
+          "DIRECT_TRANSPORT_FAILED",
+          "The direct clipboard transfer has an extra chunk",
+        );
+      }
+      pending.encryptedChunks.push(event.frame.data);
+      if (pending.encryptedChunks.length !== pending.manifest.chunkCount) return;
+      await this.finishDirectClipboardReceive(event, pending);
+      return;
+    }
+
     const session = this.requireSession();
     const transport = this.dependencies.directTransport;
     if (!transport?.sendClipboardVerified) {
@@ -1419,8 +1473,17 @@ export class CopyytServiceWorkerRuntime {
         "The direct clipboard transport is not available in this build",
       );
     }
-    if (!this.status.syncPreferences.receiveEnabled) {
-      throw new RuntimeError("CLIPBOARD_WRITE_FAILED", "Clipboard receiving is disabled for this device");
+    if (!this.isReceivePolicyCurrent(this.receivePolicyRevision)) {
+      throw new RuntimeError(
+        "CLIPBOARD_WRITE_FAILED",
+        "Clipboard receiving is disabled for this device",
+      );
+    }
+    if (this.directClipboardReceives.has(event.transferId)) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct clipboard manifest was repeated",
+      );
     }
     const identity = await this.identityLoader(session.user.id);
     if (!identity || identity.keyVersion === null) {
@@ -1432,6 +1495,7 @@ export class CopyytServiceWorkerRuntime {
     );
     if (
       !isLocallyVerified(localRecipient) ||
+      !identityMatchesLocalDevice(identity, localRecipient) ||
       !localRecipient.capabilities?.includes(CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY) ||
       !localRecipient.capabilities?.includes(CLIPBOARD_IMAGE_PNG_ASSISTED_WRITE_V1_CAPABILITY)
     ) {
@@ -1440,86 +1504,150 @@ export class CopyytServiceWorkerRuntime {
         "This device has not advertised direct assisted PNG receive",
       );
     }
-    if (event.frame.type === "clipboard-secure-start") {
-      if (this.directClipboardReceives.has(event.transferId)) {
-        throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard manifest was repeated");
-      }
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(event.frame.manifest) as unknown;
-      } catch {
-        throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard manifest is invalid");
-      }
-      if (!isDirectClipboardStartV1(parsed)) {
-        throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard manifest is invalid");
-      }
-      const manifest = parsed;
-      if (
-        manifest.transferId !== event.transferId ||
-        manifest.sourceDeviceId !== event.remoteDeviceId ||
-        manifest.userId !== session.user.id ||
-        manifest.recipientDeviceId !== identity.deviceId
-      ) {
-        throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard manifest peer binding is invalid");
-      }
-      const source = await this.requireActiveTrustedDirectSource(
-        session,
-        manifest.sourceDeviceId,
-        manifest.sourceKeyVersion,
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(event.frame.manifest) as unknown;
+    } catch {
+      throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard manifest is invalid");
+    }
+    if (!isDirectClipboardStartV1(parsed)) {
+      throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard manifest is invalid");
+    }
+    const manifest = parsed;
+    if (
+      manifest.transferId !== event.transferId ||
+      manifest.sourceDeviceId !== event.remoteDeviceId ||
+      manifest.userId !== session.user.id ||
+      manifest.recipientDeviceId !== identity.deviceId ||
+      manifest.recipientKeyVersion !== identity.keyVersion
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct clipboard manifest peer binding is invalid",
       );
-      const now = this.now().getTime();
-      const expiresAt = parseStrictExpiry(manifest.expiresAt);
-      if (expiresAt === null || now >= expiresAt || !isLiveExpiryWithinPolicy(expiresAt, now)) {
-        throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard transfer has expired");
-      }
-      if (
-        Math.ceil(manifest.plaintextByteLength / manifest.chunkPlaintextSize) !==
-        manifest.chunkCount
-      ) {
-        throw new RuntimeError(
-          "DIRECT_TRANSPORT_FAILED",
-          "The direct clipboard chunk count is invalid",
-        );
-      }
-      if (
-        !(await verifyDirectClipboardManifestSignature({
-          manifest,
-          sourceSignature: manifest.sourceSignature,
-          sourceSigningPublicKey: source.signingPublicKey,
-        }))
-      ) {
-        throw new RuntimeError(
-          "DIRECT_TRANSPORT_FAILED",
-          "The direct clipboard manifest signature is invalid",
-        );
-      }
-      if (source.capabilities && !source.capabilities.includes(CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY)) {
-        throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct source does not advertise clipboard direct transfer");
-      }
-      this.directClipboardReceives.set(event.transferId, {
+    }
+    const source = await this.requireActiveTrustedDirectSource(
+      session,
+      manifest.sourceDeviceId,
+      manifest.sourceKeyVersion,
+    );
+    const now = this.now().getTime();
+    const expiresAt = parseStrictExpiry(manifest.expiresAt);
+    if (expiresAt === null || now >= expiresAt || !isLiveExpiryWithinPolicy(expiresAt, now)) {
+      throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard transfer has expired");
+    }
+    if (
+      Math.ceil(manifest.plaintextByteLength / manifest.chunkPlaintextSize) !==
+      manifest.chunkCount
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct clipboard chunk count is invalid",
+      );
+    }
+    if (
+      !(await verifyDirectClipboardManifestSignature({
         manifest,
-        encryptedChunks: [],
-        sourceDeviceId: source.deviceId,
-      });
-      return;
+        sourceSignature: manifest.sourceSignature,
+        sourceSigningPublicKey: source.signingPublicKey,
+      }))
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct clipboard manifest signature is invalid",
+      );
     }
+    if (!source.capabilities?.includes(CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY)) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct source does not advertise clipboard direct transfer",
+      );
+    }
+    this.directClipboardReceives.set(event.transferId, {
+      manifest,
+      encryptedChunks: [],
+      sourceDeviceId: source.deviceId,
+      receivePolicyRevision: this.receivePolicyRevision,
+    });
+  }
 
-    const pending = this.directClipboardReceives.get(event.transferId);
-    if (!pending) throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard chunk has no manifest");
-    if (event.remoteDeviceId !== pending.sourceDeviceId) {
-      throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard chunk source changed");
+  private async finishDirectClipboardReceive(
+    event: Extract<DirectManagerEvent, { kind: "application-frame" }>,
+    pending: {
+      manifest: DirectClipboardStartV1;
+      encryptedChunks: string[];
+      sourceDeviceId: string;
+      receivePolicyRevision: number;
+    },
+  ): Promise<void> {
+    const session = this.requireSession();
+    const transport = this.dependencies.directTransport;
+    if (!transport?.sendClipboardVerified) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_UNAVAILABLE",
+        "The direct clipboard transport is not available in this build",
+      );
     }
-    pending.encryptedChunks.push(event.frame.data);
-    if (pending.encryptedChunks.length > pending.manifest.chunkCount) {
-      throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard transfer has an extra chunk");
+    if (!this.isReceivePolicyCurrent(pending.receivePolicyRevision)) {
+      throw new RuntimeError(
+        "CLIPBOARD_WRITE_FAILED",
+        "Clipboard receiving is disabled for this device",
+      );
     }
-    if (pending.encryptedChunks.length !== pending.manifest.chunkCount) return;
-
+    const identity = await this.identityLoader(session.user.id);
+    if (
+      !identity ||
+      identity.keyVersion === null ||
+      identity.deviceId !== pending.manifest.recipientDeviceId ||
+      identity.keyVersion !== pending.manifest.recipientKeyVersion
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct clipboard recipient identity changed",
+      );
+    }
+    const localRecipient = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      identity.deviceId,
+    );
+    if (
+      !isLocallyVerified(localRecipient) ||
+      !identityMatchesLocalDevice(identity, localRecipient) ||
+      !localRecipient.capabilities?.includes(CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY) ||
+      !localRecipient.capabilities?.includes(CLIPBOARD_IMAGE_PNG_ASSISTED_WRITE_V1_CAPABILITY)
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "This device is no longer trusted for direct assisted PNG receive",
+      );
+    }
     const source = await this.requireActiveTrustedDirectSource(
       session,
       pending.manifest.sourceDeviceId,
       pending.manifest.sourceKeyVersion,
     );
+    const expiresAt = parseStrictExpiry(pending.manifest.expiresAt);
+    if (expiresAt === null || this.now().getTime() >= expiresAt) {
+      throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard transfer has expired");
+    }
+    if (
+      !(await verifyDirectClipboardManifestSignature({
+        manifest: pending.manifest,
+        sourceSignature: pending.manifest.sourceSignature,
+        sourceSigningPublicKey: source.signingPublicKey,
+      }))
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct clipboard manifest signature is invalid",
+      );
+    }
+    if (!source.capabilities?.includes(CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY)) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct source no longer advertises clipboard direct transfer",
+      );
+    }
     const decrypted = await this.decryptDirect({
       userId: session.user.id,
       identity,
@@ -1528,11 +1656,13 @@ export class CopyytServiceWorkerRuntime {
       encryptedChunks: pending.encryptedChunks,
       now: this.now,
     });
-    if (!this.isReceivePolicyCurrent(this.receivePolicyRevision)) {
-      throw new RuntimeError("CLIPBOARD_WRITE_FAILED", "Clipboard receiving is disabled for this device");
+    if (!this.isReceivePolicyCurrent(pending.receivePolicyRevision)) {
+      throw new RuntimeError(
+        "CLIPBOARD_WRITE_FAILED",
+        "Clipboard receiving is disabled for this device",
+      );
     }
-    const expiresAt = parseStrictExpiry(pending.manifest.expiresAt);
-    if (expiresAt === null || this.now().getTime() >= expiresAt || !isLiveExpiryWithinPolicy(expiresAt, this.now().getTime())) {
+    if (this.now().getTime() >= expiresAt) {
       throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard transfer has expired");
     }
     const png = getPngRepresentation(decrypted.payload);
@@ -1568,12 +1698,57 @@ export class CopyytServiceWorkerRuntime {
       sourceDeviceId: pending.manifest.sourceDeviceId,
       disposition: "pending-image",
     });
+    this.markTerminalDirectClipboardTransfer(event.transferId);
     this.directClipboardReceives.delete(event.transferId);
     await transport.sendClipboardVerified({
       transferId: event.transferId,
       plaintextByteLength: pending.manifest.plaintextByteLength,
     });
     await this.refreshPendingAssistedImageStatus();
+  }
+
+  private pruneTerminalDirectClipboardTransfers(now = this.now().getTime()): void {
+    for (const [transferId, expiresAt] of this.terminalDirectClipboardTransfers) {
+      if (expiresAt <= now) {
+        this.terminalDirectClipboardTransfers.delete(transferId);
+        const timer = this.terminalDirectClipboardTransferTimers.get(transferId);
+        if (timer !== undefined) clearTimeout(timer);
+        this.terminalDirectClipboardTransferTimers.delete(transferId);
+      }
+    }
+  }
+
+  private isTerminalDirectClipboardTransfer(transferId: string): boolean {
+    const now = this.now().getTime();
+    this.pruneTerminalDirectClipboardTransfers(now);
+    const expiresAt = this.terminalDirectClipboardTransfers.get(transferId);
+    return expiresAt !== undefined && expiresAt > now;
+  }
+
+  private markTerminalDirectClipboardTransfer(transferId: string): void {
+    const now = this.now().getTime();
+    this.pruneTerminalDirectClipboardTransfers(now);
+    const manifestExpiry = this.directClipboardReceives.get(transferId)?.manifest.expiresAt;
+    const parsedManifestExpiry = manifestExpiry === undefined
+      ? null
+      : parseStrictExpiry(manifestExpiry);
+    const boundedExpiry = now + LIVE_CLIPBOARD_TTL_MS;
+    const drainExpiry = now + DIRECT_CLIPBOARD_TERMINAL_TOMBSTONE_TTL_MS;
+    const expiresAt = parsedManifestExpiry === null
+      ? drainExpiry
+      : Math.min(boundedExpiry, Math.max(drainExpiry, parsedManifestExpiry));
+    const previousTimer = this.terminalDirectClipboardTransferTimers.get(transferId);
+    if (previousTimer !== undefined) clearTimeout(previousTimer);
+    this.terminalDirectClipboardTransfers.set(transferId, expiresAt);
+    const timer = setTimeout(() => {
+      if (this.terminalDirectClipboardTransfers.get(transferId) !== expiresAt) return;
+      this.terminalDirectClipboardTransfers.delete(transferId);
+      this.terminalDirectClipboardTransferTimers.delete(transferId);
+    }, Math.max(0, expiresAt - now));
+    (
+      timer as unknown as { unref?: () => void }
+    ).unref?.();
+    this.terminalDirectClipboardTransferTimers.set(transferId, timer);
   }
 
   private async requireActiveTrustedDirectSource(

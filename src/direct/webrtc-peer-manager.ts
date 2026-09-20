@@ -116,6 +116,7 @@ interface TransferState {
   expectedByteLength?: number;
   expectedSha256?: string;
   expectedClipboardPlaintextByteLength?: number;
+  clipboardExpiresAtMs?: number;
   receivedChunks?: ArrayBuffer[];
   expectedChunkCount?: number;
   receivedChunkCount?: number;
@@ -261,6 +262,23 @@ function parseClipboardStartManifest(
     throw new DirectTransportError("The direct clipboard manifest is invalid");
   }
   return value;
+}
+
+function parseClipboardExpiry(
+  manifest: DirectClipboardStartV1,
+  now: number,
+): number {
+  const expiresAtMs = Date.parse(manifest.expiresAt);
+  if (
+    !Number.isFinite(expiresAtMs) ||
+    new Date(expiresAtMs).toISOString() !== manifest.expiresAt
+  ) {
+    throw new DirectTransportError("The direct clipboard expiry is invalid");
+  }
+  if (expiresAtMs <= now) {
+    throw new DirectTransportError("Direct clipboard transfer expired");
+  }
+  return expiresAtMs;
 }
 
 function isClipboardVerifiedControl(
@@ -424,10 +442,15 @@ export class WebRtcPeerManager {
       throw new DirectTransportError("The direct clipboard manifest is missing");
     }
     let manifest: DirectClipboardStartV1;
+    let clipboardExpiresAtMs: number;
     try {
       manifest = parseClipboardStartManifest(
         JSON.parse(input.manifest) as unknown,
         input.transferId,
+      );
+      clipboardExpiresAtMs = parseClipboardExpiry(
+        manifest,
+        this.dependencies.now().getTime(),
       );
     } catch (error) {
       if (error instanceof DirectTransportError) throw error;
@@ -448,6 +471,7 @@ export class WebRtcPeerManager {
       "initiator",
     );
     state.applicationMode = "clipboard";
+    state.clipboardExpiresAtMs = clipboardExpiresAtMs;
     state.expectedClipboardPlaintextByteLength = manifest.plaintextByteLength;
     state.clipboardPackage = {
       manifest: input.manifest,
@@ -858,10 +882,15 @@ export class WebRtcPeerManager {
     channel.onopen = () => {
       if (this.transfers.get(state.transferId) !== state) return;
       this.clearConnectionTimer(state);
-      state.transferTimer = setTimeout(
-        () => this.handleTransportFailure(state, "Direct transfer timed out"),
-        this.dependencies.transferTimeoutMs,
-      );
+      if (state.applicationMode === "clipboard") {
+        if (!this.armClipboardTransferTimer(state)) return;
+      } else {
+        this.armTransferTimer(
+          state,
+          this.dependencies.transferTimeoutMs,
+          "Direct transfer timed out",
+        );
+      }
       state.state = "open";
       void this.emitStatus(state, "open");
       if (state.role === "initiator") {
@@ -1100,9 +1129,15 @@ export class WebRtcPeerManager {
           throw new DirectTransportError("The direct clipboard start frame is invalid");
         }
         const manifest = parseClipboardStartManifest(parsed, state.transferId);
+        const expiresAtMs = parseClipboardExpiry(
+          manifest,
+          this.dependencies.now().getTime(),
+        );
         state.applicationMode = "clipboard";
+        state.clipboardExpiresAtMs = expiresAtMs;
         state.expectedClipboardPlaintextByteLength =
           manifest.plaintextByteLength;
+        if (!this.armClipboardTransferTimer(state)) return;
         state.receivedStart = true;
         state.state = "receiving";
         await this.emitApplicationFrame(state, {
@@ -1412,6 +1447,36 @@ export class WebRtcPeerManager {
       return;
     }
     this.fail(state, reason);
+  }
+
+  private armTransferTimer(
+    state: TransferState,
+    delayMs: number,
+    reason: string,
+  ): void {
+    if (state.transferTimer !== undefined) clearTimeout(state.transferTimer);
+    state.transferTimer = setTimeout(
+      () => this.handleTransportFailure(state, reason),
+      Math.max(0, delayMs),
+    );
+  }
+
+  private armClipboardTransferTimer(state: TransferState): boolean {
+    const expiresAtMs = state.clipboardExpiresAtMs;
+    if (expiresAtMs === undefined) {
+      this.handleTransportFailure(
+        state,
+        "The direct clipboard expiry is missing",
+      );
+      return false;
+    }
+    const remainingMs = expiresAtMs - this.dependencies.now().getTime();
+    if (remainingMs <= 0) {
+      this.handleTransportFailure(state, "Direct clipboard transfer expired");
+      return false;
+    }
+    this.armTransferTimer(state, remainingMs, "Direct clipboard transfer expired");
+    return true;
   }
 
   private startCleanupTimer(state: TransferState): void {
