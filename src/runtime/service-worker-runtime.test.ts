@@ -694,12 +694,7 @@ test("registration advertises assisted PNG receive capability", async () => {
       return { identity, device: registeredDevice };
     },
   });
-  assert.deepEqual(registrations, [[
-    "clipboard",
-    "clipboard-bundle-v1",
-    "clipboard-html-v1",
-    "clipboard-image-png-assisted-write-v1",
-  ]]);
+  assert.deepEqual(registrations, [[...CLIPBOARD_RECEIVE_CAPABILITIES]]);
   assert.equal(setup.runtime.getStatus().device.deviceId, identity.deviceId);
   assert.equal(setup.runtime.getStatus().syncReady, true);
 });

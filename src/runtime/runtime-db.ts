@@ -1,4 +1,5 @@
 import type { ClipboardItemEnvelope } from "../crypto/crypto-core.ts";
+import type { DirectClipboardStartV1 } from "../crypto/direct-clipboard.ts";
 
 export const RUNTIME_DATABASE_NAME = "copyyt-runtime-v1";
 export const RUNTIME_DATABASE_VERSION = 2;
@@ -36,7 +37,7 @@ export interface OutboundItemRecord {
   sourceDeviceId: string;
 }
 
-export interface PendingAssistedImageRecord {
+interface PendingAssistedImageRecordBase {
   key: string;
   userId: string;
   itemId: string;
@@ -45,9 +46,39 @@ export interface PendingAssistedImageRecord {
   receivedAt: string;
   expiresAt: string;
   hasPng: true;
-  /** Encrypted envelope only; never decrypted PNG or bundle bytes. */
-  envelope: ClipboardItemEnvelope;
 }
+
+export type PendingAssistedImageRecord = PendingAssistedImageRecordBase &
+  (
+    | {
+        /** Exactly one encrypted relay package; never decrypted PNG or bundle bytes. */
+        envelope: ClipboardItemEnvelope;
+        directPackage?: never;
+      }
+    | {
+        /** Exactly one encrypted direct package; never decrypted PNG or bundle bytes. */
+        envelope?: never;
+        directPackage: {
+          manifest: DirectClipboardStartV1;
+          encryptedChunks: string[];
+        };
+      }
+  );
+
+export type PendingAssistedImageRecordInput = Omit<PendingAssistedImageRecordBase, "key"> &
+  (
+    | {
+        envelope: ClipboardItemEnvelope;
+        directPackage?: never;
+      }
+    | {
+        envelope?: never;
+        directPackage: {
+          manifest: DirectClipboardStartV1;
+          encryptedChunks: string[];
+        };
+      }
+  );
 
 export interface AssistedPngSuppressionRecord {
   key: string;
@@ -205,7 +236,7 @@ export interface OutboundItemStore {
 export interface PendingAssistedImageStore {
   list(userId: string): Promise<PendingAssistedImageRecord[]>;
   get(userId: string, itemId: string): Promise<PendingAssistedImageRecord | null>;
-  put(record: Omit<PendingAssistedImageRecord, "key">): Promise<void>;
+  put(record: PendingAssistedImageRecordInput): Promise<void>;
   remove(userId: string, itemId: string): Promise<void>;
   clearUser(userId: string): Promise<void>;
 }
@@ -297,7 +328,7 @@ export class InMemoryPendingAssistedImageStore implements PendingAssistedImageSt
     return structuredClone(record);
   }
 
-  async put(record: Omit<PendingAssistedImageRecord, "key">): Promise<void> {
+  async put(record: PendingAssistedImageRecordInput): Promise<void> {
     this.records.set(pendingKey(record.userId, record.itemId), {
       ...structuredClone(record),
       key: pendingKey(record.userId, record.itemId),
@@ -382,7 +413,7 @@ export class IndexedDBPendingAssistedImageStore implements PendingAssistedImageS
     return record;
   }
 
-  async put(record: Omit<PendingAssistedImageRecord, "key">): Promise<void> {
+  async put(record: PendingAssistedImageRecordInput): Promise<void> {
     await withTransaction<void>(PENDING_ASSISTED_IMAGE_STORE, "readwrite", (store, finish) => {
       store.put({ ...structuredClone(record), key: pendingKey(record.userId, record.itemId) });
       finish(undefined);

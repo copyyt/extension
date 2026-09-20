@@ -247,6 +247,31 @@ chrome.runtime.onMessage.addListener(
         }
       }
 
+      if (request.type === "DIRECT_START_CLIPBOARD") {
+        try {
+          await directPeerManager.startClipboardTransfer({
+            transferId: request.transferId!,
+            remoteDeviceId: request.remoteDeviceId!,
+            manifest: request.manifest!,
+            encryptedChunks: request.encryptedChunks!,
+          });
+          return response(request, "DIRECT_START_CLIPBOARD_RESULT", {
+            accepted: true,
+            transferId: request.transferId,
+          });
+        } catch (error) {
+          return response(request, "ERROR", {
+            error: {
+              code: "DIRECT_TRANSPORT_FAILED",
+              message:
+                error instanceof DirectTransportError || error instanceof Error
+                  ? error.message
+                  : "The direct clipboard transport could not start",
+            },
+          });
+        }
+      }
+
       if (request.type === "DIRECT_HANDLE_SIGNAL") {
         try {
           await directPeerManager.handleSignal(request.signal!);
@@ -262,6 +287,29 @@ chrome.runtime.onMessage.addListener(
                 error instanceof Error
                   ? error.message
                   : "The direct signal could not be applied",
+            },
+          });
+        }
+      }
+
+      if (request.type === "DIRECT_SEND_CLIPBOARD_VERIFIED") {
+        try {
+          await directPeerManager.sendClipboardVerified({
+            transferId: request.transferId!,
+            plaintextByteLength: request.plaintextByteLength!,
+          });
+          return response(request, "DIRECT_SEND_CLIPBOARD_VERIFIED_RESULT", {
+            accepted: true,
+            transferId: request.transferId,
+          });
+        } catch (error) {
+          return response(request, "ERROR", {
+            error: {
+              code: "DIRECT_TRANSPORT_FAILED",
+              message:
+                error instanceof Error
+                  ? error.message
+                  : "The direct clipboard verification could not be sent",
             },
           });
         }

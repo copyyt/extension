@@ -8,7 +8,7 @@ export const CLIPBOARD_HTML_V1_CAPABILITY = "clipboard-html-v1";
  */
 export const CLIPBOARD_IMAGE_PNG_ASSISTED_WRITE_V1_CAPABILITY =
   "clipboard-image-png-assisted-write-v1";
-/** Defined for the experimental transport only; intentionally not advertised yet. */
+/** Direct transport capability for the bounded application-level clipboard protocol. */
 export const CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY =
   "clipboard-direct-webrtc-v1";
 
@@ -18,6 +18,7 @@ export const CLIPBOARD_RECEIVE_CAPABILITIES = [
   CLIPBOARD_BUNDLE_V1_CAPABILITY,
   CLIPBOARD_HTML_V1_CAPABILITY,
   CLIPBOARD_IMAGE_PNG_ASSISTED_WRITE_V1_CAPABILITY,
+  CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY,
 ] as const;
 
 /** Return a safe copy for server metadata that may be malformed at runtime. */

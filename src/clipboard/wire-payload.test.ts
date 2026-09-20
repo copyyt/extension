@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   CLIPBOARD_BUNDLE_V1_CAPABILITY,
+  CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY,
   CLIPBOARD_HTML_V1_CAPABILITY,
   CLIPBOARD_IMAGE_PNG_ASSISTED_WRITE_V1_CAPABILITY,
 } from "./capabilities.ts";
@@ -15,6 +16,7 @@ import {
 import {
   selectClipboardWirePayload,
   selectClipboardWirePayloads,
+  selectClipboardDeliveryRoutes,
   ClipboardWirePayloadTooLargeError,
   type ClipboardWireRecipient,
 } from "./wire-payload.ts";
@@ -214,4 +216,42 @@ test("PNG projection measures serialized bundle size and never truncates", () =>
       }),
     ClipboardWirePayloadTooLargeError,
   );
+});
+
+test("oversized PNG routing is recipient-specific and never creates an oversized relay projection", () => {
+  const bytes = new Uint8Array(800_000);
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const png = clipboardPayloadFromPngBytes(bytes);
+  const payload: ClipboardPayloadV1 = {
+    version: 1,
+    representations: [
+      { mime: "text/plain", encoding: "utf-8", data: "fallback" },
+      { mime: "text/html", encoding: "utf-8", data: "<b>fallback</b>" },
+      ...png.representations,
+    ],
+  };
+  const directCapabilities = [
+    ...pngCapabilities,
+    CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY,
+  ];
+  const routes = selectClipboardDeliveryRoutes({
+    payload,
+    recipients: [
+      recipient(directCapabilities, directCapabilities),
+      recipient(pngCapabilities, pngCapabilities),
+      recipient(["clipboard"], ["clipboard"]),
+    ],
+  });
+  assert.equal(routes.direct.length, 1);
+  assert.equal(routes.direct[0]!.payload.representations.some((value) => value.mime === "image/png"), true);
+  assert.equal(routes.relay.length, 2);
+  for (const relay of routes.relay) {
+    if (relay.wirePayload.format === "bundle-v1") {
+      assert.equal(
+        relay.wirePayload.plaintext.byteLength <= MAX_CLIPBOARD_PLAINTEXT_BYTES,
+        true,
+      );
+      assert.equal(relay.payload.representations.some((value) => value.mime === "image/png"), false);
+    }
+  }
 });

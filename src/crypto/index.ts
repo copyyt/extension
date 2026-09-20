@@ -10,12 +10,25 @@ export {
   verifyClipboardEnvelopeSignature,
   verifyDeviceApproval,
   wrapContentKeyForRecipient,
+  signDirectClipboardManifest,
+  unwrapDirectClipboardKeyForRecipient,
+  verifyDirectClipboardManifestSignature,
+  wrapDirectClipboardKeyForRecipient,
   type ClipboardItemEnvelope,
   CryptoProtocolError,
   type DeviceApprovalCertificate,
   type EncryptClipboardItemInput,
   type VerifiedRecipient,
 } from "./crypto-core.ts";
+export {
+  decodeDirectClipboardChunkFrame,
+  directClipboardChunkNonce,
+  decryptDirectClipboardTransfer,
+  isDirectClipboardStartV1,
+  prepareDirectClipboardTransfer,
+  type DirectClipboardStartV1,
+  type PreparedDirectClipboardTransfer,
+} from "./direct-clipboard.ts";
 export {
   getDeviceIdentity,
   getOrCreateDeviceIdentity,
@@ -43,11 +56,15 @@ export type {
 } from "./device-registration.ts";
 export {
   buildClipboardEnvelopeSignatureMessage,
+  buildDirectClipboardChunkAad,
+  buildDirectClipboardManifestMessage,
+  buildDirectClipboardWrapContext,
   buildDeviceApprovalMessage,
   buildKeyWrapContext,
   buildPairingFingerprintContext,
   buildPayloadAad,
   buildSocketAuthMessage,
+  canonicalIsoExpiry,
 } from "./protocol.ts";
 export {
   base64ToBytes,

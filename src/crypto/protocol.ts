@@ -15,6 +15,12 @@ export const KEY_WRAP_HKDF_SALT = "copyyt-key-wrap-hkdf-salt-v1";
 export const PAYLOAD_AAD_VERSION = "copyyt-payload-v1";
 export const PAIRING_FINGERPRINT_CONTEXT_VERSION =
   "copyyt-pairing-fingerprint-v1";
+export const DIRECT_CLIPBOARD_WRAP_CONTEXT_VERSION =
+  "copyyt-direct-clipboard-wrap-v1";
+export const DIRECT_CLIPBOARD_MANIFEST_SIGNATURE_VERSION =
+  "copyyt-direct-clipboard-manifest-v1";
+export const DIRECT_CLIPBOARD_CHUNK_AAD_VERSION =
+  "copyyt-direct-clipboard-chunk-v1";
 
 function canonicalLines(lines: string[]): Uint8Array {
   return utf8Encode(`${lines.join("\n")}\n`);
@@ -26,6 +32,109 @@ function canonicalExpiry(value: Date | string): string {
     throw new TypeError("expiresAt must be a valid date");
   }
   return date.toISOString();
+}
+
+export function canonicalIsoExpiry(value: Date | string): string {
+  return canonicalExpiry(value);
+}
+
+export interface DirectClipboardManifestMessageInput {
+  protocol: string;
+  userId: string;
+  transferId: string;
+  sourceDeviceId: string;
+  sourceKeyVersion: number;
+  recipientDeviceId: string;
+  recipientKeyVersion: number;
+  contentType: string;
+  expiresAt: Date | string;
+  plaintextByteLength: number;
+  chunkPlaintextSize: number;
+  chunkCount: number;
+  noncePrefix: Uint8Array | string;
+  wrapNonce: Uint8Array | string;
+  wrappedKey: Uint8Array | string;
+}
+
+function canonicalBytes(value: Uint8Array | string): Uint8Array {
+  return typeof value === "string" ? base64ToBytes(value) : new Uint8Array(value);
+}
+
+export function buildDirectClipboardManifestMessage(
+  input: DirectClipboardManifestMessageInput,
+): Uint8Array {
+  return canonicalLines([
+    DIRECT_CLIPBOARD_MANIFEST_SIGNATURE_VERSION,
+    `protocol=${input.protocol}`,
+    `userId=${input.userId}`,
+    `transferId=${input.transferId}`,
+    `sourceDeviceId=${input.sourceDeviceId}`,
+    `sourceKeyVersion=${input.sourceKeyVersion}`,
+    `recipientDeviceId=${input.recipientDeviceId}`,
+    `recipientKeyVersion=${input.recipientKeyVersion}`,
+    `contentType=${input.contentType}`,
+    `expiresAt=${canonicalExpiry(input.expiresAt)}`,
+    `plaintextByteLength=${input.plaintextByteLength}`,
+    `chunkPlaintextSize=${input.chunkPlaintextSize}`,
+    `chunkCount=${input.chunkCount}`,
+    `noncePrefix=${bytesToBase64(canonicalBytes(input.noncePrefix))}`,
+    `wrapNonce=${bytesToBase64(canonicalBytes(input.wrapNonce))}`,
+    `wrappedKey=${bytesToBase64(canonicalBytes(input.wrappedKey))}`,
+  ]);
+}
+
+export interface DirectClipboardChunkAadInput
+  extends Omit<
+    DirectClipboardManifestMessageInput,
+    "noncePrefix" | "wrapNonce" | "wrappedKey"
+  > {
+  chunkIndex: number;
+  expectedPlaintextLength: number;
+}
+
+export function buildDirectClipboardChunkAad(
+  input: DirectClipboardChunkAadInput,
+): Uint8Array {
+  return canonicalLines([
+    DIRECT_CLIPBOARD_CHUNK_AAD_VERSION,
+    `protocol=${input.protocol}`,
+    `userId=${input.userId}`,
+    `transferId=${input.transferId}`,
+    `sourceDeviceId=${input.sourceDeviceId}`,
+    `sourceKeyVersion=${input.sourceKeyVersion}`,
+    `recipientDeviceId=${input.recipientDeviceId}`,
+    `recipientKeyVersion=${input.recipientKeyVersion}`,
+    `contentType=${input.contentType}`,
+    `expiresAt=${canonicalExpiry(input.expiresAt)}`,
+    `plaintextByteLength=${input.plaintextByteLength}`,
+    `chunkPlaintextSize=${input.chunkPlaintextSize}`,
+    `chunkCount=${input.chunkCount}`,
+    `chunkIndex=${input.chunkIndex}`,
+    `expectedPlaintextLength=${input.expectedPlaintextLength}`,
+  ]);
+}
+
+export interface DirectClipboardWrapContextInput {
+  userId: string;
+  transferId: string;
+  sourceDeviceId: string;
+  sourceKeyVersion: number;
+  recipientDeviceId: string;
+  recipientKeyVersion: number;
+}
+
+export function buildDirectClipboardWrapContext(
+  input: DirectClipboardWrapContextInput,
+): Uint8Array {
+  return canonicalLines([
+    DIRECT_CLIPBOARD_WRAP_CONTEXT_VERSION,
+    `userId=${input.userId}`,
+    `transferId=${input.transferId}`,
+    `sourceDeviceId=${input.sourceDeviceId}`,
+    `sourceKeyVersion=${input.sourceKeyVersion}`,
+    `recipientDeviceId=${input.recipientDeviceId}`,
+    `recipientKeyVersion=${input.recipientKeyVersion}`,
+  ]);
 }
 
 export interface DeviceApprovalMessageInput {

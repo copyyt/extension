@@ -11,6 +11,8 @@ import {
 import {
   buildClipboardEnvelopeSignatureMessage,
   buildDeviceApprovalMessage,
+  buildDirectClipboardManifestMessage,
+  buildDirectClipboardWrapContext,
   buildKeyWrapContext,
   buildPairingFingerprintContext,
   buildPayloadAad,
@@ -332,6 +334,141 @@ export async function unwrapContentKeyForRecipient(input: {
     return contentKey;
   } catch {
     throw new CryptoProtocolError("Content-key unwrap failed");
+  }
+}
+
+/** The direct clipboard protocol uses the same X25519/HKDF/AES-GCM primitive
+ * as relay envelopes, with a separately domain-separated context. */
+export async function wrapDirectClipboardKeyForRecipient(input: {
+  userId: string;
+  transferId: string;
+  sourceDeviceId: string;
+  sourceKeyVersion: number;
+  senderIdentity: DeviceIdentity;
+  recipient: VerifiedRecipient;
+  contentKey: Uint8Array;
+  wrapNonce: Uint8Array;
+}): Promise<{ wrapNonce: string; wrappedKey: string }> {
+  if (input.senderIdentity.userId !== input.userId || input.recipient.userId !== input.userId) {
+    throw new CryptoProtocolError("The direct clipboard identity belongs to another account");
+  }
+  assertLength(input.contentKey, KEY_LENGTH_BYTES, "Direct clipboard CEK");
+  assertLength(input.wrapNonce, NONCE_LENGTH_BYTES, "Direct clipboard wrap nonce");
+  assertPositiveInteger(input.sourceKeyVersion, "sourceKeyVersion");
+  const recipientKeyVersionValue = recipientKeyVersion(input.recipient);
+  assertPositiveInteger(recipientKeyVersionValue, "recipientKeyVersion");
+  if (input.recipient.trustState !== "root" && input.recipient.trustState !== "verified") {
+    throw new CryptoProtocolError("Only locally verified devices may receive direct clipboard keys");
+  }
+  const context = buildDirectClipboardWrapContext({
+    userId: input.userId,
+    transferId: input.transferId,
+    sourceDeviceId: input.sourceDeviceId,
+    sourceKeyVersion: input.sourceKeyVersion,
+    recipientDeviceId: input.recipient.deviceId,
+    recipientKeyVersion: recipientKeyVersionValue,
+  });
+  const wrappingKey = await deriveWrappingKey(
+    getPrivateKeyHandles(input.senderIdentity).encryptionPrivateKey,
+    publicKeyBytes(input.recipient.encryptionPublicKey),
+    context,
+  );
+  const wrapped = new Uint8Array(
+    await globalThis.crypto.subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv: asBufferSource(input.wrapNonce),
+        additionalData: asBufferSource(context),
+        tagLength: AES_GCM_TAG_LENGTH,
+      },
+      wrappingKey,
+      asBufferSource(input.contentKey),
+    ),
+  );
+  assertLength(wrapped, 48, "Wrapped direct clipboard CEK");
+  return {
+    wrapNonce: bytesToBase64(input.wrapNonce),
+    wrappedKey: bytesToBase64(wrapped),
+  };
+}
+
+export async function unwrapDirectClipboardKeyForRecipient(input: {
+  userId: string;
+  transferId: string;
+  sourceDeviceId: string;
+  sourceKeyVersion: number;
+  recipientIdentity: DeviceIdentity;
+  recipientDeviceId: string;
+  recipientKeyVersion: number;
+  sourceEncryptionPublicKey: Uint8Array | string;
+  wrapNonce: string;
+  wrappedKey: string;
+}): Promise<Uint8Array> {
+  assertPositiveInteger(input.sourceKeyVersion, "sourceKeyVersion");
+  assertPositiveInteger(input.recipientKeyVersion, "recipientKeyVersion");
+  const wrapNonce = base64ToBytes(input.wrapNonce);
+  const wrappedKey = base64ToBytes(input.wrappedKey);
+  assertLength(wrapNonce, NONCE_LENGTH_BYTES, "Direct clipboard wrap nonce");
+  assertLength(wrappedKey, 48, "Wrapped direct clipboard CEK");
+  const context = buildDirectClipboardWrapContext({
+    userId: input.userId,
+    transferId: input.transferId,
+    sourceDeviceId: input.sourceDeviceId,
+    sourceKeyVersion: input.sourceKeyVersion,
+    recipientDeviceId: input.recipientDeviceId,
+    recipientKeyVersion: input.recipientKeyVersion,
+  });
+  const wrappingKey = await deriveWrappingKey(
+    getPrivateKeyHandles(input.recipientIdentity).encryptionPrivateKey,
+    publicKeyBytes(input.sourceEncryptionPublicKey),
+    context,
+  );
+  try {
+    const contentKey = new Uint8Array(
+      await globalThis.crypto.subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv: asBufferSource(wrapNonce),
+          additionalData: asBufferSource(context),
+          tagLength: AES_GCM_TAG_LENGTH,
+        },
+        wrappingKey,
+        asBufferSource(wrappedKey),
+      ),
+    );
+    assertLength(contentKey, KEY_LENGTH_BYTES, "Unwrapped direct clipboard CEK");
+    return contentKey;
+  } catch {
+    throw new CryptoProtocolError("Direct clipboard CEK unwrap failed");
+  }
+}
+
+export async function signDirectClipboardManifest(input: {
+  identity: DeviceIdentity;
+  manifest: Parameters<typeof buildDirectClipboardManifestMessage>[0];
+}): Promise<string> {
+  return bytesToBase64(
+    await signWithIdentity(
+      input.identity,
+      buildDirectClipboardManifestMessage(input.manifest),
+    ),
+  );
+}
+
+export async function verifyDirectClipboardManifestSignature(input: {
+  manifest: Parameters<typeof buildDirectClipboardManifestMessage>[0];
+  sourceSignature: string;
+  sourceSigningPublicKey: Uint8Array | string;
+}): Promise<boolean> {
+  if (!isCanonicalBase64Bytes(input.sourceSignature, 64)) return false;
+  try {
+    return verifyWithPublicKey(
+      publicKeyBytes(input.sourceSigningPublicKey),
+      buildDirectClipboardManifestMessage(input.manifest),
+      base64ToBytes(input.sourceSignature),
+    );
+  } catch {
+    return false;
   }
 }
 

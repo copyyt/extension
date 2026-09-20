@@ -9,6 +9,8 @@ import {
   DIRECT_MAX_ICE_CANDIDATES,
   DIRECT_MAX_TEST_PAYLOAD_BYTES,
   DIRECT_TEST_PAYLOAD_BYTES,
+  DIRECT_CLIPBOARD_PROTOCOL,
+  DIRECT_APPLICATION_MAX_FRAME_BYTES,
   DIRECT_TRANSFER_TIMEOUT_MS,
   deterministicTestBytes,
   isDirectIceCandidate,
@@ -19,6 +21,7 @@ import {
   type DirectSignalDelivery,
   type DirectTransferState,
 } from "./protocol.ts";
+import { base64ToBytes, bytesToBase64 } from "../crypto/bytes.ts";
 
 interface DataChannelLike {
   label: string;
@@ -75,6 +78,13 @@ export interface DirectPeerManagerDependencies {
   cleanupTimeoutMs?: number;
 }
 
+export interface DirectClipboardTransferInput {
+  transferId: string;
+  remoteDeviceId: string;
+  manifest: string;
+  encryptedChunks: readonly string[];
+}
+
 export class DirectTransportError extends Error {
   constructor(message: string) {
     super(message);
@@ -107,6 +117,12 @@ interface TransferState {
   receivedByteLength?: number;
   receivedStart?: boolean;
   receivedEnd?: boolean;
+  applicationMode?: "test" | "clipboard";
+  clipboardPackage?: {
+    manifest: string;
+    encryptedChunks: readonly string[];
+  };
+  applicationFrameChain?: Promise<void>;
 }
 
 type CompletionPhase =
@@ -147,6 +163,19 @@ interface ControlVerified {
 
 interface ControlVerifiedAck {
   type: "verified-ack";
+  transferId: string;
+}
+
+interface ClipboardVerifiedControl {
+  type: "clipboard-secure-verified";
+  protocol: typeof DIRECT_CLIPBOARD_PROTOCOL;
+  transferId: string;
+  plaintextByteLength: number;
+}
+
+interface ClipboardVerifiedAckControl {
+  type: "clipboard-secure-verified-ack";
+  protocol: typeof DIRECT_CLIPBOARD_PROTOCOL;
   transferId: string;
 }
 
@@ -203,6 +232,45 @@ function isVerifiedAckControl(value: unknown): value is ControlVerifiedAck {
     Object.keys(value).length === 2 &&
     candidate.type === "verified-ack" &&
     typeof candidate.transferId === "string"
+  );
+}
+
+function isClipboardStartControl(value: unknown): value is {
+  type: "clipboard-secure-start";
+  protocol: typeof DIRECT_CLIPBOARD_PROTOCOL;
+  transferId: string;
+} {
+  return (
+    isControlObject(value) &&
+    value.type === "clipboard-secure-start" &&
+    value.protocol === DIRECT_CLIPBOARD_PROTOCOL &&
+    typeof value.transferId === "string"
+  );
+}
+
+function isClipboardVerifiedControl(
+  value: unknown,
+): value is ClipboardVerifiedControl {
+  return (
+    isControlObject(value) &&
+    Object.keys(value).length === 4 &&
+    value.type === "clipboard-secure-verified" &&
+    value.protocol === DIRECT_CLIPBOARD_PROTOCOL &&
+    typeof value.transferId === "string" &&
+    Number.isSafeInteger(value.plaintextByteLength) &&
+    (value.plaintextByteLength as number) > 0
+  );
+}
+
+function isClipboardVerifiedAckControl(
+  value: unknown,
+): value is ClipboardVerifiedAckControl {
+  return (
+    isControlObject(value) &&
+    Object.keys(value).length === 3 &&
+    value.type === "clipboard-secure-verified-ack" &&
+    value.protocol === DIRECT_CLIPBOARD_PROTOCOL &&
+    typeof value.transferId === "string"
   );
 }
 
@@ -322,6 +390,99 @@ export class WebRtcPeerManager {
       );
       throw new DirectTransportError("Unable to create the direct offer");
     }
+  }
+
+  async startClipboardTransfer(
+    input: DirectClipboardTransferInput,
+  ): Promise<void> {
+    if (
+      this.occupiedTransferSlots() >= this.dependencies.maxConcurrentTransfers
+    ) {
+      throw new DirectTransportError(
+        "The maximum number of direct transfers is already active",
+      );
+    }
+    if (this.transfers.has(input.transferId)) {
+      throw new DirectTransportError("The direct transfer is already active");
+    }
+    if (typeof input.manifest !== "string" || input.manifest.length === 0) {
+      throw new DirectTransportError("The direct clipboard manifest is missing");
+    }
+    for (const chunk of input.encryptedChunks) {
+      try {
+        if (base64ToBytes(chunk).byteLength > DIRECT_APPLICATION_MAX_FRAME_BYTES) {
+          throw new Error("oversized");
+        }
+      } catch {
+        throw new DirectTransportError("The direct clipboard chunk is invalid");
+      }
+    }
+    const state = this.createTransfer(
+      input.transferId,
+      input.remoteDeviceId,
+      "initiator",
+    );
+    state.applicationMode = "clipboard";
+    state.clipboardPackage = {
+      manifest: input.manifest,
+      encryptedChunks: [...input.encryptedChunks],
+    };
+    try {
+      const dataChannel = state.peerConnection.createDataChannel(
+        DIRECT_DATA_CHANNEL_LABEL,
+        { ordered: true },
+      );
+      this.attachDataChannel(state, dataChannel);
+      const offer = await state.peerConnection.createOffer();
+      await state.peerConnection.setLocalDescription(offer);
+      await this.emitSignal(state, {
+        kind: "offer",
+        sdp: offer.sdp ?? "",
+      });
+    } catch (error) {
+      this.handleTransportFailure(
+        state,
+        error instanceof Error ? error.message : "Offer failed",
+      );
+      throw new DirectTransportError("Unable to create the direct offer");
+    }
+  }
+
+  async sendClipboardVerified(input: {
+    transferId: string;
+    plaintextByteLength: number;
+  }): Promise<void> {
+    const state = this.transfers.get(input.transferId);
+    if (
+      !state ||
+      state.role !== "responder" ||
+      state.applicationMode !== "clipboard" ||
+      state.completionPhase !== "transferring" ||
+      !state.dataChannel ||
+      state.dataChannel.readyState !== "open"
+    ) {
+      throw new DirectTransportError(
+        "The direct clipboard transfer is not ready for verification",
+      );
+    }
+    if (!Number.isSafeInteger(input.plaintextByteLength) || input.plaintextByteLength <= 0) {
+      throw new DirectTransportError("The direct clipboard byte length is invalid");
+    }
+    const control: ClipboardVerifiedControl = {
+      type: "clipboard-secure-verified",
+      protocol: DIRECT_CLIPBOARD_PROTOCOL,
+      transferId: input.transferId,
+      plaintextByteLength: input.plaintextByteLength,
+    };
+    state.dataChannel.send(JSON.stringify(control));
+    this.markApplicationSucceeded(state);
+    state.completionPhase = "awaiting-verified-ack";
+    state.state = "verified";
+    await this.emitApplicationSucceeded(state, {
+      bytesReceived: input.plaintextByteLength,
+      byteLength: input.plaintextByteLength,
+    });
+    this.startCleanupTimer(state);
   }
 
   async handleSignal(signal: DirectSignalDelivery): Promise<void> {
@@ -661,15 +822,23 @@ export class WebRtcPeerManager {
       );
       state.state = "open";
       void this.emitStatus(state, "open");
-      if (state.role === "initiator") void this.sendTestPayload(state);
+      if (state.role === "initiator") {
+        if (state.applicationMode === "clipboard") {
+          void this.sendClipboardPayload(state);
+        } else {
+          void this.sendTestPayload(state);
+        }
+      }
     };
     channel.onmessage = (event) => {
-      void this.handleDataMessage(state, event.data).catch((error: unknown) => {
-        this.handleTransportFailure(
-          state,
-          error instanceof Error ? error.message : "Data channel failed",
-        );
-      });
+      state.applicationFrameChain = (state.applicationFrameChain ?? Promise.resolve())
+        .then(() => this.handleDataMessage(state, event.data))
+        .catch((error: unknown) => {
+          this.handleTransportFailure(
+            state,
+            error instanceof Error ? error.message : "Data channel failed",
+          );
+        });
     };
     channel.onerror = () =>
       this.handleTransportFailure(state, "Data channel error");
@@ -735,6 +904,52 @@ export class WebRtcPeerManager {
     }
   }
 
+  private async sendClipboardPayload(state: TransferState): Promise<void> {
+    const packageToSend = state.clipboardPackage;
+    if (
+      !state.dataChannel ||
+      state.dataChannel.readyState !== "open" ||
+      !packageToSend
+    ) {
+      return;
+    }
+    try {
+      state.dataChannel.send(packageToSend.manifest);
+      state.state = "sending";
+      const totalBytes = packageToSend.encryptedChunks.reduce((total, chunk) => {
+        try {
+          return total + base64ToBytes(chunk).byteLength;
+        } catch {
+          throw new DirectTransportError("The direct clipboard chunk is invalid");
+        }
+      }, 0);
+      let sentBytes = 0;
+      await this.emitStatus(state, "sending", { byteLength: totalBytes });
+      for (const encodedChunk of packageToSend.encryptedChunks) {
+        await this.waitForBufferLow(state.dataChannel);
+        if (state.dataChannel.readyState !== "open") {
+          throw new DirectTransportError("Data channel closed during sending");
+        }
+        const bytes = base64ToBytes(encodedChunk);
+        if (bytes.byteLength > DIRECT_APPLICATION_MAX_FRAME_BYTES) {
+          throw new DirectTransportError("The direct clipboard chunk is too large");
+        }
+        state.dataChannel.send(bytes.buffer);
+        sentBytes += bytes.byteLength;
+        await this.emitStatus(state, "sending", {
+          bytesSent: sentBytes,
+          byteLength: totalBytes,
+        });
+      }
+      state.completionPhase = "awaiting-verified";
+    } catch (error) {
+      this.handleTransportFailure(
+        state,
+        error instanceof Error ? error.message : "Direct clipboard send failed",
+      );
+    }
+  }
+
   private async waitForBufferLow(channel: DataChannelLike): Promise<void> {
     if (channel.bufferedAmount <= DIRECT_BUFFER_HIGH_WATER) return;
     await new Promise<void>((resolve, reject) => {
@@ -778,6 +993,76 @@ export class WebRtcPeerManager {
         parsed = JSON.parse(raw) as unknown;
       } catch {
         throw new DirectTransportError("The direct control frame is invalid");
+      }
+      if (isClipboardVerifiedControl(parsed)) {
+        if (
+          state.role !== "initiator" ||
+          state.applicationMode !== "clipboard" ||
+          state.completionPhase !== "awaiting-verified" ||
+          parsed.transferId !== state.transferId
+        ) {
+          throw new DirectTransportError(
+            "The direct clipboard verification acknowledgement is invalid",
+          );
+        }
+        this.markApplicationSucceeded(state);
+        state.state = "verified";
+        const verifiedStatus = this.emitStatus(state, "verified", {
+          bytesReceived: parsed.plaintextByteLength,
+          byteLength: parsed.plaintextByteLength,
+        });
+        await this.emitApplicationSucceeded(state, {
+          bytesReceived: parsed.plaintextByteLength,
+          byteLength: parsed.plaintextByteLength,
+        });
+        await verifiedStatus;
+        if (!state.dataChannel || state.dataChannel.readyState !== "open") {
+          throw new DirectTransportError(
+            "The data channel closed before clipboard verification acknowledgement",
+          );
+        }
+        const acknowledged: ClipboardVerifiedAckControl = {
+          type: "clipboard-secure-verified-ack",
+          protocol: DIRECT_CLIPBOARD_PROTOCOL,
+          transferId: state.transferId,
+        };
+        state.dataChannel.send(JSON.stringify(acknowledged));
+        state.completionPhase = "closing-transport";
+        this.startCleanupTimer(state);
+        return;
+      }
+      if (isClipboardVerifiedAckControl(parsed)) {
+        if (
+          state.role !== "responder" ||
+          state.applicationMode !== "clipboard" ||
+          state.applicationResult !== "succeeded" ||
+          state.completionPhase !== "awaiting-verified-ack" ||
+          parsed.transferId !== state.transferId
+        ) {
+          throw new DirectTransportError(
+            "The direct clipboard verification acknowledgement is invalid",
+          );
+        }
+        state.completionPhase = "closing-transport";
+        this.cleanup(state);
+        return;
+      }
+      if (isClipboardStartControl(parsed)) {
+        if (
+          state.role !== "responder" ||
+          state.applicationMode !== undefined ||
+          parsed.transferId !== state.transferId
+        ) {
+          throw new DirectTransportError("The direct clipboard start frame is invalid");
+        }
+        state.applicationMode = "clipboard";
+        state.receivedStart = true;
+        state.state = "receiving";
+        await this.emitApplicationFrame(state, {
+          type: "clipboard-secure-start",
+          manifest: raw,
+        });
+        return;
       }
       if (isVerifiedControl(parsed)) {
         if (
@@ -868,6 +1153,19 @@ export class WebRtcPeerManager {
       return;
     }
     const chunk = asArrayBuffer(raw);
+    if (state.applicationMode === "clipboard") {
+      if (!chunk || !state.receivedStart) {
+        throw new DirectTransportError("The direct clipboard chunk arrived before its manifest");
+      }
+      if (chunk.byteLength > DIRECT_APPLICATION_MAX_FRAME_BYTES) {
+        throw new DirectTransportError("The direct clipboard chunk is too large");
+      }
+      await this.emitApplicationFrame(state, {
+        type: "clipboard-secure-chunk",
+        data: bytesToBase64(new Uint8Array(chunk)),
+      });
+      return;
+    }
     if (!chunk || !state.receivedStart || state.receivedChunks === undefined) {
       throw new DirectTransportError(
         "The direct binary chunk arrived out of order",
@@ -962,6 +1260,20 @@ export class WebRtcPeerManager {
       transferId: state.transferId,
       remoteDeviceId: state.remoteDeviceId,
       signal,
+    });
+  }
+
+  private async emitApplicationFrame(
+    state: TransferState,
+    frame:
+      | { type: "clipboard-secure-start"; manifest: string }
+      | { type: "clipboard-secure-chunk"; data: string },
+  ): Promise<void> {
+    await this.dependencies.emit({
+      kind: "application-frame",
+      transferId: state.transferId,
+      remoteDeviceId: state.remoteDeviceId,
+      frame,
     });
   }
 

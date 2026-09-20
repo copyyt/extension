@@ -11,3 +11,6 @@ export const MAX_CLIPBOARD_PLAINTEXT_BYTES =
  * bundle-v1 item that can currently be encrypted for the network.
  */
 export const MAX_LOCAL_CLIPBOARD_IMAGE_BYTES = 8 * 1024 * 1024;
+
+/** Maximum canonical bundle size for the bounded direct clipboard protocol. */
+export const DIRECT_CLIPBOARD_MAX_PLAINTEXT_BYTES = 16 * 1024 * 1024;

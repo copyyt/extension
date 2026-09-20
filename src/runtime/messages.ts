@@ -241,7 +241,9 @@ export interface OffscreenRequest {
     | "WATCH_STOP"
     | "PING"
     | "DIRECT_START_TEST"
+    | "DIRECT_START_CLIPBOARD"
     | "DIRECT_HANDLE_SIGNAL"
+    | "DIRECT_SEND_CLIPBOARD_VERIFIED"
     | "DIRECT_CANCEL"
     | "DIRECT_CANCEL_ALL";
   text?: string;
@@ -250,6 +252,9 @@ export interface OffscreenRequest {
   transferId?: string;
   remoteDeviceId?: string;
   signal?: DirectSignalDelivery;
+  manifest?: string;
+  encryptedChunks?: string[];
+  plaintextByteLength?: number;
   reason?: string;
 }
 
@@ -267,7 +272,9 @@ export interface OffscreenResponse {
     | "WATCH_STOP_RESULT"
     | "PONG"
     | "DIRECT_START_RESULT"
+    | "DIRECT_START_CLIPBOARD_RESULT"
     | "DIRECT_HANDLE_SIGNAL_RESULT"
+    | "DIRECT_SEND_CLIPBOARD_VERIFIED_RESULT"
     | "DIRECT_CANCEL_RESULT"
     | "DIRECT_CANCEL_ALL_RESULT"
     | "ERROR";
@@ -351,7 +358,9 @@ export function isOffscreenRequest(value: unknown): value is OffscreenRequest {
       candidate.type === "WATCH_STOP" ||
       candidate.type === "PING" ||
       candidate.type === "DIRECT_START_TEST" ||
+      candidate.type === "DIRECT_START_CLIPBOARD" ||
       candidate.type === "DIRECT_HANDLE_SIGNAL" ||
+      candidate.type === "DIRECT_SEND_CLIPBOARD_VERIFIED" ||
       candidate.type === "DIRECT_CANCEL" ||
       candidate.type === "DIRECT_CANCEL_ALL");
   if (!validRequestHeader) {
@@ -369,17 +378,21 @@ export function isOffscreenRequest(value: unknown): value is OffscreenRequest {
           ? ["source", "target", "requestId", "type", "resetBaseline"]
           : type === "DIRECT_START_TEST"
             ? ["source", "target", "requestId", "type", "transferId", "remoteDeviceId"]
-            : type === "DIRECT_HANDLE_SIGNAL"
-              ? ["source", "target", "requestId", "type", "signal"]
-              : type === "DIRECT_CANCEL"
-                ? candidate.reason === undefined
-                  ? ["source", "target", "requestId", "type", "transferId"]
-                  : ["source", "target", "requestId", "type", "transferId", "reason"]
-                : type === "DIRECT_CANCEL_ALL"
-                  ? candidate.reason === undefined
-                    ? ["source", "target", "requestId", "type"]
-                    : ["source", "target", "requestId", "type", "reason"]
-                  : ["source", "target", "requestId", "type"];
+            : type === "DIRECT_START_CLIPBOARD"
+              ? ["source", "target", "requestId", "type", "transferId", "remoteDeviceId", "manifest", "encryptedChunks"]
+              : type === "DIRECT_HANDLE_SIGNAL"
+                ? ["source", "target", "requestId", "type", "signal"]
+                : type === "DIRECT_SEND_CLIPBOARD_VERIFIED"
+                  ? ["source", "target", "requestId", "type", "transferId", "plaintextByteLength"]
+                  : type === "DIRECT_CANCEL"
+                    ? candidate.reason === undefined
+                      ? ["source", "target", "requestId", "type", "transferId"]
+                      : ["source", "target", "requestId", "type", "transferId", "reason"]
+                    : type === "DIRECT_CANCEL_ALL"
+                      ? candidate.reason === undefined
+                        ? ["source", "target", "requestId", "type"]
+                        : ["source", "target", "requestId", "type", "reason"]
+                      : ["source", "target", "requestId", "type"];
   if (
     keys.length !== expectedKeys.length ||
     !keys.every(
@@ -401,6 +414,16 @@ export function isOffscreenRequest(value: unknown): value is OffscreenRequest {
     return isUuid(candidate.transferId) &&
       isUuid(candidate.remoteDeviceId);
   }
+  if (type === "DIRECT_START_CLIPBOARD") {
+    return (
+      isUuid(candidate.transferId) &&
+      isUuid(candidate.remoteDeviceId) &&
+      typeof candidate.manifest === "string" &&
+      candidate.manifest.length > 0 &&
+      Array.isArray(candidate.encryptedChunks) &&
+      candidate.encryptedChunks.every((chunk) => typeof chunk === "string")
+    );
+  }
   if (type === "DIRECT_HANDLE_SIGNAL") {
     return isDirectSignalDelivery(candidate.signal);
   }
@@ -408,6 +431,13 @@ export function isOffscreenRequest(value: unknown): value is OffscreenRequest {
     return isUuid(candidate.transferId) &&
       (candidate.reason === undefined ||
         (typeof candidate.reason === "string" && candidate.reason.length <= 256));
+  }
+  if (type === "DIRECT_SEND_CLIPBOARD_VERIFIED") {
+    return (
+      isUuid(candidate.transferId) &&
+      Number.isSafeInteger(candidate.plaintextByteLength) &&
+      (candidate.plaintextByteLength as number) > 0
+    );
   }
   if (type === "DIRECT_CANCEL_ALL") {
     return candidate.reason === undefined ||
@@ -442,6 +472,24 @@ export function isOffscreenDirectTransportEvent(
     isDirectSignalBody(event.signal)
   ) {
     return true;
+  }
+  if (
+    event.kind === "application-frame" &&
+    typeof event.transferId === "string" &&
+    isUuid(event.remoteDeviceId) &&
+    event.frame &&
+    typeof event.frame === "object"
+  ) {
+    const frame = event.frame as {
+      type?: unknown;
+      manifest?: unknown;
+      data?: unknown;
+    };
+    return (
+      (frame.type === "clipboard-secure-start" &&
+        typeof frame.manifest === "string") ||
+      (frame.type === "clipboard-secure-chunk" && typeof frame.data === "string")
+    );
   }
   return (
     event.kind === "status" &&

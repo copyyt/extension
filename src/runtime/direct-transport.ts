@@ -14,7 +14,17 @@ export interface DirectTransport {
     transferId: string;
     recipientDeviceId: string;
   }): Promise<void>;
+  startClipboardTransfer?: (input: {
+    transferId: string;
+    recipientDeviceId: string;
+    manifest: string;
+    encryptedChunks: readonly string[];
+  }) => Promise<void>;
   handleSignal(signal: DirectSignalDelivery): Promise<void>;
+  sendClipboardVerified?: (input: {
+    transferId: string;
+    plaintextByteLength: number;
+  }) => Promise<void>;
   cancelTransfer(transferId: string, reason?: string): Promise<void>;
   cancelAll(reason?: string): Promise<void>;
 }
@@ -35,7 +45,9 @@ function isResponse(value: unknown): value is OffscreenResponse {
     candidate.target === RUNTIME_SOURCE &&
     typeof candidate.requestId === "string" &&
     (candidate.type === "DIRECT_START_RESULT" ||
+      candidate.type === "DIRECT_START_CLIPBOARD_RESULT" ||
       candidate.type === "DIRECT_HANDLE_SIGNAL_RESULT" ||
+      candidate.type === "DIRECT_SEND_CLIPBOARD_VERIFIED_RESULT" ||
       candidate.type === "DIRECT_CANCEL_RESULT" ||
       candidate.type === "DIRECT_CANCEL_ALL_RESULT" ||
       candidate.type === "ERROR")
@@ -69,6 +81,32 @@ export class OffscreenDirectTransport implements DirectTransport {
     await this.send({ type: "DIRECT_HANDLE_SIGNAL", signal });
   }
 
+  async startClipboardTransfer(input: {
+    transferId: string;
+    recipientDeviceId: string;
+    manifest: string;
+    encryptedChunks: readonly string[];
+  }): Promise<void> {
+    await this.send({
+      type: "DIRECT_START_CLIPBOARD",
+      transferId: input.transferId,
+      remoteDeviceId: input.recipientDeviceId,
+      manifest: input.manifest,
+      encryptedChunks: [...input.encryptedChunks],
+    });
+  }
+
+  async sendClipboardVerified(input: {
+    transferId: string;
+    plaintextByteLength: number;
+  }): Promise<void> {
+    await this.send({
+      type: "DIRECT_SEND_CLIPBOARD_VERIFIED",
+      transferId: input.transferId,
+      plaintextByteLength: input.plaintextByteLength,
+    });
+  }
+
   async cancelTransfer(transferId: string, reason?: string): Promise<void> {
     await this.send({ type: "DIRECT_CANCEL", transferId, ...(reason ? { reason } : {}) });
   }
@@ -80,7 +118,8 @@ export class OffscreenDirectTransport implements DirectTransport {
   private async send(
     input: Pick<
       OffscreenRequest,
-      "type" | "transferId" | "remoteDeviceId" | "signal" | "reason"
+      | "type" | "transferId" | "remoteDeviceId" | "signal" | "reason"
+      | "manifest" | "encryptedChunks" | "plaintextByteLength"
     >,
   ): Promise<void> {
     try {

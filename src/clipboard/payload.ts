@@ -254,16 +254,24 @@ export function decodeClipboardPlainText(
 /** Serialize the strict, unreleased bundle-v1 representation model. */
 export function encodeClipboardBundleV1(
   payload: ClipboardPayloadV1,
+  maxBytes = MAX_CLIPBOARD_PLAINTEXT_BYTES,
 ): Uint8Array {
   validateClipboardPayloadV1(payload);
   const bytes = utf8Encoder.encode(JSON.stringify(payload));
-  assertPlaintextByteLength(bytes.byteLength);
+  if (bytes.byteLength > maxBytes) {
+    throw new Error("Clipboard bundle exceeds the configured byte limit");
+  }
   return bytes;
 }
 
 /** Decode a strict bundle-v1 payload with opaque, inert text/PNG data. */
-export function decodeClipboardBundleV1(bytes: Uint8Array): ClipboardPayloadV1 {
-  assertPlaintextByteLength(bytes.byteLength);
+export function decodeClipboardBundleV1(
+  bytes: Uint8Array,
+  maxBytes = MAX_CLIPBOARD_PLAINTEXT_BYTES,
+): ClipboardPayloadV1 {
+  if (bytes.byteLength > maxBytes) {
+    throw new Error("Clipboard bundle exceeds the configured byte limit");
+  }
   const payload: unknown = JSON.parse(strictUtf8Decoder.decode(bytes));
   validateClipboardPayloadV1(payload);
   return payload;

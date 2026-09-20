@@ -9,9 +9,14 @@ import {
 } from "./payload.ts";
 import {
   CLIPBOARD_BUNDLE_V1_CAPABILITY,
+  CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY,
   CLIPBOARD_HTML_V1_CAPABILITY,
   CLIPBOARD_IMAGE_PNG_ASSISTED_WRITE_V1_CAPABILITY,
 } from "./capabilities.ts";
+import {
+  DIRECT_CLIPBOARD_MAX_PLAINTEXT_BYTES,
+  MAX_CLIPBOARD_PLAINTEXT_BYTES,
+} from "./limits.ts";
 
 export type ClipboardWirePayload =
   | {
@@ -39,6 +44,18 @@ export interface ClipboardWireProjection {
   payload: ClipboardPayloadV1;
   wirePayload: ClipboardWirePayload;
   recipients: readonly ClipboardWireRecipient[];
+}
+
+export interface ClipboardDirectProjection {
+  payload: ClipboardPayloadV1;
+  plaintext: Uint8Array;
+  recipient: ClipboardWireRecipient;
+}
+
+export interface ClipboardDeliveryRoutes {
+  relay: ClipboardWireProjection[];
+  direct: ClipboardDirectProjection[];
+  unsupported: ClipboardWireRecipient[];
 }
 
 export class ClipboardWirePayloadTooLargeError extends Error {
@@ -91,9 +108,19 @@ export function recipientSupportsAssistedPng(
     );
 }
 
+export function recipientSupportsDirectClipboard(
+  recipient: ClipboardWireRecipient,
+): boolean {
+  return recipientSupportsCapability(
+    recipient,
+    CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY,
+  );
+}
+
 function projectForRecipient(
   payload: ClipboardPayloadV1,
   recipient: ClipboardWireRecipient,
+  includePng = true,
 ): ClipboardPayloadV1 | null {
   const plain = findPlainTextRepresentation(payload);
   const html = getHtmlRepresentation(payload);
@@ -103,12 +130,16 @@ function projectForRecipient(
   if (html && recipientSupportsClipboardHtml(recipient)) {
     representations.push(html);
   }
-  if (png && recipientSupportsAssistedPng(recipient)) {
+  if (png && includePng && recipientSupportsAssistedPng(recipient)) {
     representations.push(png);
   }
   if (representations.length === 0) return null;
   if (png && !recipientSupportsAssistedPng(recipient) && !plain) return null;
   return { version: 1, representations };
+}
+
+function bundleBytesForDirect(payload: ClipboardPayloadV1): Uint8Array {
+  return encodeClipboardBundleV1(payload, DIRECT_CLIPBOARD_MAX_PLAINTEXT_BYTES);
 }
 
 function projectionKey(payload: ClipboardPayloadV1): string {
@@ -159,6 +190,87 @@ export function selectClipboardWirePayloads(input: {
     wirePayload: wirePayloadForProjection(payload),
     recipients,
   }));
+}
+
+/**
+ * Route each actual recipient independently. The relay projection retains its
+ * existing capability grouping; only an oversized PNG bundle for a recipient
+ * with both explicit direct and assisted-write capabilities is diverted.
+ */
+export function selectClipboardDeliveryRoutes(input: {
+  payload: ClipboardPayloadV1;
+  recipients: readonly ClipboardWireRecipient[];
+}): ClipboardDeliveryRoutes {
+  const relayGroups = new Map<
+    string,
+    { payload: ClipboardPayloadV1; recipients: ClipboardWireRecipient[] }
+  >();
+  const direct: ClipboardDirectProjection[] = [];
+  const unsupported: ClipboardWireRecipient[] = [];
+
+  for (const recipient of input.recipients) {
+    const fullProjection = projectForRecipient(input.payload, recipient);
+    if (!fullProjection) {
+      unsupported.push(recipient);
+      continue;
+    }
+    const hasPng = getPngRepresentation(fullProjection) !== undefined;
+    let fullBundle: Uint8Array | null = null;
+    if (hasPng) {
+      try {
+        fullBundle = encodeClipboardBundleV1(
+          fullProjection,
+          MAX_CLIPBOARD_PLAINTEXT_BYTES,
+        );
+      } catch {
+        fullBundle = null;
+      }
+    }
+    if (
+      hasPng &&
+      fullBundle === null &&
+      recipientSupportsDirectClipboard(recipient) &&
+      recipientSupportsAssistedPng(recipient)
+    ) {
+      try {
+        const plaintext = bundleBytesForDirect(fullProjection);
+        direct.push({ payload: fullProjection, plaintext, recipient });
+        continue;
+      } catch {
+        // The direct maximum is bounded. It is not a reason to attempt a
+        // relay publish that would violate the existing plaintext limit.
+        unsupported.push(recipient);
+        continue;
+      }
+    }
+
+    let relayProjection = fullProjection;
+    try {
+      wirePayloadForProjection(relayProjection);
+    } catch (error) {
+      if (!(error instanceof ClipboardWirePayloadTooLargeError)) throw error;
+      const fallbackProjection = projectForRecipient(input.payload, recipient, false);
+      if (!fallbackProjection) {
+        unsupported.push(recipient);
+        continue;
+      }
+      relayProjection = fallbackProjection;
+    }
+    const key = projectionKey(relayProjection);
+    const group = relayGroups.get(key);
+    if (group) group.recipients.push(recipient);
+    else relayGroups.set(key, { payload: relayProjection, recipients: [recipient] });
+  }
+
+  return {
+    relay: [...relayGroups.values()].map(({ payload, recipients }) => ({
+      payload,
+      wirePayload: wirePayloadForProjection(payload),
+      recipients,
+    })),
+    direct,
+    unsupported,
+  };
 }
 
 /**

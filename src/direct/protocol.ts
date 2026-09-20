@@ -1,4 +1,8 @@
 import { CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY } from "../clipboard/capabilities.ts";
+import {
+  AES_GCM_TAG_BYTES,
+  DIRECT_CLIPBOARD_MAX_PLAINTEXT_BYTES,
+} from "../clipboard/limits.ts";
 
 export const DIRECT_TRANSPORT_CAPABILITY =
   CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY;
@@ -14,6 +18,14 @@ export const DIRECT_CLEANUP_TIMEOUT_MS = 5_000;
 export const DIRECT_TEST_PAYLOAD_BYTES = 2 * 1024 * 1024;
 export const DIRECT_MAX_TEST_PAYLOAD_BYTES = DIRECT_TEST_PAYLOAD_BYTES;
 export const DIRECT_MAX_ICE_CANDIDATES = 128;
+export const DIRECT_CLIPBOARD_PROTOCOL = "copyyt-direct-clipboard-v1" as const;
+export const DIRECT_CLIPBOARD_CONTENT_TYPE =
+  "application/vnd.copyyt.clipboard-bundle+json" as const;
+export { DIRECT_CLIPBOARD_MAX_PLAINTEXT_BYTES };
+export const DIRECT_APPLICATION_FRAME_INDEX_BYTES = 4;
+export const DIRECT_APPLICATION_PLAINTEXT_CHUNK_SIZE =
+  DIRECT_CHUNK_SIZE - DIRECT_APPLICATION_FRAME_INDEX_BYTES - AES_GCM_TAG_BYTES;
+export const DIRECT_APPLICATION_MAX_FRAME_BYTES = DIRECT_CHUNK_SIZE;
 
 export type DirectSignalKind =
   | "offer"
@@ -75,6 +87,14 @@ export type DirectManagerEvent =
       error?: string;
       startedAt?: string;
       finishedAt?: string;
+    }
+  | {
+      kind: "application-frame";
+      transferId: string;
+      remoteDeviceId: string;
+      frame:
+        | { type: "clipboard-secure-start"; manifest: string }
+        | { type: "clipboard-secure-chunk"; data: string };
     };
 
 export interface DirectTransportStatus {
