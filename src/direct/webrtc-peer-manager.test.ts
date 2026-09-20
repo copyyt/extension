@@ -169,8 +169,9 @@ async function waitFor(condition: () => boolean): Promise<void> {
 async function createConnectedTransfer(
   options: {
     deferVerified?: boolean;
-    deferComplete?: boolean;
+    deferVerifiedAck?: boolean;
     transferTimeoutMs?: number;
+    cleanupTimeoutMs?: number;
   } = {},
 ): Promise<{
   managerA: WebRtcPeerManager;
@@ -192,11 +193,13 @@ async function createConnectedTransfer(
       if (peers.length === 2 && peers[0]?.dataChannel) {
         const remote = new FakeChannel(DIRECT_DATA_CHANNEL_LABEL);
         remote.deferredControlTypes = new Set(
-          [
-            options.deferVerified ? "verified" : null,
-            options.deferComplete ? "complete" : null,
-          ].filter((type): type is string => type !== null),
+          [options.deferVerified ? "verified" : null].filter(
+            (type): type is string => type !== null,
+          ),
         );
+        if (options.deferVerifiedAck) {
+          peers[0].dataChannel.deferredControlTypes.add("verified-ack");
+        }
         peers[0].dataChannel.remote = remote;
         remote.remote = peers[0].dataChannel;
         peer.pendingRemoteChannel = remote;
@@ -207,6 +210,7 @@ async function createConnectedTransfer(
       initiatorEvents.push(event);
     },
     transferTimeoutMs: options.transferTimeoutMs,
+    cleanupTimeoutMs: options.cleanupTimeoutMs,
   });
   const managerB = new WebRtcPeerManager({
     peerConnectionFactory: () => {
@@ -215,11 +219,13 @@ async function createConnectedTransfer(
       if (peers.length === 2 && peers[0]?.dataChannel) {
         const remote = new FakeChannel(DIRECT_DATA_CHANNEL_LABEL);
         remote.deferredControlTypes = new Set(
-          [
-            options.deferVerified ? "verified" : null,
-            options.deferComplete ? "complete" : null,
-          ].filter((type): type is string => type !== null),
+          [options.deferVerified ? "verified" : null].filter(
+            (type): type is string => type !== null,
+          ),
         );
+        if (options.deferVerifiedAck) {
+          peers[0].dataChannel.deferredControlTypes.add("verified-ack");
+        }
         peers[0].dataChannel.remote = remote;
         remote.remote = peers[0].dataChannel;
         peer.pendingRemoteChannel = remote;
@@ -230,6 +236,7 @@ async function createConnectedTransfer(
       responderEvents.push(event);
     },
     transferTimeoutMs: options.transferTimeoutMs,
+    cleanupTimeoutMs: options.cleanupTimeoutMs,
   });
 
   await managerA.startTestTransfer({
@@ -567,205 +574,119 @@ test("peer manager chunks the 2 MiB experiment and completes with verification",
   assert.equal(managerB.size, 0);
 });
 
-test("completion handshake keeps verified responders alive until expected close", async () => {
+test("responder success is final before the initiator receives verified", async () => {
   const harness = await createConnectedTransfer({
     deferVerified: true,
-    deferComplete: true,
+    cleanupTimeoutMs: 100,
   });
 
-  await waitFor(() => hasStatus(harness.responderEvents, "verified"));
+  await waitFor(() => hasStatus(harness.responderEvents, "succeeded"));
   assert.equal(harness.managerB.size, 1);
   assert.equal(harness.responderChannel.readyState, "open");
   assert.notEqual(harness.responderPeer.connectionState, "closed");
-  assert.equal(hasStatus(harness.responderEvents, "succeeded"), false);
-  assert.equal(harness.responderChannel.closeCalls, 0);
-  assert.equal(harness.responderPeer.closeCalls, 0);
+  harness.responderChannel.onerror?.();
+  await waitFor(() => harness.managerB.size === 0);
+  assert.equal(countStatus(harness.responderEvents, "succeeded"), 1);
+  assert.equal(countStatus(harness.responderEvents, "failed"), 0);
+});
 
-  harness.responderChannel.releaseDeferredControl("verified");
-  await waitFor(() =>
-    harness.initiatorChannel.sent.some(
+test("initiator success survives a post-success data channel error", async () => {
+  const harness = await createConnectedTransfer({ deferVerifiedAck: true });
+
+  await waitFor(() => hasStatus(harness.initiatorEvents, "succeeded"));
+  await waitFor(() => hasStatus(harness.responderEvents, "succeeded"));
+  assert.equal(
+    harness.initiatorChannel.deferredControls.some(
       (message) =>
-        typeof message === "string" &&
         (JSON.parse(message) as { type?: unknown }).type === "verified-ack",
     ),
+    true,
   );
-  await waitFor(() =>
-    harness.responderChannel.deferredControls.some(
+
+  harness.initiatorChannel.onerror?.();
+  await waitFor(
+    () => harness.managerA.size === 0 && harness.managerB.size === 0,
+  );
+  assert.equal(countStatus(harness.initiatorEvents, "succeeded"), 1);
+  assert.equal(countStatus(harness.initiatorEvents, "failed"), 0);
+  assert.equal(countStatus(harness.responderEvents, "failed"), 0);
+});
+
+test("transport errors before initiator verification still fail", async () => {
+  const harness = await createConnectedTransfer({ deferVerified: true });
+
+  await waitFor(() => hasStatus(harness.responderEvents, "succeeded"));
+  assert.equal(hasStatus(harness.initiatorEvents, "succeeded"), false);
+  harness.initiatorChannel.onerror?.();
+  await waitFor(() => harness.managerA.size === 0);
+  assert.equal(countStatus(harness.initiatorEvents, "failed"), 1);
+  assert.equal(countStatus(harness.initiatorEvents, "succeeded"), 0);
+});
+
+test("responder transport errors before hash verification still fail", async () => {
+  const harness = await createConnectedTransfer();
+
+  harness.responderChannel.onerror?.();
+  await waitFor(() => harness.managerB.size === 0);
+  assert.equal(countStatus(harness.responderEvents, "failed"), 1);
+  assert.equal(countStatus(harness.responderEvents, "succeeded"), 0);
+});
+
+test("verified-ack causes responder cleanup without a complete frame", async () => {
+  const harness = await createConnectedTransfer({ deferVerifiedAck: true });
+
+  await waitFor(() => hasStatus(harness.initiatorEvents, "succeeded"));
+  await waitFor(() => hasStatus(harness.responderEvents, "succeeded"));
+  assert.equal(
+    [...harness.initiatorChannel.sent, ...harness.responderChannel.sent].some(
       (message) =>
+        typeof message === "string" &&
         (JSON.parse(message) as { type?: unknown }).type === "complete",
     ),
+    false,
   );
   assert.equal(harness.managerA.size, 1);
-  assert.equal(hasStatus(harness.initiatorEvents, "succeeded"), false);
+  assert.equal(harness.managerB.size, 1);
 
-  harness.responderChannel.releaseDeferredControl("complete");
+  harness.initiatorChannel.releaseDeferredControl("verified-ack");
   await waitFor(
     () => harness.managerA.size === 0 && harness.managerB.size === 0,
   );
-  assert.equal(hasStatus(harness.initiatorEvents, "succeeded"), true);
-  assert.equal(hasStatus(harness.responderEvents, "succeeded"), true);
-  assert.equal(hasStatus(harness.initiatorEvents, "failed"), false);
-  assert.equal(hasStatus(harness.responderEvents, "failed"), false);
-});
-
-test("disconnected responder transfers remain active and recover", async () => {
-  const harness = await createConnectedTransfer({ deferComplete: true });
-  await waitFor(() =>
-    harness.responderChannel.deferredControls.some(
-      (message) =>
-        (JSON.parse(message) as { type?: unknown }).type === "complete",
-    ),
-  );
-
-  harness.responderPeer.connectionState = "disconnected";
-  harness.responderPeer.onconnectionstatechange?.();
-  assert.equal(harness.managerB.size, 1);
-  assert.equal(harness.responderChannel.readyState, "open");
-  assert.equal(harness.responderPeer.closeCalls, 0);
-  assert.equal(hasStatus(harness.responderEvents, "succeeded"), false);
-  assert.equal(hasStatus(harness.responderEvents, "failed"), false);
-
-  harness.responderPeer.connectionState = "connected";
-  harness.responderPeer.onconnectionstatechange?.();
-  assert.equal(harness.managerB.size, 1);
-  assert.equal(hasStatus(harness.responderEvents, "succeeded"), false);
-  assert.equal(hasStatus(harness.responderEvents, "failed"), false);
-
-  harness.responderChannel.releaseDeferredControl("complete");
-  await waitFor(() => harness.managerB.size === 0);
+  assert.equal(countStatus(harness.initiatorEvents, "succeeded"), 1);
   assert.equal(countStatus(harness.responderEvents, "succeeded"), 1);
+  assert.equal(countStatus(harness.initiatorEvents, "failed"), 0);
   assert.equal(countStatus(harness.responderEvents, "failed"), 0);
 });
 
-test("failed responder connection never masquerades as successful completion", async () => {
-  const harness = await createConnectedTransfer({ deferComplete: true });
-  await waitFor(() =>
-    harness.responderChannel.deferredControls.some(
-      (message) =>
-        (JSON.parse(message) as { type?: unknown }).type === "complete",
-    ),
-  );
-
-  harness.responderPeer.connectionState = "failed";
-  harness.responderPeer.onconnectionstatechange?.();
-  await waitFor(() => harness.managerB.size === 0);
-  assert.equal(countStatus(harness.responderEvents, "failed"), 1);
-  assert.equal(countStatus(harness.responderEvents, "succeeded"), 0);
-});
-
-test("closed responder connection succeeds only while awaiting remote close", async () => {
-  const harness = await createConnectedTransfer({ deferComplete: true });
-  await waitFor(() =>
-    harness.responderChannel.deferredControls.some(
-      (message) =>
-        (JSON.parse(message) as { type?: unknown }).type === "complete",
-    ),
-  );
-
-  harness.responderPeer.connectionState = "closed";
-  harness.responderPeer.onconnectionstatechange?.();
-  await waitFor(() => harness.managerB.size === 0);
-  assert.equal(countStatus(harness.responderEvents, "succeeded"), 1);
-  assert.equal(countStatus(harness.responderEvents, "failed"), 0);
-});
-
-test("early peer connection close remains a transfer failure", async () => {
+test("verified-ack before responder verification is invalid", async () => {
   const harness = await createConnectedTransfer({ deferVerified: true });
-  await waitFor(() => hasStatus(harness.responderEvents, "verified"));
 
-  harness.responderPeer.connectionState = "closed";
-  harness.responderPeer.onconnectionstatechange?.();
-  await waitFor(() => harness.managerB.size === 0);
-  assert.equal(countStatus(harness.responderEvents, "failed"), 1);
-  assert.equal(countStatus(harness.responderEvents, "succeeded"), 0);
-});
-
-test("data channel and peer close callbacks are idempotent in either order", async () => {
-  const channelFirst = await createConnectedTransfer({ deferComplete: true });
-  await waitFor(() =>
-    channelFirst.responderChannel.deferredControls.some(
-      (message) =>
-        (JSON.parse(message) as { type?: unknown }).type === "complete",
-    ),
-  );
-  channelFirst.responderChannel.close();
-  channelFirst.responderPeer.connectionState = "closed";
-  channelFirst.responderPeer.onconnectionstatechange?.();
-  await waitFor(() => channelFirst.managerB.size === 0);
-  assert.equal(countStatus(channelFirst.responderEvents, "succeeded"), 1);
-  assert.equal(countStatus(channelFirst.responderEvents, "failed"), 0);
-
-  const peerFirst = await createConnectedTransfer({ deferComplete: true });
-  await waitFor(() =>
-    peerFirst.responderChannel.deferredControls.some(
-      (message) =>
-        (JSON.parse(message) as { type?: unknown }).type === "complete",
-    ),
-  );
-  peerFirst.responderPeer.connectionState = "closed";
-  peerFirst.responderPeer.onconnectionstatechange?.();
-  await waitFor(() => peerFirst.managerB.size === 0);
-  peerFirst.responderChannel.onclose?.();
-  assert.equal(countStatus(peerFirst.responderEvents, "succeeded"), 1);
-  assert.equal(countStatus(peerFirst.responderEvents, "failed"), 0);
-});
-
-test("persistent disconnected responder transfers fail through the transfer timeout", async () => {
-  const harness = await createConnectedTransfer({
-    deferComplete: true,
-    transferTimeoutMs: 250,
+  harness.responderChannel.onmessage?.({
+    data: JSON.stringify({ type: "verified-ack", transferId }),
   });
-  await waitFor(() =>
-    harness.responderChannel.deferredControls.some(
-      (message) =>
-        (JSON.parse(message) as { type?: unknown }).type === "complete",
-    ),
-  );
-
-  harness.responderPeer.connectionState = "disconnected";
-  harness.responderPeer.onconnectionstatechange?.();
-  assert.equal(harness.managerB.size, 1);
   await waitFor(() => harness.managerB.size === 0);
   assert.equal(countStatus(harness.responderEvents, "failed"), 1);
   assert.equal(countStatus(harness.responderEvents, "succeeded"), 0);
 });
 
-test("early receiver close before verified remains a transfer failure", async () => {
+test("disconnected initiator transfers remain active and recover before success", async () => {
   const harness = await createConnectedTransfer({ deferVerified: true });
-  await waitFor(() => hasStatus(harness.responderEvents, "verified"));
+  await waitFor(() => hasStatus(harness.responderEvents, "succeeded"));
 
-  harness.responderChannel.close();
+  harness.initiatorPeer.connectionState = "disconnected";
+  harness.initiatorPeer.onconnectionstatechange?.();
+  assert.equal(harness.managerA.size, 1);
+  assert.equal(hasStatus(harness.initiatorEvents, "succeeded"), false);
+  assert.equal(hasStatus(harness.initiatorEvents, "failed"), false);
+
+  harness.initiatorPeer.connectionState = "connected";
+  harness.initiatorPeer.onconnectionstatechange?.();
+  harness.responderChannel.releaseDeferredControl("verified");
   await waitFor(
     () => harness.managerA.size === 0 && harness.managerB.size === 0,
   );
-  assert.equal(hasStatus(harness.initiatorEvents, "failed"), true);
-  assert.equal(hasStatus(harness.responderEvents, "failed"), true);
-  assert.equal(hasStatus(harness.responderEvents, "succeeded"), false);
-});
-
-test("initiator close before verified acknowledgement remains a failure", async () => {
-  const harness = await createConnectedTransfer({ deferVerified: true });
-  await waitFor(() => hasStatus(harness.responderEvents, "verified"));
-
-  harness.initiatorChannel.close();
-  await waitFor(
-    () => harness.managerA.size === 0 && harness.managerB.size === 0,
-  );
-  assert.equal(hasStatus(harness.initiatorEvents, "failed"), true);
-  assert.equal(hasStatus(harness.responderEvents, "failed"), true);
-  assert.equal(hasStatus(harness.responderEvents, "succeeded"), false);
-});
-
-test("responder close before complete remains a transfer failure", async () => {
-  const harness = await createConnectedTransfer({ deferVerified: true });
-  await waitFor(() => hasStatus(harness.responderEvents, "verified"));
-
-  harness.responderChannel.close();
-  await waitFor(
-    () => harness.managerA.size === 0 && harness.managerB.size === 0,
-  );
-  assert.equal(hasStatus(harness.initiatorEvents, "failed"), true);
-  assert.equal(hasStatus(harness.responderEvents, "failed"), true);
+  assert.equal(countStatus(harness.initiatorEvents, "succeeded"), 1);
+  assert.equal(countStatus(harness.initiatorEvents, "failed"), 0);
 });
 
 test("terminal handshake timeout cleans up when verified acknowledgement never arrives", async () => {
@@ -777,25 +698,61 @@ test("terminal handshake timeout cleans up when verified acknowledgement never a
   await waitFor(
     () => harness.managerA.size === 0 && harness.managerB.size === 0,
   );
-  assert.equal(hasStatus(harness.responderEvents, "failed"), true);
+  assert.equal(hasStatus(harness.responderEvents, "succeeded"), true);
+  assert.equal(hasStatus(harness.responderEvents, "failed"), false);
   assert.equal(hasStatus(harness.initiatorEvents, "failed"), true);
 });
 
-test("terminal handshake timeout cleans up when complete never arrives", async () => {
+test("post-success cleanup timeout preserves success", async () => {
   const harness = await createConnectedTransfer({
-    deferComplete: true,
-    transferTimeoutMs: 250,
+    deferVerifiedAck: true,
+    cleanupTimeoutMs: 25,
   });
-  await waitFor(() =>
-    harness.responderChannel.deferredControls.some(
-      (message) =>
-        (JSON.parse(message) as { type?: unknown }).type === "complete",
-    ),
-  );
+  await waitFor(() => hasStatus(harness.initiatorEvents, "succeeded"));
+  await waitFor(() => hasStatus(harness.responderEvents, "succeeded"));
+  harness.initiatorChannel.onclose = null;
+  harness.responderChannel.onclose = null;
+  harness.initiatorPeer.onconnectionstatechange = null;
+  harness.responderPeer.onconnectionstatechange = null;
   await waitFor(
     () => harness.managerA.size === 0 && harness.managerB.size === 0,
   );
-  assert.equal(hasStatus(harness.initiatorEvents, "failed"), true);
+  assert.equal(countStatus(harness.initiatorEvents, "succeeded"), 1);
+  assert.equal(countStatus(harness.responderEvents, "succeeded"), 1);
+  assert.equal(countStatus(harness.initiatorEvents, "failed"), 0);
+  assert.equal(countStatus(harness.responderEvents, "failed"), 0);
+  assert.equal(harness.initiatorChannel.closeCalls, 1);
+  assert.equal(harness.responderChannel.closeCalls, 1);
+  assert.equal(harness.initiatorPeer.closeCalls, 1);
+  assert.equal(harness.responderPeer.closeCalls, 1);
+});
+
+test("post-success close callbacks are idempotent in either order", async () => {
+  for (const order of ["channel-first", "peer-first"] as const) {
+    const harness = await createConnectedTransfer({ deferVerifiedAck: true });
+    await waitFor(() => hasStatus(harness.initiatorEvents, "succeeded"));
+    await waitFor(() => hasStatus(harness.responderEvents, "succeeded"));
+
+    if (order === "channel-first") {
+      harness.initiatorChannel.onerror?.();
+      harness.initiatorChannel.onclose?.();
+      harness.initiatorPeer.connectionState = "closed";
+      harness.initiatorPeer.onconnectionstatechange?.();
+    } else {
+      harness.initiatorPeer.connectionState = "closed";
+      harness.initiatorPeer.onconnectionstatechange?.();
+      harness.initiatorChannel.onerror?.();
+      harness.initiatorChannel.onclose?.();
+    }
+
+    await waitFor(
+      () => harness.managerA.size === 0 && harness.managerB.size === 0,
+    );
+    assert.equal(countStatus(harness.initiatorEvents, "succeeded"), 1);
+    assert.equal(countStatus(harness.responderEvents, "succeeded"), 1);
+    assert.equal(countStatus(harness.initiatorEvents, "failed"), 0);
+    assert.equal(countStatus(harness.responderEvents, "failed"), 0);
+  }
 });
 
 test("peer manager enforces the bounded concurrent transfer ceiling", async () => {

@@ -2,6 +2,7 @@ import {
   DIRECT_BUFFER_HIGH_WATER,
   DIRECT_BUFFER_LOW_THRESHOLD,
   DIRECT_CHUNK_SIZE,
+  DIRECT_CLEANUP_TIMEOUT_MS,
   DIRECT_CONNECTION_TIMEOUT_MS,
   DIRECT_DATA_CHANNEL_LABEL,
   DIRECT_MAX_CONCURRENT_TRANSFERS,
@@ -71,6 +72,7 @@ export interface DirectPeerManagerDependencies {
   maxConcurrentTransfers?: number;
   connectionTimeoutMs?: number;
   transferTimeoutMs?: number;
+  cleanupTimeoutMs?: number;
 }
 
 export class DirectTransportError extends Error {
@@ -90,9 +92,12 @@ interface TransferState {
   remoteDescriptionSet: boolean;
   createdAt: number;
   state: DirectTransferState;
+  applicationResult: ApplicationResult;
+  succeededStatusEmitted: boolean;
   completionPhase: CompletionPhase;
   connectionTimer?: ReturnType<typeof setTimeout>;
   transferTimer?: ReturnType<typeof setTimeout>;
+  cleanupTimer?: ReturnType<typeof setTimeout>;
   testBytes?: Uint8Array;
   expectedByteLength?: number;
   expectedSha256?: string;
@@ -108,8 +113,9 @@ type CompletionPhase =
   | "transferring"
   | "awaiting-verified"
   | "awaiting-verified-ack"
-  | "awaiting-complete"
-  | "awaiting-remote-close";
+  | "closing-transport";
+
+type ApplicationResult = "pending" | "succeeded" | "failed";
 
 interface PendingIceQueue {
   sourceDeviceId: string;
@@ -141,11 +147,6 @@ interface ControlVerified {
 
 interface ControlVerifiedAck {
   type: "verified-ack";
-  transferId: string;
-}
-
-interface ControlComplete {
-  type: "complete";
   transferId: string;
 }
 
@@ -201,16 +202,6 @@ function isVerifiedAckControl(value: unknown): value is ControlVerifiedAck {
   return (
     Object.keys(value).length === 2 &&
     candidate.type === "verified-ack" &&
-    typeof candidate.transferId === "string"
-  );
-}
-
-function isCompleteControl(value: unknown): value is ControlComplete {
-  if (!isControlObject(value)) return false;
-  const candidate = value as Partial<ControlComplete>;
-  return (
-    Object.keys(value).length === 2 &&
-    candidate.type === "complete" &&
     typeof candidate.transferId === "string"
   );
 }
@@ -272,6 +263,8 @@ export class WebRtcPeerManager {
         dependencies.connectionTimeoutMs ?? DIRECT_CONNECTION_TIMEOUT_MS,
       transferTimeoutMs:
         dependencies.transferTimeoutMs ?? DIRECT_TRANSFER_TIMEOUT_MS,
+      cleanupTimeoutMs:
+        dependencies.cleanupTimeoutMs ?? DIRECT_CLEANUP_TIMEOUT_MS,
       emit: dependencies.emit,
     };
     if (
@@ -323,7 +316,10 @@ export class WebRtcPeerManager {
         sdp: offer.sdp ?? "",
       });
     } catch (error) {
-      this.fail(state, error instanceof Error ? error.message : "Offer failed");
+      this.handleTransportFailure(
+        state,
+        error instanceof Error ? error.message : "Offer failed",
+      );
       throw new DirectTransportError("Unable to create the direct offer");
     }
   }
@@ -334,7 +330,7 @@ export class WebRtcPeerManager {
     } catch (error) {
       const state = this.transfers.get(signal.transferId);
       if (state && state.remoteDeviceId === signal.sourceDeviceId) {
-        this.fail(
+        this.handleTransportFailure(
           state,
           error instanceof Error ? error.message : "Direct signalling failed",
         );
@@ -444,6 +440,8 @@ export class WebRtcPeerManager {
       remoteDescriptionSet: false,
       createdAt: this.dependencies.now().getTime(),
       state: "connecting",
+      applicationResult: "pending",
+      succeededStatusEmitted: false,
       completionPhase: "transferring",
     };
     this.transfers.set(transferId, state);
@@ -451,7 +449,7 @@ export class WebRtcPeerManager {
       const candidate = candidateFromEvent(event.candidate);
       if (!candidate) return;
       void this.emitSignal(state, { kind: "ice-candidate", candidate }).catch(
-        () => this.fail(state, "ICE signalling failed"),
+        () => this.handleTransportFailure(state, "ICE signalling failed"),
       );
     };
     peerConnection.ondatachannel = (event) => {
@@ -465,19 +463,15 @@ export class WebRtcPeerManager {
     peerConnection.onconnectionstatechange = () => {
       const connectionState = peerConnection.connectionState;
       if (connectionState === "closed") {
-        if (
-          state.role === "responder" &&
-          state.completionPhase === "awaiting-remote-close"
-        ) {
-          this.succeed(state, this.verificationDetails(state));
-          return;
-        }
-        this.fail(state, `Peer connection ${connectionState}`);
+        this.handleTransportFailure(
+          state,
+          `Peer connection ${connectionState}`,
+        );
         return;
       }
 
       if (connectionState === "failed") {
-        this.fail(state, "Peer connection failed");
+        this.handleTransportFailure(state, "Peer connection failed");
         return;
       }
 
@@ -488,7 +482,7 @@ export class WebRtcPeerManager {
       }
     };
     state.connectionTimer = setTimeout(
-      () => this.fail(state, "Direct connection timed out"),
+      () => this.handleTransportFailure(state, "Direct connection timed out"),
       this.dependencies.connectionTimeoutMs,
     );
     void this.emitStatus(state, "connecting");
@@ -662,7 +656,7 @@ export class WebRtcPeerManager {
       if (this.transfers.get(state.transferId) !== state) return;
       this.clearConnectionTimer(state);
       state.transferTimer = setTimeout(
-        () => this.fail(state, "Direct transfer timed out"),
+        () => this.handleTransportFailure(state, "Direct transfer timed out"),
         this.dependencies.transferTimeoutMs,
       );
       state.state = "open";
@@ -671,24 +665,19 @@ export class WebRtcPeerManager {
     };
     channel.onmessage = (event) => {
       void this.handleDataMessage(state, event.data).catch((error: unknown) => {
-        this.fail(
+        this.handleTransportFailure(
           state,
           error instanceof Error ? error.message : "Data channel failed",
         );
       });
     };
-    channel.onerror = () => this.fail(state, "Data channel error");
+    channel.onerror = () =>
+      this.handleTransportFailure(state, "Data channel error");
     channel.onclose = () => {
-      if (this.transfers.get(state.transferId) === state) {
-        if (
-          state.role === "responder" &&
-          state.completionPhase === "awaiting-remote-close"
-        ) {
-          this.succeed(state, this.verificationDetails(state));
-          return;
-        }
-        this.fail(state, "Data channel closed before verification");
-      }
+      this.handleTransportFailure(
+        state,
+        "Data channel closed before verification",
+      );
     };
   }
 
@@ -739,7 +728,7 @@ export class WebRtcPeerManager {
       state.dataChannel.send(JSON.stringify(end));
       state.completionPhase = "awaiting-verified";
     } catch (error) {
-      this.fail(
+      this.handleTransportFailure(
         state,
         error instanceof Error ? error.message : "Direct send failed",
       );
@@ -802,12 +791,18 @@ export class WebRtcPeerManager {
             "The direct verification acknowledgement is invalid",
           );
         }
+        this.markApplicationSucceeded(state);
         state.state = "verified";
-        await this.emitStatus(state, "verified", {
+        const verifiedStatus = this.emitStatus(state, "verified", {
           bytesReceived: parsed.byteLength,
           byteLength: parsed.byteLength,
           sha256: parsed.sha256,
         });
+        await this.emitApplicationSucceeded(
+          state,
+          this.verificationDetails(state),
+        );
+        await verifiedStatus;
         const acknowledged: ControlVerifiedAck = {
           type: "verified-ack",
           transferId: state.transferId,
@@ -818,12 +813,14 @@ export class WebRtcPeerManager {
           );
         }
         state.dataChannel.send(JSON.stringify(acknowledged));
-        state.completionPhase = "awaiting-complete";
+        state.completionPhase = "closing-transport";
+        this.startCleanupTimer(state);
         return;
       }
       if (isVerifiedAckControl(parsed)) {
         if (
           state.role !== "responder" ||
+          state.applicationResult !== "succeeded" ||
           state.completionPhase !== "awaiting-verified-ack" ||
           parsed.transferId !== state.transferId
         ) {
@@ -831,30 +828,8 @@ export class WebRtcPeerManager {
             "The direct verification acknowledgement is invalid",
           );
         }
-        const complete: ControlComplete = {
-          type: "complete",
-          transferId: state.transferId,
-        };
-        if (!state.dataChannel || state.dataChannel.readyState !== "open") {
-          throw new DirectTransportError(
-            "The data channel closed before completion",
-          );
-        }
-        state.dataChannel.send(JSON.stringify(complete));
-        state.completionPhase = "awaiting-remote-close";
-        return;
-      }
-      if (isCompleteControl(parsed)) {
-        if (
-          state.role !== "initiator" ||
-          state.completionPhase !== "awaiting-complete" ||
-          parsed.transferId !== state.transferId
-        ) {
-          throw new DirectTransportError(
-            "The direct completion acknowledgement is invalid",
-          );
-        }
-        this.succeed(state, this.verificationDetails(state));
+        state.completionPhase = "closing-transport";
+        this.cleanup(state);
         return;
       }
       if (!isStartControl(parsed)) {
@@ -956,19 +931,26 @@ export class WebRtcPeerManager {
       byteLength: total,
       sha256: hash,
     };
-    if (!state.dataChannel || state.dataChannel.readyState !== "open") {
-      throw new DirectTransportError(
-        "The data channel closed before verification",
-      );
-    }
-    state.dataChannel.send(JSON.stringify(acknowledged));
+    this.markApplicationSucceeded(state);
     state.completionPhase = "awaiting-verified-ack";
     state.state = "verified";
-    await this.emitStatus(state, "verified", {
+    const verifiedStatus = this.emitStatus(state, "verified", {
       bytesReceived: total,
       byteLength: total,
       sha256: hash,
     });
+    await this.emitApplicationSucceeded(state, {
+      bytesReceived: total,
+      byteLength: total,
+      sha256: hash,
+    });
+    await verifiedStatus;
+    if (!state.dataChannel || state.dataChannel.readyState !== "open") {
+      this.handleTransportFailure(state, "The data channel closed before verification");
+      return;
+    }
+    state.dataChannel.send(JSON.stringify(acknowledged));
+    this.startCleanupTimer(state);
   }
 
   private async emitSignal(
@@ -1006,21 +988,38 @@ export class WebRtcPeerManager {
     });
   }
 
-  private succeed(
+  private markApplicationSucceeded(state: TransferState): void {
+    if (this.transfers.get(state.transferId) !== state) return;
+    if (state.applicationResult === "failed") return;
+    state.applicationResult = "succeeded";
+  }
+
+  private async emitApplicationSucceeded(
     state: TransferState,
     details: Record<string, unknown>,
-  ): void {
+  ): Promise<void> {
     if (this.transfers.get(state.transferId) !== state) return;
+    if (
+      state.applicationResult !== "succeeded" ||
+      state.succeededStatusEmitted
+    ) {
+      return;
+    }
+    state.succeededStatusEmitted = true;
     state.state = "succeeded";
-    void this.emitStatus(state, "succeeded", {
+    await this.emitStatus(state, "succeeded", {
       ...details,
       finishedAt: this.dependencies.now().toISOString(),
     } as Partial<DirectManagerEvent & { kind: "status" }>);
-    this.cleanup(state);
   }
 
   private cancelState(state: TransferState, reason: string): void {
     if (this.transfers.get(state.transferId) !== state) return;
+    if (state.applicationResult === "succeeded") {
+      this.cleanup(state);
+      return;
+    }
+    state.applicationResult = "failed";
     state.state = "cancelled";
     void this.emitStatus(state, "cancelled", {
       error: reason,
@@ -1031,12 +1030,42 @@ export class WebRtcPeerManager {
 
   private fail(state: TransferState, reason: string): void {
     if (this.transfers.get(state.transferId) !== state) return;
+    if (state.applicationResult === "succeeded") {
+      this.cleanup(state);
+      return;
+    }
+    if (state.applicationResult === "failed") {
+      this.cleanup(state);
+      return;
+    }
+    state.applicationResult = "failed";
     state.state = "failed";
     void this.emitStatus(state, "failed", {
       error: reason,
       finishedAt: this.dependencies.now().toISOString(),
     });
     this.cleanup(state);
+  }
+
+  private handleTransportFailure(state: TransferState, reason: string): void {
+    if (state.applicationResult === "succeeded") {
+      this.cleanup(state);
+      return;
+    }
+    this.fail(state, reason);
+  }
+
+  private startCleanupTimer(state: TransferState): void {
+    if (this.transfers.get(state.transferId) !== state) return;
+    if (state.transferTimer !== undefined) {
+      clearTimeout(state.transferTimer);
+      state.transferTimer = undefined;
+    }
+    if (state.cleanupTimer !== undefined) clearTimeout(state.cleanupTimer);
+    state.cleanupTimer = setTimeout(
+      () => this.cleanup(state),
+      this.dependencies.cleanupTimeoutMs,
+    );
   }
 
   private clearConnectionTimer(state: TransferState): void {
@@ -1050,6 +1079,9 @@ export class WebRtcPeerManager {
     if (this.transfers.get(state.transferId) !== state) return;
     this.clearConnectionTimer(state);
     if (state.transferTimer !== undefined) clearTimeout(state.transferTimer);
+    if (state.cleanupTimer !== undefined) clearTimeout(state.cleanupTimer);
+    state.transferTimer = undefined;
+    state.cleanupTimer = undefined;
     this.transfers.delete(state.transferId);
     try {
       state.dataChannel?.close();
