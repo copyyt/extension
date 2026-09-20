@@ -32,7 +32,10 @@ interface DataChannelLike {
   onbufferedamountlow: (() => void) | null;
   send(data: string | ArrayBuffer): void;
   close(): void;
-  addEventListener?: (type: string, listener: (...args: unknown[]) => void) => void;
+  addEventListener?: (
+    type: string,
+    listener: (...args: unknown[]) => void,
+  ) => void;
   removeEventListener?: (
     type: string,
     listener: (...args: unknown[]) => void,
@@ -46,7 +49,10 @@ interface PeerConnectionLike {
   onicecandidate: ((event: { candidate: unknown }) => void) | null;
   ondatachannel: ((event: { channel: DataChannelLike }) => void) | null;
   onconnectionstatechange: (() => void) | null;
-  createDataChannel(label: string, options?: { ordered: boolean }): DataChannelLike;
+  createDataChannel(
+    label: string,
+    options?: { ordered: boolean },
+  ): DataChannelLike;
   createOffer(): Promise<RTCSessionDescriptionInit>;
   createAnswer(): Promise<RTCSessionDescriptionInit>;
   setLocalDescription(description: RTCSessionDescriptionInit): Promise<void>;
@@ -56,7 +62,9 @@ interface PeerConnectionLike {
 }
 
 export interface DirectPeerManagerDependencies {
-  peerConnectionFactory?: (configuration: RTCConfiguration) => PeerConnectionLike;
+  peerConnectionFactory?: (
+    configuration: RTCConfiguration,
+  ) => PeerConnectionLike;
   emit(event: DirectManagerEvent): Promise<void> | void;
   now?: () => Date;
   chunkSize?: number;
@@ -82,6 +90,7 @@ interface TransferState {
   remoteDescriptionSet: boolean;
   createdAt: number;
   state: DirectTransferState;
+  completionPhase: CompletionPhase;
   connectionTimer?: ReturnType<typeof setTimeout>;
   transferTimer?: ReturnType<typeof setTimeout>;
   testBytes?: Uint8Array;
@@ -94,6 +103,13 @@ interface TransferState {
   receivedStart?: boolean;
   receivedEnd?: boolean;
 }
+
+type CompletionPhase =
+  | "transferring"
+  | "awaiting-verified"
+  | "awaiting-verified-ack"
+  | "awaiting-complete"
+  | "awaiting-remote-close";
 
 interface PendingIceQueue {
   sourceDeviceId: string;
@@ -123,6 +139,16 @@ interface ControlVerified {
   sha256: string;
 }
 
+interface ControlVerifiedAck {
+  type: "verified-ack";
+  transferId: string;
+}
+
+interface ControlComplete {
+  type: "complete";
+  transferId: string;
+}
+
 function isControlObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
@@ -131,6 +157,7 @@ function isStartControl(value: unknown): value is ControlStart {
   if (!isControlObject(value)) return false;
   const candidate = value as Partial<ControlStart>;
   return (
+    Object.keys(value).length === 6 &&
     candidate.type === "start" &&
     typeof candidate.transferId === "string" &&
     Number.isSafeInteger(candidate.byteLength) &&
@@ -147,19 +174,44 @@ function isStartControl(value: unknown): value is ControlStart {
 function isEndControl(value: unknown): value is ControlEnd {
   return (
     isControlObject(value) &&
+    Object.keys(value).length === 2 &&
     value.type === "end" &&
     typeof value.transferId === "string"
   );
 }
 
 function isVerifiedControl(value: unknown): value is ControlVerified {
+  if (!isControlObject(value)) return false;
+  const candidate = value as Partial<ControlVerified>;
   return (
-    isControlObject(value) &&
-    value.type === "verified" &&
-    typeof value.transferId === "string" &&
-    Number.isSafeInteger(value.byteLength) &&
-    typeof value.sha256 === "string" &&
-    /^[0-9a-f]{64}$/.test(value.sha256)
+    Object.keys(value).length === 4 &&
+    candidate.type === "verified" &&
+    typeof candidate.transferId === "string" &&
+    Number.isSafeInteger(candidate.byteLength) &&
+    (candidate.byteLength as number) > 0 &&
+    (candidate.byteLength as number) <= DIRECT_MAX_TEST_PAYLOAD_BYTES &&
+    typeof candidate.sha256 === "string" &&
+    /^[0-9a-f]{64}$/.test(candidate.sha256)
+  );
+}
+
+function isVerifiedAckControl(value: unknown): value is ControlVerifiedAck {
+  if (!isControlObject(value)) return false;
+  const candidate = value as Partial<ControlVerifiedAck>;
+  return (
+    Object.keys(value).length === 2 &&
+    candidate.type === "verified-ack" &&
+    typeof candidate.transferId === "string"
+  );
+}
+
+function isCompleteControl(value: unknown): value is ControlComplete {
+  if (!isControlObject(value)) return false;
+  const candidate = value as Partial<ControlComplete>;
+  return (
+    Object.keys(value).length === 2 &&
+    candidate.type === "complete" &&
+    typeof candidate.transferId === "string"
   );
 }
 
@@ -167,7 +219,10 @@ function asArrayBuffer(value: unknown): ArrayBuffer | null {
   if (value instanceof ArrayBuffer) return value;
   if (ArrayBuffer.isView(value)) {
     const view = value as ArrayBufferView;
-    return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength) as ArrayBuffer;
+    return view.buffer.slice(
+      view.byteOffset,
+      view.byteOffset + view.byteLength,
+    ) as ArrayBuffer;
   }
   return null;
 }
@@ -181,7 +236,8 @@ function candidateFromEvent(value: unknown): DirectIceCandidate | null {
     usernameFragment?: unknown;
     toJSON?: () => unknown;
   };
-  const json = typeof candidate.toJSON === "function" ? candidate.toJSON() : value;
+  const json =
+    typeof candidate.toJSON === "function" ? candidate.toJSON() : value;
   if (!isDirectIceCandidate(json)) return null;
   return {
     candidate: json.candidate,
@@ -238,7 +294,9 @@ export class WebRtcPeerManager {
     transferId: string;
     remoteDeviceId: string;
   }): Promise<void> {
-    if (this.occupiedTransferSlots() >= this.dependencies.maxConcurrentTransfers) {
+    if (
+      this.occupiedTransferSlots() >= this.dependencies.maxConcurrentTransfers
+    ) {
       throw new DirectTransportError(
         "The maximum number of direct transfers is already active",
       );
@@ -290,7 +348,9 @@ export class WebRtcPeerManager {
     }
   }
 
-  private async handleSignalInternal(signal: DirectSignalDelivery): Promise<void> {
+  private async handleSignalInternal(
+    signal: DirectSignalDelivery,
+  ): Promise<void> {
     if (signal.kind === "cancel") {
       const state = this.transfers.get(signal.transferId);
       if (state && state.remoteDeviceId !== signal.sourceDeviceId) {
@@ -322,22 +382,36 @@ export class WebRtcPeerManager {
     }
 
     const state = this.transfers.get(signal.transferId);
-    if (!state || state.role !== "initiator" || state.remoteDeviceId !== signal.sourceDeviceId) {
-      throw new DirectTransportError("The direct answer does not match an active transfer");
+    if (
+      !state ||
+      state.role !== "initiator" ||
+      state.remoteDeviceId !== signal.sourceDeviceId
+    ) {
+      throw new DirectTransportError(
+        "The direct answer does not match an active transfer",
+      );
     }
     if (typeof signal.sdp !== "string" || signal.sdp.length === 0) {
       throw new DirectTransportError("The direct answer is missing SDP");
     }
-    await state.peerConnection.setRemoteDescription({ type: "answer", sdp: signal.sdp });
+    await state.peerConnection.setRemoteDescription({
+      type: "answer",
+      sdp: signal.sdp,
+    });
     state.remoteDescriptionSet = true;
     await this.flushCandidates(state);
   }
 
-  async cancelTransfer(transferId: string, reason = "Cancelled"): Promise<void> {
+  async cancelTransfer(
+    transferId: string,
+    reason = "Cancelled",
+  ): Promise<void> {
     const state = this.transfers.get(transferId);
     this.discardPendingCandidates(transferId);
     if (!state) return;
-    await this.emitSignal(state, { kind: "cancel", reason }).catch(() => undefined);
+    await this.emitSignal(state, { kind: "cancel", reason }).catch(
+      () => undefined,
+    );
     this.cancelState(state, reason);
   }
 
@@ -370,6 +444,7 @@ export class WebRtcPeerManager {
       remoteDescriptionSet: false,
       createdAt: this.dependencies.now().getTime(),
       state: "connecting",
+      completionPhase: "transferring",
     };
     this.transfers.set(transferId, state);
     peerConnection.onicecandidate = (event) => {
@@ -394,6 +469,13 @@ export class WebRtcPeerManager {
         connectionState === "closed" ||
         connectionState === "disconnected"
       ) {
+        if (
+          state.role === "responder" &&
+          state.completionPhase === "awaiting-remote-close"
+        ) {
+          this.succeed(state, this.verificationDetails(state));
+          return;
+        }
         this.fail(state, `Peer connection ${connectionState}`);
       }
     };
@@ -408,8 +490,13 @@ export class WebRtcPeerManager {
   private async handleOffer(signal: DirectSignalDelivery): Promise<void> {
     let state = this.transfers.get(signal.transferId);
     if (state) {
-      if (state.role !== "responder" || state.remoteDeviceId !== signal.sourceDeviceId) {
-        throw new DirectTransportError("The direct offer conflicts with an active transfer");
+      if (
+        state.role !== "responder" ||
+        state.remoteDeviceId !== signal.sourceDeviceId
+      ) {
+        throw new DirectTransportError(
+          "The direct offer conflicts with an active transfer",
+        );
       }
     } else {
       const pending = this.pendingCandidates.get(signal.transferId);
@@ -435,7 +522,10 @@ export class WebRtcPeerManager {
     if (typeof signal.sdp !== "string" || signal.sdp.length === 0) {
       throw new DirectTransportError("The direct offer is missing SDP");
     }
-    await state.peerConnection.setRemoteDescription({ type: "offer", sdp: signal.sdp });
+    await state.peerConnection.setRemoteDescription({
+      type: "offer",
+      sdp: signal.sdp,
+    });
     state.remoteDescriptionSet = true;
     await this.flushCandidates(state);
     const answer = await state.peerConnection.createAnswer();
@@ -453,7 +543,10 @@ export class WebRtcPeerManager {
     const state = this.transfers.get(signal.transferId);
     if (!state) {
       const pending = this.pendingCandidates.get(signal.transferId);
-      if (!pending && this.occupiedTransferSlots() >= this.dependencies.maxConcurrentTransfers) {
+      if (
+        !pending &&
+        this.occupiedTransferSlots() >= this.dependencies.maxConcurrentTransfers
+      ) {
         throw new DirectTransportError(
           "The maximum number of direct transfers is already active",
         );
@@ -464,7 +557,9 @@ export class WebRtcPeerManager {
         );
       }
       if (pending && pending.candidates.length >= DIRECT_MAX_ICE_CANDIDATES) {
-        throw new DirectTransportError("Too many ICE candidates for the transfer");
+        throw new DirectTransportError(
+          "Too many ICE candidates for the transfer",
+        );
       }
       if (pending) {
         pending.candidates.push(signal.candidate);
@@ -474,7 +569,8 @@ export class WebRtcPeerManager {
         sourceDeviceId: signal.sourceDeviceId,
         candidates: [signal.candidate],
         expiresAt:
-          this.dependencies.now().getTime() + this.dependencies.connectionTimeoutMs,
+          this.dependencies.now().getTime() +
+          this.dependencies.connectionTimeoutMs,
       };
       queue.timer = setTimeout(
         () => this.expirePendingCandidates(signal.transferId, queue),
@@ -484,11 +580,15 @@ export class WebRtcPeerManager {
       return;
     }
     if (state.remoteDeviceId !== signal.sourceDeviceId) {
-      throw new DirectTransportError("The ICE candidate source does not match the transfer");
+      throw new DirectTransportError(
+        "The ICE candidate source does not match the transfer",
+      );
     }
     if (!state.remoteDescriptionSet) {
       if (state.pendingCandidates.length >= DIRECT_MAX_ICE_CANDIDATES) {
-        throw new DirectTransportError("Too many ICE candidates for the transfer");
+        throw new DirectTransportError(
+          "Too many ICE candidates for the transfer",
+        );
       }
       state.pendingCandidates.push(signal.candidate);
       return;
@@ -543,7 +643,10 @@ export class WebRtcPeerManager {
     }
   }
 
-  private attachDataChannel(state: TransferState, channel: DataChannelLike): void {
+  private attachDataChannel(
+    state: TransferState,
+    channel: DataChannelLike,
+  ): void {
     state.dataChannel = channel;
     channel.binaryType = "arraybuffer";
     channel.bufferedAmountLowThreshold = DIRECT_BUFFER_LOW_THRESHOLD;
@@ -560,12 +663,22 @@ export class WebRtcPeerManager {
     };
     channel.onmessage = (event) => {
       void this.handleDataMessage(state, event.data).catch((error: unknown) => {
-        this.fail(state, error instanceof Error ? error.message : "Data channel failed");
+        this.fail(
+          state,
+          error instanceof Error ? error.message : "Data channel failed",
+        );
       });
     };
     channel.onerror = () => this.fail(state, "Data channel error");
     channel.onclose = () => {
       if (this.transfers.get(state.transferId) === state) {
+        if (
+          state.role === "responder" &&
+          state.completionPhase === "awaiting-remote-close"
+        ) {
+          this.succeed(state, this.verificationDetails(state));
+          return;
+        }
         this.fail(state, "Data channel closed before verification");
       }
     };
@@ -574,11 +687,16 @@ export class WebRtcPeerManager {
   private async sendTestPayload(state: TransferState): Promise<void> {
     if (!state.dataChannel || state.dataChannel.readyState !== "open") return;
     try {
-      const bytes = deterministicTestBytes(state.transferId, DIRECT_TEST_PAYLOAD_BYTES);
+      const bytes = deterministicTestBytes(
+        state.transferId,
+        DIRECT_TEST_PAYLOAD_BYTES,
+      );
       state.testBytes = bytes;
       state.expectedByteLength = bytes.byteLength;
       state.expectedSha256 = await sha256Hex(bytes);
-      const chunkCount = Math.ceil(bytes.byteLength / this.dependencies.chunkSize);
+      const chunkCount = Math.ceil(
+        bytes.byteLength / this.dependencies.chunkSize,
+      );
       const start: ControlStart = {
         type: "start",
         transferId: state.transferId,
@@ -590,7 +708,11 @@ export class WebRtcPeerManager {
       state.dataChannel.send(JSON.stringify(start));
       state.state = "sending";
       await this.emitStatus(state, "sending", { byteLength: bytes.byteLength });
-      for (let offset = 0; offset < bytes.byteLength; offset += this.dependencies.chunkSize) {
+      for (
+        let offset = 0;
+        offset < bytes.byteLength;
+        offset += this.dependencies.chunkSize
+      ) {
         await this.waitForBufferLow(state.dataChannel);
         if (state.dataChannel.readyState !== "open") {
           throw new DirectTransportError("Data channel closed during sending");
@@ -607,8 +729,12 @@ export class WebRtcPeerManager {
       }
       const end: ControlEnd = { type: "end", transferId: state.transferId };
       state.dataChannel.send(JSON.stringify(end));
+      state.completionPhase = "awaiting-verified";
     } catch (error) {
-      this.fail(state, error instanceof Error ? error.message : "Direct send failed");
+      this.fail(
+        state,
+        error instanceof Error ? error.message : "Direct send failed",
+      );
     }
   }
 
@@ -632,15 +758,23 @@ export class WebRtcPeerManager {
       };
       channel.onclose = () => {
         previousClose?.();
-        finish(new DirectTransportError("Data channel closed while backpressured"));
+        finish(
+          new DirectTransportError("Data channel closed while backpressured"),
+        );
       };
       if (channel.readyState !== "open") {
-        finish(new DirectTransportError("Data channel closed while backpressured"));
+        finish(
+          new DirectTransportError("Data channel closed while backpressured"),
+        );
       }
     });
   }
 
-  private async handleDataMessage(state: TransferState, raw: unknown): Promise<void> {
+  private async handleDataMessage(
+    state: TransferState,
+    raw: unknown,
+  ): Promise<void> {
+    if (this.transfers.get(state.transferId) !== state) return;
     if (typeof raw === "string") {
       let parsed: unknown;
       try {
@@ -651,11 +785,14 @@ export class WebRtcPeerManager {
       if (isVerifiedControl(parsed)) {
         if (
           state.role !== "initiator" ||
+          state.completionPhase !== "awaiting-verified" ||
           parsed.transferId !== state.transferId ||
           parsed.byteLength !== state.expectedByteLength ||
           parsed.sha256 !== state.expectedSha256
         ) {
-          throw new DirectTransportError("The direct verification acknowledgement is invalid");
+          throw new DirectTransportError(
+            "The direct verification acknowledgement is invalid",
+          );
         }
         state.state = "verified";
         await this.emitStatus(state, "verified", {
@@ -663,11 +800,53 @@ export class WebRtcPeerManager {
           byteLength: parsed.byteLength,
           sha256: parsed.sha256,
         });
-        this.succeed(state, {
-          bytesReceived: parsed.byteLength,
-          byteLength: parsed.byteLength,
-          sha256: parsed.sha256,
-        });
+        const acknowledged: ControlVerifiedAck = {
+          type: "verified-ack",
+          transferId: state.transferId,
+        };
+        if (!state.dataChannel || state.dataChannel.readyState !== "open") {
+          throw new DirectTransportError(
+            "The data channel closed before verification acknowledgement",
+          );
+        }
+        state.dataChannel.send(JSON.stringify(acknowledged));
+        state.completionPhase = "awaiting-complete";
+        return;
+      }
+      if (isVerifiedAckControl(parsed)) {
+        if (
+          state.role !== "responder" ||
+          state.completionPhase !== "awaiting-verified-ack" ||
+          parsed.transferId !== state.transferId
+        ) {
+          throw new DirectTransportError(
+            "The direct verification acknowledgement is invalid",
+          );
+        }
+        const complete: ControlComplete = {
+          type: "complete",
+          transferId: state.transferId,
+        };
+        if (!state.dataChannel || state.dataChannel.readyState !== "open") {
+          throw new DirectTransportError(
+            "The data channel closed before completion",
+          );
+        }
+        state.dataChannel.send(JSON.stringify(complete));
+        state.completionPhase = "awaiting-remote-close";
+        return;
+      }
+      if (isCompleteControl(parsed)) {
+        if (
+          state.role !== "initiator" ||
+          state.completionPhase !== "awaiting-complete" ||
+          parsed.transferId !== state.transferId
+        ) {
+          throw new DirectTransportError(
+            "The direct completion acknowledgement is invalid",
+          );
+        }
+        this.succeed(state, this.verificationDetails(state));
         return;
       }
       if (!isStartControl(parsed)) {
@@ -677,7 +856,10 @@ export class WebRtcPeerManager {
         }
         throw new DirectTransportError("The direct control frame is invalid");
       }
-      if (state.role !== "responder" || parsed.transferId !== state.transferId) {
+      if (
+        state.role !== "responder" ||
+        parsed.transferId !== state.transferId
+      ) {
         throw new DirectTransportError("The direct start frame is invalid");
       }
       if (state.receivedStart) {
@@ -697,19 +879,28 @@ export class WebRtcPeerManager {
       state.receivedByteLength = 0;
       state.receivedStart = true;
       state.state = "receiving";
-      await this.emitStatus(state, "receiving", { byteLength: parsed.byteLength });
+      await this.emitStatus(state, "receiving", {
+        byteLength: parsed.byteLength,
+      });
       return;
     }
     const chunk = asArrayBuffer(raw);
     if (!chunk || !state.receivedStart || state.receivedChunks === undefined) {
-      throw new DirectTransportError("The direct binary chunk arrived out of order");
+      throw new DirectTransportError(
+        "The direct binary chunk arrived out of order",
+      );
     }
     if (chunk.byteLength > this.dependencies.chunkSize) {
       throw new DirectTransportError("The direct binary chunk is too large");
     }
     const nextByteLength = (state.receivedByteLength ?? 0) + chunk.byteLength;
-    if (nextByteLength > (state.expectedByteLength ?? DIRECT_MAX_TEST_PAYLOAD_BYTES)) {
-      throw new DirectTransportError("The direct transfer exceeded its declared length");
+    if (
+      nextByteLength >
+      (state.expectedByteLength ?? DIRECT_MAX_TEST_PAYLOAD_BYTES)
+    ) {
+      throw new DirectTransportError(
+        "The direct transfer exceeded its declared length",
+      );
     }
     state.receivedChunks.push(chunk);
     state.receivedChunkCount = (state.receivedChunkCount ?? 0) + 1;
@@ -720,7 +911,10 @@ export class WebRtcPeerManager {
     });
   }
 
-  private async finishReceive(state: TransferState, control: ControlEnd): Promise<void> {
+  private async finishReceive(
+    state: TransferState,
+    control: ControlEnd,
+  ): Promise<void> {
     if (
       state.role !== "responder" ||
       !state.receivedStart ||
@@ -740,7 +934,9 @@ export class WebRtcPeerManager {
       offset += chunk.byteLength;
     }
     if (offset !== state.expectedByteLength) {
-      throw new DirectTransportError("The direct byte length verification failed");
+      throw new DirectTransportError(
+        "The direct byte length verification failed",
+      );
     }
     const hash = await sha256Hex(bytes);
     if (hash !== state.expectedSha256) {
@@ -753,25 +949,38 @@ export class WebRtcPeerManager {
       sha256: hash,
     };
     if (!state.dataChannel || state.dataChannel.readyState !== "open") {
-      throw new DirectTransportError("The data channel closed before verification");
+      throw new DirectTransportError(
+        "The data channel closed before verification",
+      );
     }
     state.dataChannel.send(JSON.stringify(acknowledged));
+    state.completionPhase = "awaiting-verified-ack";
     state.state = "verified";
     await this.emitStatus(state, "verified", {
       bytesReceived: total,
       byteLength: total,
       sha256: hash,
     });
-    this.succeed(state, { bytesReceived: total, byteLength: total, sha256: hash });
   }
 
-  private async emitSignal(state: TransferState, signal: DirectSignalBody): Promise<void> {
+  private async emitSignal(
+    state: TransferState,
+    signal: DirectSignalBody,
+  ): Promise<void> {
     await this.dependencies.emit({
       kind: "signal",
       transferId: state.transferId,
       remoteDeviceId: state.remoteDeviceId,
       signal,
     });
+  }
+
+  private verificationDetails(state: TransferState): Record<string, unknown> {
+    return {
+      bytesReceived: state.expectedByteLength,
+      byteLength: state.expectedByteLength,
+      sha256: state.expectedSha256,
+    };
   }
 
   private async emitStatus(
@@ -789,7 +998,10 @@ export class WebRtcPeerManager {
     });
   }
 
-  private succeed(state: TransferState, details: Record<string, unknown>): void {
+  private succeed(
+    state: TransferState,
+    details: Record<string, unknown>,
+  ): void {
     if (this.transfers.get(state.transferId) !== state) return;
     state.state = "succeeded";
     void this.emitStatus(state, "succeeded", {

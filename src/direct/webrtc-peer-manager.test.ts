@@ -34,6 +34,9 @@ class FakeChannel implements DataChannelLike {
   remote: FakeChannel | null = null;
   sent: Array<string | ArrayBuffer> = [];
   backpressureWaits = 0;
+  deferredControlTypes = new Set<string>();
+  deferredControls: string[] = [];
+  closeCalls = 0;
 
   constructor(label: string) {
     this.label = label;
@@ -46,6 +49,13 @@ class FakeChannel implements DataChannelLike {
 
   send(data: string | ArrayBuffer): void {
     this.sent.push(data);
+    if (typeof data === "string") {
+      const type = (JSON.parse(data) as { type?: unknown }).type;
+      if (typeof type === "string" && this.deferredControlTypes.has(type)) {
+        this.deferredControls.push(data);
+        return;
+      }
+    }
     if (data instanceof ArrayBuffer && this.sent.length === 2) {
       this.bufferedAmount = DIRECT_BUFFER_HIGH_WATER + 1;
       this.backpressureWaits += 1;
@@ -56,15 +66,29 @@ class FakeChannel implements DataChannelLike {
     }
     const remote = this.remote;
     if (remote) {
-      const delivered =
-        typeof data === "string" ? data : data.slice(0);
+      const delivered = typeof data === "string" ? data : data.slice(0);
       queueMicrotask(() => remote.onmessage?.({ data: delivered }));
     }
   }
 
   close(): void {
+    if (this.readyState === "closed") return;
+    this.closeCalls += 1;
     this.readyState = "closed";
     this.onclose?.();
+    if (this.remote && this.remote.readyState !== "closed") {
+      this.remote.close();
+    }
+  }
+
+  releaseDeferredControl(type: string): void {
+    const index = this.deferredControls.findIndex(
+      (control) => (JSON.parse(control) as { type?: unknown }).type === type,
+    );
+    assert.notEqual(index, -1);
+    const control = this.deferredControls.splice(index, 1)[0];
+    const remote = this.remote;
+    if (remote) queueMicrotask(() => remote.onmessage?.({ data: control }));
   }
 }
 
@@ -73,14 +97,19 @@ class FakePeerConnection implements PeerConnectionLike {
   remoteDescription: RTCSessionDescriptionInit | null = null;
   connectionState = "new";
   onicecandidate: ((event: { candidate: unknown }) => void) | null = null;
-  private onDataChannel: ((event: { channel: DataChannelLike }) => void) | null = null;
+  private onDataChannel:
+    | ((event: { channel: DataChannelLike }) => void)
+    | null = null;
   pendingRemoteChannel: FakeChannel | null = null;
   receivedDataChannel: FakeChannel | null = null;
   onconnectionstatechange: (() => void) | null = null;
   dataChannel: FakeChannel | null = null;
   addedIceCandidates: unknown[] = [];
+  closeCalls = 0;
 
-  set ondatachannel(listener: ((event: { channel: DataChannelLike }) => void) | null) {
+  set ondatachannel(
+    listener: ((event: { channel: DataChannelLike }) => void) | null,
+  ) {
     this.onDataChannel = listener;
     if (listener && this.pendingRemoteChannel) {
       this.receivedDataChannel = this.pendingRemoteChannel;
@@ -106,11 +135,15 @@ class FakePeerConnection implements PeerConnectionLike {
     return { type: "answer", sdp: "answer-sdp" };
   }
 
-  async setLocalDescription(description: RTCSessionDescriptionInit): Promise<void> {
+  async setLocalDescription(
+    description: RTCSessionDescriptionInit,
+  ): Promise<void> {
     this.localDescription = description;
   }
 
-  async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
+  async setRemoteDescription(
+    description: RTCSessionDescriptionInit,
+  ): Promise<void> {
     this.remoteDescription = description;
   }
 
@@ -120,8 +153,143 @@ class FakePeerConnection implements PeerConnectionLike {
   }
 
   close(): void {
+    this.closeCalls += 1;
     this.connectionState = "closed";
   }
+}
+
+async function waitFor(condition: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    if (condition()) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+  assert.fail("Timed out waiting for direct transfer condition");
+}
+
+async function createConnectedTransfer(
+  options: {
+    deferVerified?: boolean;
+    deferComplete?: boolean;
+    transferTimeoutMs?: number;
+  } = {},
+): Promise<{
+  managerA: WebRtcPeerManager;
+  managerB: WebRtcPeerManager;
+  initiatorEvents: DirectManagerEvent[];
+  responderEvents: DirectManagerEvent[];
+  initiatorPeer: FakePeerConnection;
+  responderPeer: FakePeerConnection;
+  initiatorChannel: FakeChannel;
+  responderChannel: FakeChannel;
+}> {
+  const initiatorEvents: DirectManagerEvent[] = [];
+  const responderEvents: DirectManagerEvent[] = [];
+  const peers: FakePeerConnection[] = [];
+  const managerA = new WebRtcPeerManager({
+    peerConnectionFactory: () => {
+      const peer = new FakePeerConnection();
+      peers.push(peer);
+      if (peers.length === 2 && peers[0]?.dataChannel) {
+        const remote = new FakeChannel(DIRECT_DATA_CHANNEL_LABEL);
+        remote.deferredControlTypes = new Set(
+          [
+            options.deferVerified ? "verified" : null,
+            options.deferComplete ? "complete" : null,
+          ].filter((type): type is string => type !== null),
+        );
+        peers[0].dataChannel.remote = remote;
+        remote.remote = peers[0].dataChannel;
+        peer.pendingRemoteChannel = remote;
+      }
+      return peer;
+    },
+    emit: (event) => {
+      initiatorEvents.push(event);
+    },
+    transferTimeoutMs: options.transferTimeoutMs,
+  });
+  const managerB = new WebRtcPeerManager({
+    peerConnectionFactory: () => {
+      const peer = new FakePeerConnection();
+      peers.push(peer);
+      if (peers.length === 2 && peers[0]?.dataChannel) {
+        const remote = new FakeChannel(DIRECT_DATA_CHANNEL_LABEL);
+        remote.deferredControlTypes = new Set(
+          [
+            options.deferVerified ? "verified" : null,
+            options.deferComplete ? "complete" : null,
+          ].filter((type): type is string => type !== null),
+        );
+        peers[0].dataChannel.remote = remote;
+        remote.remote = peers[0].dataChannel;
+        peer.pendingRemoteChannel = remote;
+      }
+      return peer;
+    },
+    emit: (event) => {
+      responderEvents.push(event);
+    },
+    transferTimeoutMs: options.transferTimeoutMs,
+  });
+
+  await managerA.startTestTransfer({
+    transferId,
+    remoteDeviceId: recipientDeviceId,
+  });
+  const offer = initiatorEvents.find(
+    (event): event is Extract<DirectManagerEvent, { kind: "signal" }> =>
+      event.kind === "signal" && event.signal.kind === "offer",
+  );
+  assert.ok(offer);
+  await managerB.handleSignal({
+    transferId,
+    sourceDeviceId,
+    sourceKeyVersion: 1,
+    kind: "offer",
+    sdp: offer.signal.sdp,
+  });
+  const answer = responderEvents.find(
+    (event): event is Extract<DirectManagerEvent, { kind: "signal" }> =>
+      event.kind === "signal" && event.signal.kind === "answer",
+  );
+  assert.ok(answer);
+  await managerA.handleSignal({
+    transferId,
+    sourceDeviceId: recipientDeviceId,
+    sourceKeyVersion: 1,
+    kind: "answer",
+    sdp: answer.signal.sdp,
+  });
+
+  const initiatorPeer = peers[0];
+  const responderPeer = peers[1];
+  const initiatorChannel = initiatorPeer?.dataChannel;
+  const responderChannel = responderPeer?.receivedDataChannel;
+  assert.ok(initiatorPeer);
+  assert.ok(responderPeer);
+  assert.ok(initiatorChannel);
+  assert.ok(responderChannel);
+  responderChannel.open();
+  initiatorChannel.open();
+  return {
+    managerA,
+    managerB,
+    initiatorEvents,
+    responderEvents,
+    initiatorPeer,
+    responderPeer,
+    initiatorChannel,
+    responderChannel,
+  };
+}
+
+function hasStatus(
+  events: DirectManagerEvent[],
+  state: Extract<DirectManagerEvent, { kind: "status" }>["state"],
+): boolean {
+  return events.some(
+    (event) => event.kind === "status" && event.state === state,
+  );
 }
 
 test("direct test bytes are deterministic and hashable", async () => {
@@ -164,7 +332,12 @@ test("peer manager queues ICE until the offer creates its peer", async () => {
   });
   assert.equal(manager.size, 1);
   assert.equal(peers[0]?.remoteDescription?.type, "offer");
-  assert.equal(events.some((event) => event.kind === "signal" && event.signal.kind === "answer"), true);
+  assert.equal(
+    events.some(
+      (event) => event.kind === "signal" && event.signal.kind === "answer",
+    ),
+    true,
+  );
   await manager.cancelAll();
 });
 
@@ -328,7 +501,10 @@ test("peer manager chunks the 2 MiB experiment and completes with verification",
     },
   });
 
-  await managerA.startTestTransfer({ transferId, remoteDeviceId: recipientDeviceId });
+  await managerA.startTestTransfer({
+    transferId,
+    remoteDeviceId: recipientDeviceId,
+  });
   const offer = initiatorEvents.find(
     (event): event is Extract<DirectManagerEvent, { kind: "signal" }> =>
       event.kind === "signal" && event.signal.kind === "offer",
@@ -370,11 +546,125 @@ test("peer manager chunks the 2 MiB experiment and completes with verification",
   const binaryChunks = initiatorChannel.sent.filter(
     (message): message is ArrayBuffer => message instanceof ArrayBuffer,
   );
-  assert.equal(binaryChunks.length, Math.ceil(DIRECT_TEST_PAYLOAD_BYTES / DIRECT_CHUNK_SIZE));
-  assert.ok(binaryChunks.every((chunk) => chunk.byteLength <= DIRECT_CHUNK_SIZE));
+  assert.equal(
+    binaryChunks.length,
+    Math.ceil(DIRECT_TEST_PAYLOAD_BYTES / DIRECT_CHUNK_SIZE),
+  );
+  assert.ok(
+    binaryChunks.every((chunk) => chunk.byteLength <= DIRECT_CHUNK_SIZE),
+  );
   assert.ok(initiatorChannel.backpressureWaits > 0);
   assert.equal(managerA.size, 0);
   assert.equal(managerB.size, 0);
+});
+
+test("completion handshake keeps verified responders alive until expected close", async () => {
+  const harness = await createConnectedTransfer({
+    deferVerified: true,
+    deferComplete: true,
+  });
+
+  await waitFor(() => hasStatus(harness.responderEvents, "verified"));
+  assert.equal(harness.managerB.size, 1);
+  assert.equal(harness.responderChannel.readyState, "open");
+  assert.notEqual(harness.responderPeer.connectionState, "closed");
+  assert.equal(hasStatus(harness.responderEvents, "succeeded"), false);
+  assert.equal(harness.responderChannel.closeCalls, 0);
+  assert.equal(harness.responderPeer.closeCalls, 0);
+
+  harness.responderChannel.releaseDeferredControl("verified");
+  await waitFor(() =>
+    harness.initiatorChannel.sent.some(
+      (message) =>
+        typeof message === "string" &&
+        (JSON.parse(message) as { type?: unknown }).type === "verified-ack",
+    ),
+  );
+  await waitFor(() =>
+    harness.responderChannel.deferredControls.some(
+      (message) =>
+        (JSON.parse(message) as { type?: unknown }).type === "complete",
+    ),
+  );
+  assert.equal(harness.managerA.size, 1);
+  assert.equal(hasStatus(harness.initiatorEvents, "succeeded"), false);
+
+  harness.responderChannel.releaseDeferredControl("complete");
+  await waitFor(
+    () => harness.managerA.size === 0 && harness.managerB.size === 0,
+  );
+  assert.equal(hasStatus(harness.initiatorEvents, "succeeded"), true);
+  assert.equal(hasStatus(harness.responderEvents, "succeeded"), true);
+  assert.equal(hasStatus(harness.initiatorEvents, "failed"), false);
+  assert.equal(hasStatus(harness.responderEvents, "failed"), false);
+});
+
+test("early receiver close before verified remains a transfer failure", async () => {
+  const harness = await createConnectedTransfer({ deferVerified: true });
+  await waitFor(() => hasStatus(harness.responderEvents, "verified"));
+
+  harness.responderChannel.close();
+  await waitFor(
+    () => harness.managerA.size === 0 && harness.managerB.size === 0,
+  );
+  assert.equal(hasStatus(harness.initiatorEvents, "failed"), true);
+  assert.equal(hasStatus(harness.responderEvents, "failed"), true);
+  assert.equal(hasStatus(harness.responderEvents, "succeeded"), false);
+});
+
+test("initiator close before verified acknowledgement remains a failure", async () => {
+  const harness = await createConnectedTransfer({ deferVerified: true });
+  await waitFor(() => hasStatus(harness.responderEvents, "verified"));
+
+  harness.initiatorChannel.close();
+  await waitFor(
+    () => harness.managerA.size === 0 && harness.managerB.size === 0,
+  );
+  assert.equal(hasStatus(harness.initiatorEvents, "failed"), true);
+  assert.equal(hasStatus(harness.responderEvents, "failed"), true);
+  assert.equal(hasStatus(harness.responderEvents, "succeeded"), false);
+});
+
+test("responder close before complete remains a transfer failure", async () => {
+  const harness = await createConnectedTransfer({ deferVerified: true });
+  await waitFor(() => hasStatus(harness.responderEvents, "verified"));
+
+  harness.responderChannel.close();
+  await waitFor(
+    () => harness.managerA.size === 0 && harness.managerB.size === 0,
+  );
+  assert.equal(hasStatus(harness.initiatorEvents, "failed"), true);
+  assert.equal(hasStatus(harness.responderEvents, "failed"), true);
+});
+
+test("terminal handshake timeout cleans up when verified acknowledgement never arrives", async () => {
+  const harness = await createConnectedTransfer({
+    deferVerified: true,
+    transferTimeoutMs: 250,
+  });
+  await waitFor(() => hasStatus(harness.responderEvents, "verified"));
+  await waitFor(
+    () => harness.managerA.size === 0 && harness.managerB.size === 0,
+  );
+  assert.equal(hasStatus(harness.responderEvents, "failed"), true);
+  assert.equal(hasStatus(harness.initiatorEvents, "failed"), true);
+});
+
+test("terminal handshake timeout cleans up when complete never arrives", async () => {
+  const harness = await createConnectedTransfer({
+    deferComplete: true,
+    transferTimeoutMs: 250,
+  });
+  await waitFor(() =>
+    harness.responderChannel.deferredControls.some(
+      (message) =>
+        (JSON.parse(message) as { type?: unknown }).type === "complete",
+    ),
+  );
+  await waitFor(
+    () => harness.managerA.size === 0 && harness.managerB.size === 0,
+  );
+  assert.equal(hasStatus(harness.initiatorEvents, "failed"), true);
 });
 
 test("peer manager enforces the bounded concurrent transfer ceiling", async () => {
@@ -383,7 +673,10 @@ test("peer manager enforces the bounded concurrent transfer ceiling", async () =
     emit: () => undefined,
     maxConcurrentTransfers: 1,
   });
-  await manager.startTestTransfer({ transferId, remoteDeviceId: recipientDeviceId });
+  await manager.startTestTransfer({
+    transferId,
+    remoteDeviceId: recipientDeviceId,
+  });
   await assert.rejects(
     manager.startTestTransfer({
       transferId: "e0e8e38b-7e3d-4ab7-8a1a-fd0ecf32c9a0",
