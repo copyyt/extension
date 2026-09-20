@@ -464,11 +464,7 @@ export class WebRtcPeerManager {
     };
     peerConnection.onconnectionstatechange = () => {
       const connectionState = peerConnection.connectionState;
-      if (
-        connectionState === "failed" ||
-        connectionState === "closed" ||
-        connectionState === "disconnected"
-      ) {
+      if (connectionState === "closed") {
         if (
           state.role === "responder" &&
           state.completionPhase === "awaiting-remote-close"
@@ -477,6 +473,18 @@ export class WebRtcPeerManager {
           return;
         }
         this.fail(state, `Peer connection ${connectionState}`);
+        return;
+      }
+
+      if (connectionState === "failed") {
+        this.fail(state, "Peer connection failed");
+        return;
+      }
+
+      if (connectionState === "disconnected") {
+        // A disconnected peer connection may recover before the transfer
+        // timeout expires. Leave the transfer and its timers intact.
+        return;
       }
     };
     state.connectionTimer = setTimeout(

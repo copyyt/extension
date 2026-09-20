@@ -292,6 +292,15 @@ function hasStatus(
   );
 }
 
+function countStatus(
+  events: DirectManagerEvent[],
+  state: Extract<DirectManagerEvent, { kind: "status" }>["state"],
+): number {
+  return events.filter(
+    (event) => event.kind === "status" && event.state === state,
+  ).length;
+}
+
 test("direct test bytes are deterministic and hashable", async () => {
   const first = deterministicTestBytes(transferId);
   const second = deterministicTestBytes(transferId);
@@ -597,6 +606,128 @@ test("completion handshake keeps verified responders alive until expected close"
   assert.equal(hasStatus(harness.responderEvents, "succeeded"), true);
   assert.equal(hasStatus(harness.initiatorEvents, "failed"), false);
   assert.equal(hasStatus(harness.responderEvents, "failed"), false);
+});
+
+test("disconnected responder transfers remain active and recover", async () => {
+  const harness = await createConnectedTransfer({ deferComplete: true });
+  await waitFor(() =>
+    harness.responderChannel.deferredControls.some(
+      (message) =>
+        (JSON.parse(message) as { type?: unknown }).type === "complete",
+    ),
+  );
+
+  harness.responderPeer.connectionState = "disconnected";
+  harness.responderPeer.onconnectionstatechange?.();
+  assert.equal(harness.managerB.size, 1);
+  assert.equal(harness.responderChannel.readyState, "open");
+  assert.equal(harness.responderPeer.closeCalls, 0);
+  assert.equal(hasStatus(harness.responderEvents, "succeeded"), false);
+  assert.equal(hasStatus(harness.responderEvents, "failed"), false);
+
+  harness.responderPeer.connectionState = "connected";
+  harness.responderPeer.onconnectionstatechange?.();
+  assert.equal(harness.managerB.size, 1);
+  assert.equal(hasStatus(harness.responderEvents, "succeeded"), false);
+  assert.equal(hasStatus(harness.responderEvents, "failed"), false);
+
+  harness.responderChannel.releaseDeferredControl("complete");
+  await waitFor(() => harness.managerB.size === 0);
+  assert.equal(countStatus(harness.responderEvents, "succeeded"), 1);
+  assert.equal(countStatus(harness.responderEvents, "failed"), 0);
+});
+
+test("failed responder connection never masquerades as successful completion", async () => {
+  const harness = await createConnectedTransfer({ deferComplete: true });
+  await waitFor(() =>
+    harness.responderChannel.deferredControls.some(
+      (message) =>
+        (JSON.parse(message) as { type?: unknown }).type === "complete",
+    ),
+  );
+
+  harness.responderPeer.connectionState = "failed";
+  harness.responderPeer.onconnectionstatechange?.();
+  await waitFor(() => harness.managerB.size === 0);
+  assert.equal(countStatus(harness.responderEvents, "failed"), 1);
+  assert.equal(countStatus(harness.responderEvents, "succeeded"), 0);
+});
+
+test("closed responder connection succeeds only while awaiting remote close", async () => {
+  const harness = await createConnectedTransfer({ deferComplete: true });
+  await waitFor(() =>
+    harness.responderChannel.deferredControls.some(
+      (message) =>
+        (JSON.parse(message) as { type?: unknown }).type === "complete",
+    ),
+  );
+
+  harness.responderPeer.connectionState = "closed";
+  harness.responderPeer.onconnectionstatechange?.();
+  await waitFor(() => harness.managerB.size === 0);
+  assert.equal(countStatus(harness.responderEvents, "succeeded"), 1);
+  assert.equal(countStatus(harness.responderEvents, "failed"), 0);
+});
+
+test("early peer connection close remains a transfer failure", async () => {
+  const harness = await createConnectedTransfer({ deferVerified: true });
+  await waitFor(() => hasStatus(harness.responderEvents, "verified"));
+
+  harness.responderPeer.connectionState = "closed";
+  harness.responderPeer.onconnectionstatechange?.();
+  await waitFor(() => harness.managerB.size === 0);
+  assert.equal(countStatus(harness.responderEvents, "failed"), 1);
+  assert.equal(countStatus(harness.responderEvents, "succeeded"), 0);
+});
+
+test("data channel and peer close callbacks are idempotent in either order", async () => {
+  const channelFirst = await createConnectedTransfer({ deferComplete: true });
+  await waitFor(() =>
+    channelFirst.responderChannel.deferredControls.some(
+      (message) =>
+        (JSON.parse(message) as { type?: unknown }).type === "complete",
+    ),
+  );
+  channelFirst.responderChannel.close();
+  channelFirst.responderPeer.connectionState = "closed";
+  channelFirst.responderPeer.onconnectionstatechange?.();
+  await waitFor(() => channelFirst.managerB.size === 0);
+  assert.equal(countStatus(channelFirst.responderEvents, "succeeded"), 1);
+  assert.equal(countStatus(channelFirst.responderEvents, "failed"), 0);
+
+  const peerFirst = await createConnectedTransfer({ deferComplete: true });
+  await waitFor(() =>
+    peerFirst.responderChannel.deferredControls.some(
+      (message) =>
+        (JSON.parse(message) as { type?: unknown }).type === "complete",
+    ),
+  );
+  peerFirst.responderPeer.connectionState = "closed";
+  peerFirst.responderPeer.onconnectionstatechange?.();
+  await waitFor(() => peerFirst.managerB.size === 0);
+  peerFirst.responderChannel.onclose?.();
+  assert.equal(countStatus(peerFirst.responderEvents, "succeeded"), 1);
+  assert.equal(countStatus(peerFirst.responderEvents, "failed"), 0);
+});
+
+test("persistent disconnected responder transfers fail through the transfer timeout", async () => {
+  const harness = await createConnectedTransfer({
+    deferComplete: true,
+    transferTimeoutMs: 250,
+  });
+  await waitFor(() =>
+    harness.responderChannel.deferredControls.some(
+      (message) =>
+        (JSON.parse(message) as { type?: unknown }).type === "complete",
+    ),
+  );
+
+  harness.responderPeer.connectionState = "disconnected";
+  harness.responderPeer.onconnectionstatechange?.();
+  assert.equal(harness.managerB.size, 1);
+  await waitFor(() => harness.managerB.size === 0);
+  assert.equal(countStatus(harness.responderEvents, "failed"), 1);
+  assert.equal(countStatus(harness.responderEvents, "succeeded"), 0);
 });
 
 test("early receiver close before verified remains a transfer failure", async () => {
