@@ -11,6 +11,7 @@ import {
   DIRECT_TEST_PAYLOAD_BYTES,
   DIRECT_CLIPBOARD_PROTOCOL,
   DIRECT_APPLICATION_MAX_FRAME_BYTES,
+  DIRECT_APPLICATION_FRAME_INDEX_BYTES,
   DIRECT_PROGRESS_BYTES,
   DIRECT_PROGRESS_INTERVAL_MS,
   DIRECT_TRANSFER_TIMEOUT_MS,
@@ -118,6 +119,7 @@ interface TransferState {
   expectedByteLength?: number;
   expectedSha256?: string;
   expectedClipboardPlaintextByteLength?: number;
+  expectedClipboardChunkPlaintextSize?: number;
   clipboardExpiresAtMs?: number;
   receivedChunks?: ArrayBuffer[];
   expectedChunkCount?: number;
@@ -483,6 +485,8 @@ export class WebRtcPeerManager {
     state.applicationMode = "clipboard";
     state.clipboardExpiresAtMs = clipboardExpiresAtMs;
     state.expectedClipboardPlaintextByteLength = manifest.plaintextByteLength;
+    state.expectedClipboardChunkPlaintextSize = manifest.chunkPlaintextSize;
+    state.expectedChunkCount = manifest.chunkCount;
     state.clipboardPackage = {
       manifest: input.manifest,
       encryptedChunks: [...input.encryptedChunks],
@@ -1010,13 +1014,10 @@ export class WebRtcPeerManager {
     try {
       state.dataChannel.send(packageToSend.manifest);
       state.state = "sending";
-      const totalBytes = packageToSend.encryptedChunks.reduce((total, chunk) => {
-        try {
-          return total + base64ToBytes(chunk).byteLength;
-        } catch {
-          throw new DirectTransportError("The direct clipboard chunk is invalid");
-        }
-      }, 0);
+      const totalBytes = state.expectedClipboardPlaintextByteLength;
+      if (totalBytes === undefined) {
+        throw new DirectTransportError("The direct clipboard manifest is invalid");
+      }
       let sentBytes = 0;
       await this.emitStatus(state, "sending", { byteLength: totalBytes });
       this.noteProgress(state, 0);
@@ -1035,7 +1036,7 @@ export class WebRtcPeerManager {
           throw new DirectTransportError("The direct clipboard chunk is too large");
         }
         state.dataChannel.send(bytes.buffer);
-        sentBytes += bytes.byteLength;
+        sentBytes += this.clipboardChunkPlaintextContribution(state, index);
         this.queueProgress(state, "sending", {
           bytesSent: sentBytes,
           byteLength: totalBytes,
@@ -1188,6 +1189,7 @@ export class WebRtcPeerManager {
         state.clipboardExpiresAtMs = expiresAtMs;
         state.expectedClipboardPlaintextByteLength =
           manifest.plaintextByteLength;
+        state.expectedClipboardChunkPlaintextSize = manifest.chunkPlaintextSize;
         state.receivedByteLength = 0;
         state.expectedChunkCount = manifest.chunkCount;
         state.receivedChunkCount = 0;
@@ -1310,12 +1312,27 @@ export class WebRtcPeerManager {
           "The direct clipboard transfer has an extra chunk",
         );
       }
+      const chunkIndex = state.receivedChunkCount ?? 0;
+      const view = new DataView(chunk);
+      if (chunk.byteLength < DIRECT_APPLICATION_FRAME_INDEX_BYTES) {
+        throw new DirectTransportError("The direct clipboard chunk is invalid");
+      }
+      if (view.getUint32(0, false) !== chunkIndex) {
+        throw new DirectTransportError(
+          "The direct clipboard chunk arrived out of order",
+        );
+      }
+      const plaintextContribution = this.clipboardChunkPlaintextContribution(
+        state,
+        chunkIndex,
+      );
+      state.receivedByteLength =
+        (state.receivedByteLength ?? 0) + plaintextContribution;
+      state.receivedChunkCount = chunkIndex + 1;
       await this.emitApplicationFrame(state, {
         type: "clipboard-secure-chunk",
         data: bytesToBase64(new Uint8Array(chunk)),
       });
-      state.receivedByteLength = (state.receivedByteLength ?? 0) + chunk.byteLength;
-      state.receivedChunkCount = (state.receivedChunkCount ?? 0) + 1;
       await this.queueProgress(state, "receiving", {
         bytesReceived: state.receivedByteLength,
         byteLength: state.expectedClipboardPlaintextByteLength,
@@ -1437,6 +1454,38 @@ export class WebRtcPeerManager {
     });
   }
 
+  private clipboardChunkPlaintextContribution(
+    state: TransferState,
+    index: number,
+  ): number {
+    const plaintextByteLength = state.expectedClipboardPlaintextByteLength;
+    const chunkPlaintextSize = state.expectedClipboardChunkPlaintextSize;
+    const chunkCount = state.expectedChunkCount;
+    if (
+      plaintextByteLength === undefined ||
+      chunkPlaintextSize === undefined ||
+      chunkCount === undefined ||
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      index >= chunkCount
+    ) {
+      throw new DirectTransportError(
+        "The direct clipboard manifest or chunk index is invalid",
+      );
+    }
+    const offset = index * chunkPlaintextSize;
+    const contribution = Math.min(
+      chunkPlaintextSize,
+      plaintextByteLength - offset,
+    );
+    if (contribution <= 0) {
+      throw new DirectTransportError(
+        "The direct clipboard plaintext contribution is invalid",
+      );
+    }
+    return contribution;
+  }
+
   private noteProgress(state: TransferState, bytes: number): void {
     state.progressBytes = bytes;
     state.progressAt = this.dependencies.now().getTime();
@@ -1448,7 +1497,12 @@ export class WebRtcPeerManager {
     details: Partial<DirectManagerEvent & { kind: "status" }>,
     force = false,
   ): Promise<void> {
-    if (this.transfers.get(state.transferId) !== state) return Promise.resolve();
+    if (
+      this.transfers.get(state.transferId) !== state ||
+      state.applicationResult !== "pending"
+    ) {
+      return Promise.resolve();
+    }
     const bytes = details.bytesSent ?? details.bytesReceived;
     const now = this.dependencies.now().getTime();
     const shouldEmit =
@@ -1465,7 +1519,12 @@ export class WebRtcPeerManager {
     const emission = previous
       .catch(() => undefined)
       .then(() => {
-        if (this.transfers.get(state.transferId) !== state) return;
+        if (
+          this.transfers.get(state.transferId) !== state ||
+          state.applicationResult !== "pending"
+        ) {
+          return;
+        }
         return this.emitStatus(state, status, details);
       });
     state.progressEmissionChain = emission;

@@ -244,6 +244,14 @@ test("oversized PNG routing is recipient-specific and never creates an oversized
   });
   assert.equal(routes.direct.length, 1);
   assert.equal(routes.direct[0]!.payload.representations.some((value) => value.mime === "image/png"), true);
+  assert.deepEqual(
+    routes.direct[0]!.payload.representations.map((value) => value.mime),
+    ["image/png"],
+  );
+  assert.equal(
+    (routes.direct[0]!.plaintext as Uint8Array).byteLength > 0,
+    true,
+  );
   assert.equal(routes.relay.length, 2);
   const richFallback = routes.relay.find((route) =>
     route.payload.representations.some((value) => value.mime === "text/html"),

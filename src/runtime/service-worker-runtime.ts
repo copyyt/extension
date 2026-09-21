@@ -742,8 +742,9 @@ export class CopyytServiceWorkerRuntime {
     {
       sourceDeviceId: string;
       sourceKeyVersion: number;
-      expiresAt: number;
-      timer: ReturnType<typeof setTimeout>;
+      expiresAt?: number;
+      timer?: ReturnType<typeof setTimeout>;
+      validation?: Promise<ClientVerifiedDevice>;
     }
   >();
 
@@ -1778,7 +1779,7 @@ export class CopyytServiceWorkerRuntime {
   private clearDirectSignalValidation(transferId: string): void {
     const validation = this.directSignalValidations.get(transferId);
     if (!validation) return;
-    clearTimeout(validation.timer);
+    if (validation.timer !== undefined) clearTimeout(validation.timer);
     this.directSignalValidations.delete(transferId);
   }
 
@@ -1788,17 +1789,35 @@ export class CopyytServiceWorkerRuntime {
     }
   }
 
-  private rememberDirectSignalValidation(
+  private reserveDirectSignalValidation(
     transferId: string,
     sourceDeviceId: string,
     sourceKeyVersion: number,
-  ): void {
-    this.clearDirectSignalValidation(transferId);
+  ): {
+    sourceDeviceId: string;
+    sourceKeyVersion: number;
+    validation?: Promise<ClientVerifiedDevice>;
+    expiresAt?: number;
+    timer?: ReturnType<typeof setTimeout>;
+  } {
     while (this.directSignalValidations.size >= DIRECT_SIGNAL_VALIDATION_MAX) {
       const oldestTransferId = this.directSignalValidations.keys().next().value;
       if (typeof oldestTransferId !== "string") break;
       this.clearDirectSignalValidation(oldestTransferId);
     }
+    const reservation = { sourceDeviceId, sourceKeyVersion };
+    this.directSignalValidations.set(transferId, reservation);
+    return reservation;
+  }
+
+  private promoteDirectSignalValidation(
+    transferId: string,
+    reservation: {
+      sourceDeviceId: string;
+      sourceKeyVersion: number;
+    },
+  ): void {
+    if (this.directSignalValidations.get(transferId) !== reservation) return;
     const expiresAt = this.now().getTime() + DIRECT_SIGNAL_VALIDATION_TTL_MS;
     const timer = setTimeout(() => {
       const current = this.directSignalValidations.get(transferId);
@@ -1808,8 +1827,8 @@ export class CopyytServiceWorkerRuntime {
     }, DIRECT_SIGNAL_VALIDATION_TTL_MS);
     (timer as unknown as { unref?: () => void }).unref?.();
     this.directSignalValidations.set(transferId, {
-      sourceDeviceId,
-      sourceKeyVersion,
+      sourceDeviceId: reservation.sourceDeviceId,
+      sourceKeyVersion: reservation.sourceKeyVersion,
       expiresAt,
       timer,
     });
@@ -1931,6 +1950,7 @@ export class CopyytServiceWorkerRuntime {
   }
 
   async cancelDirectTestTransfer(transferId: string): Promise<void> {
+    this.clearDirectSignalValidation(transferId);
     if (!this.dependencies.directTransport) return;
     await this.dependencies.directTransport.cancelTransfer(
       transferId,
@@ -1943,6 +1963,50 @@ export class CopyytServiceWorkerRuntime {
     if (!this.status.socket.deviceAuthenticated || !this.dependencies.directTransport) {
       return;
     }
+    const existing = this.directSignalValidations.get(payload.transferId);
+    if (existing) {
+      if (
+        existing.sourceDeviceId !== payload.sourceDeviceId ||
+        existing.sourceKeyVersion !== payload.sourceKeyVersion
+      ) {
+        // A transfer binding is immutable, including while its first
+        // authoritative validation is still in flight.
+        return;
+      }
+      if (existing.validation) {
+        try {
+          await existing.validation;
+        } catch {
+          return;
+        }
+        const promoted = this.directSignalValidations.get(payload.transferId);
+        if (
+          !promoted ||
+          promoted.sourceDeviceId !== payload.sourceDeviceId ||
+          promoted.sourceKeyVersion !== payload.sourceKeyVersion ||
+          promoted.validation
+        ) {
+          return;
+        }
+        await this.dependencies.directTransport.handleSignal(payload).catch(() => undefined);
+        if (payload.kind === "cancel") {
+          this.clearDirectSignalValidation(payload.transferId);
+        }
+        return;
+      } else if (
+        existing.expiresAt === undefined ||
+        existing.expiresAt <= this.now().getTime()
+      ) {
+        this.clearDirectSignalValidation(payload.transferId);
+      } else {
+        await this.dependencies.directTransport.handleSignal(payload).catch(() => undefined);
+        if (payload.kind === "cancel") {
+          this.clearDirectSignalValidation(payload.transferId);
+        }
+        return;
+      }
+    }
+
     const localSource = await this.dependencies.trustStore.getDevice(
       this.session.user.id,
       payload.sourceDeviceId,
@@ -1954,21 +2018,39 @@ export class CopyytServiceWorkerRuntime {
       return;
     }
 
-    const cached = this.directSignalValidations.get(payload.transferId);
-    if (cached) {
+    const boundAfterLocalTrust = this.directSignalValidations.get(payload.transferId);
+    if (boundAfterLocalTrust) {
       if (
-        cached.expiresAt <= this.now().getTime() ||
-        cached.sourceDeviceId !== payload.sourceDeviceId ||
-        cached.sourceKeyVersion !== payload.sourceKeyVersion
+        boundAfterLocalTrust.sourceDeviceId !== payload.sourceDeviceId ||
+        boundAfterLocalTrust.sourceKeyVersion !== payload.sourceKeyVersion
       ) {
-        // A source mismatch is a forged signal for an already-bound transfer;
-        // do not let it replace the original validation binding.
+        return;
+      }
+      if (boundAfterLocalTrust.validation) {
+        try {
+          await boundAfterLocalTrust.validation;
+        } catch {
+          return;
+        }
+        const promoted = this.directSignalValidations.get(payload.transferId);
         if (
-          cached.sourceDeviceId !== payload.sourceDeviceId ||
-          cached.sourceKeyVersion !== payload.sourceKeyVersion
+          !promoted ||
+          promoted.sourceDeviceId !== payload.sourceDeviceId ||
+          promoted.sourceKeyVersion !== payload.sourceKeyVersion ||
+          promoted.validation
         ) {
           return;
         }
+        await this.dependencies.directTransport.handleSignal(payload).catch(() => undefined);
+        if (payload.kind === "cancel") {
+          this.clearDirectSignalValidation(payload.transferId);
+        }
+        return;
+      }
+      if (
+        boundAfterLocalTrust.expiresAt === undefined ||
+        boundAfterLocalTrust.expiresAt <= this.now().getTime()
+      ) {
         this.clearDirectSignalValidation(payload.transferId);
       } else {
         await this.dependencies.directTransport.handleSignal(payload).catch(() => undefined);
@@ -1982,20 +2064,29 @@ export class CopyytServiceWorkerRuntime {
     // The first signal for a transfer (offer, answer, or pre-offer ICE) is
     // authoritative. Ordinary subsequent ICE candidates reuse only this
     // transfer-scoped, short-lived source binding.
-    try {
-      await this.requireActiveTrustedDirectSource(
-        this.session,
-        payload.sourceDeviceId,
-        payload.sourceKeyVersion,
-      );
-    } catch {
-      return;
-    }
-    this.rememberDirectSignalValidation(
+    const reservation = this.reserveDirectSignalValidation(
       payload.transferId,
       payload.sourceDeviceId,
       payload.sourceKeyVersion,
     );
+    const validation = this.requireActiveTrustedDirectSource(
+      this.session,
+      payload.sourceDeviceId,
+      payload.sourceKeyVersion,
+    );
+    reservation.validation = validation;
+    try {
+      await validation;
+    } catch {
+      if (this.directSignalValidations.get(payload.transferId) === reservation) {
+        this.clearDirectSignalValidation(payload.transferId);
+      }
+      return;
+    }
+    if (this.directSignalValidations.get(payload.transferId) !== reservation) {
+      return;
+    }
+    this.promoteDirectSignalValidation(payload.transferId, reservation);
     await this.dependencies.directTransport.handleSignal(payload).catch(() => undefined);
     if (payload.kind === "cancel") {
       this.clearDirectSignalValidation(payload.transferId);

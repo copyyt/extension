@@ -233,9 +233,20 @@ export function selectClipboardDeliveryRoutes(input: {
       recipientSupportsDirectClipboard(recipient) &&
       recipientSupportsAssistedPng(recipient)
     ) {
+      const fallbackProjection = projectForRecipient(input.payload, recipient, false);
+      const directProjection = fallbackProjection
+        ? {
+            version: 1 as const,
+            representations: [getPngRepresentation(fullProjection)!],
+          }
+        : fullProjection;
       try {
-        const plaintext = bundleBytesForDirect(fullProjection);
-        direct.push({ payload: fullProjection, plaintext, recipient });
+        const directPlaintext = bundleBytesForDirect(directProjection);
+        direct.push({
+          payload: directProjection,
+          plaintext: directPlaintext,
+          recipient,
+        });
       } catch {
         // The direct maximum is bounded. It is not a reason to attempt a
         // relay publish that would violate the existing plaintext limit.
@@ -246,7 +257,6 @@ export function selectClipboardDeliveryRoutes(input: {
       // Direct delivery is opportunistic. Keep an independently valid
       // text/HTML projection for the same recipient so a failed local-network
       // connection does not discard a relay-compatible fallback.
-      const fallbackProjection = projectForRecipient(input.payload, recipient, false);
       if (fallbackProjection) {
         const key = projectionKey(fallbackProjection);
         const group = relayGroups.get(key);

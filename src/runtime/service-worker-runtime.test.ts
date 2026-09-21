@@ -16,6 +16,10 @@ import {
   type ClipboardPayloadV1,
 } from "../clipboard/payload.ts";
 import type { DeviceIdentity } from "../crypto/key-store.ts";
+import { createDeviceIdentityForTesting } from "../crypto/key-store.ts";
+import {
+  prepareDirectClipboardTransfer,
+} from "../crypto/direct-clipboard.ts";
 import type { RegisteredDeviceResponse } from "../crypto/device-registration.ts";
 import type { ClientTrustStore, ClientVerifiedDevice, LocalDeviceRecord } from "../crypto/trust-store.ts";
 import type { IUser } from "../interfaces/user.interface.ts";
@@ -368,6 +372,7 @@ function makeRuntime(overrides: Partial<{
   approveDevice: (request: unknown) => Promise<AxiosResponse<unknown>>;
   signApproval: RuntimeDependencies["signApproval"];
   decrypt: RuntimeDependencies["decrypt"];
+  decryptDirect: RuntimeDependencies["decryptDirect"];
   encrypt: RuntimeDependencies["encrypt"];
   identity: DeviceIdentity;
   registeredDevice: typeof registeredDevice;
@@ -3228,6 +3233,57 @@ const directSourceDevice: RegisteredDeviceResponse = {
   capabilities: [CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY],
 };
 
+async function makeDirectTestIdentity(deviceId: string): Promise<DeviceIdentity> {
+  const signing = (await crypto.subtle.generateKey(
+    { name: "Ed25519" },
+    false,
+    ["sign", "verify"],
+  )) as CryptoKeyPair;
+  const encryption = (await crypto.subtle.generateKey(
+    { name: "X25519" },
+    false,
+    ["deriveBits"],
+  )) as CryptoKeyPair;
+  return createDeviceIdentityForTesting({
+    userId: user.id,
+    deviceId,
+    keyVersion: 1,
+    signingPrivateKey: signing.privateKey,
+    signingPublicKey: await crypto.subtle.importKey(
+      "raw",
+      await crypto.subtle.exportKey("raw", signing.publicKey),
+      { name: "Ed25519" },
+      true,
+      ["verify"],
+    ),
+    encryptionPrivateKey: encryption.privateKey,
+    encryptionPublicKey: await crypto.subtle.importKey(
+      "raw",
+      await crypto.subtle.exportKey("raw", encryption.publicKey),
+      { name: "X25519" },
+      true,
+      [],
+    ),
+  });
+}
+
+function registeredDirectDevice(
+  device: DeviceIdentity,
+  capabilities: string[],
+  name: string,
+): RegisteredDeviceResponse {
+  return {
+    deviceId: device.deviceId,
+    name,
+    platform: "chrome",
+    encryptionPublicKey: device.encryptionPublicKeyBase64,
+    signingPublicKey: device.signingPublicKeyBase64,
+    trustState: "trusted",
+    keyVersion: device.keyVersion!,
+    capabilities,
+  };
+}
+
 function directSignal(
   overrides: Partial<DirectSignalDelivery> = {},
 ): DirectSignalDelivery {
@@ -3333,6 +3389,177 @@ test("ordinary direct ICE reuses transfer-scoped source validation", async () =>
     "direct ICE candidate was not forwarded",
   );
   assert.equal(direct.getSnapshotCalls(), afterOfferSnapshotCalls);
+});
+
+test("concurrent initial direct signals share one authoritative source snapshot", async () => {
+  const pairing = makePairingTrustStore();
+  putLocalRecord(pairing.records, directSourceDevice, "verified");
+  let snapshotCalls = 0;
+  let releaseSnapshot!: () => void;
+  const snapshotGate = new Promise<void>((resolve) => {
+    releaseSnapshot = resolve;
+  });
+  let delaySnapshots = false;
+  const handled: DirectSignalDelivery[] = [];
+  const directTransport: DirectTransport = {
+    startTestTransfer: async () => undefined,
+    handleSignal: async (signal) => {
+      handled.push(signal);
+    },
+    cancelTransfer: async () => undefined,
+    cancelAll: async () => undefined,
+  };
+  const setup = await startReady({
+    trustStore: pairing.trustStore,
+    directTransport,
+    listDevices: async () => {
+      snapshotCalls += 1;
+      if (delaySnapshots) await snapshotGate;
+      return response([registeredDevice, directSourceDevice]);
+    },
+    listPendingDevices: async () => {
+      snapshotCalls += 1;
+      if (delaySnapshots) await snapshotGate;
+      return response([]);
+    },
+  });
+  const baselineSnapshotCalls = snapshotCalls;
+  delaySnapshots = true;
+  const signals = [
+    directSignal({ kind: "offer", reason: undefined, sdp: "offer-sdp" }),
+    directSignal({
+      kind: "ice-candidate",
+      reason: undefined,
+      candidate: { candidate: "candidate:1", sdpMLineIndex: 0 },
+    }),
+    directSignal({
+      kind: "ice-candidate",
+      reason: undefined,
+      candidate: { candidate: "candidate:2", sdpMLineIndex: 0 },
+    }),
+  ];
+  for (const signal of signals) setup.socket.trigger("direct:signal", signal);
+
+  await waitForRuntimeCondition(
+    () => snapshotCalls >= baselineSnapshotCalls + 2,
+    "the first direct signal did not start authoritative validation",
+  );
+  await flushRuntimeWork();
+  assert.equal(snapshotCalls, baselineSnapshotCalls + 2);
+
+  releaseSnapshot();
+  await waitForRuntimeCondition(
+    () => handled.length === signals.length,
+    "all concurrent direct signals were not forwarded",
+  );
+});
+
+test("PNG-only direct completion persists assisted image state without another text write", async () => {
+  const recipientIdentity = await makeDirectTestIdentity(identity.deviceId);
+  const sourceIdentity = await makeDirectTestIdentity(directSourceDevice.deviceId);
+  const recipientServer = registeredDirectDevice(
+    recipientIdentity,
+    [
+      "clipboard",
+      "clipboard-bundle-v1",
+      "clipboard-html-v1",
+      "clipboard-image-png-assisted-write-v1",
+      CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY,
+    ],
+    "Direct Recipient",
+  );
+  const sourceServer = registeredDirectDevice(
+    sourceIdentity,
+    [CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY],
+    "Direct Source",
+  );
+  const pairing = makePairingTrustStore(
+    recipientIdentity,
+    recipientServer,
+    { identity: sourceIdentity, device: sourceServer },
+  );
+  putLocalRecord(pairing.records, recipientServer, "verified", {
+    capabilities: recipientServer.capabilities,
+  });
+  putLocalRecord(pairing.records, sourceServer, "verified", {
+    capabilities: sourceServer.capabilities,
+  });
+  const pngPayload = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9]),
+  );
+  const transferId = "88888888-8888-4888-8888-888888888888";
+  const prepared = await prepareDirectClipboardTransfer({
+    userId: user.id,
+    identity: sourceIdentity,
+    recipient: {
+      userId: user.id,
+      deviceId: recipientIdentity.deviceId,
+      keyVersion: recipientIdentity.keyVersion!,
+      signingPublicKey: recipientIdentity.signingPublicKeyBase64,
+      encryptionPublicKey: recipientIdentity.encryptionPublicKeyBase64,
+      trustState: "verified",
+    },
+    payload: pngPayload,
+    transferId,
+    expiresAt: new Date(Date.now() + 60_000),
+  });
+  const writes: string[] = [];
+  let verifiedCalls = 0;
+  const pendingAssistedImageStore = new InMemoryPendingAssistedImageStore();
+  const setup = await startReady({
+    identity: recipientIdentity,
+    registeredDevice: recipientServer,
+    trustStore: pairing.trustStore,
+    pendingAssistedImageStore,
+    listDevices: async () => response([recipientServer, sourceServer]),
+    clipboardAdapter: {
+      readText: async () => "newer clipboard text",
+      writeText: async (text) => { writes.push(text); },
+    },
+    decryptDirect: async () => ({
+      payload: pngPayload,
+      plaintextBytes: encodeClipboardBundleV1(pngPayload),
+    }),
+    directTransport: {
+      startTestTransfer: async () => undefined,
+      handleSignal: async () => undefined,
+      cancelTransfer: async () => undefined,
+      cancelAll: async () => undefined,
+      sendClipboardVerified: async () => { verifiedCalls += 1; },
+    },
+  });
+  const frame = (value: {
+    type: "clipboard-secure-start" | "clipboard-secure-chunk";
+    manifest?: string;
+    data?: string;
+  }) => ({
+    source: OFFSCREEN_SOURCE,
+    target: RUNTIME_SOURCE,
+    type: "DIRECT_EVENT" as const,
+    event: {
+      kind: "application-frame" as const,
+      transferId,
+      remoteDeviceId: sourceIdentity.deviceId,
+      frame:
+        value.type === "clipboard-secure-start"
+          ? { type: value.type, manifest: value.manifest! }
+          : { type: value.type, data: value.data! },
+    },
+  });
+  await setup.runtime.handleDirectTransportEvent(
+    frame({ type: "clipboard-secure-start", manifest: JSON.stringify(prepared.manifest) }),
+  );
+  for (const chunk of prepared.encryptedChunks) {
+    await setup.runtime.handleDirectTransportEvent(
+      frame({ type: "clipboard-secure-chunk", data: chunk }),
+    );
+  }
+
+  assert.equal(verifiedCalls, 1);
+  assert.deepEqual(writes, []);
+  const pending = await pendingAssistedImageStore.list(user.id);
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0]?.itemId, transferId);
 });
 
 test("a direct signal from a locally unverified source is not forwarded", async () => {

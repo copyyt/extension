@@ -349,6 +349,7 @@ async function createConnectedClipboardTransfer(
     encryptedChunks?: string[];
     plaintextByteLength?: number;
     delayFinalProgress?: boolean;
+    deferFinalApplicationFrame?: boolean;
     closeInitiatorAfterBinarySendCount?: number;
   } = {},
 ): Promise<{
@@ -360,12 +361,13 @@ async function createConnectedClipboardTransfer(
   responderChannel: FakeChannel;
   expectedPlaintextByteLength: number;
   releaseFinalProgress?: () => void;
+  releaseFinalApplicationFrame?: () => void;
 }> {
   const initiatorEvents: DirectManagerEvent[] = [];
   const responderEvents: DirectManagerEvent[] = [];
   const peers: FakePeerConnection[] = [];
   const encryptedChunks = options.encryptedChunks ?? [
-    bytesToBase64(new Uint8Array([1, 2, 3])),
+    bytesToBase64(new Uint8Array([0, 0, 0, 0, 1, 2, 3])),
   ];
   const plaintextByteLength = options.plaintextByteLength ?? 123;
   const packageToSend = clipboardManifest(
@@ -381,6 +383,15 @@ async function createConnectedClipboardTransfer(
       resolveFinalProgress = resolve;
     });
     releaseFinalProgress = () => resolveFinalProgress?.();
+  }
+  let releaseFinalApplicationFrame: (() => void) | undefined;
+  let resolveFinalApplicationFrame: (() => void) | undefined;
+  let finalApplicationFrameGate: Promise<void> | undefined;
+  if (options.deferFinalApplicationFrame) {
+    finalApplicationFrameGate = new Promise<void>((resolve) => {
+      resolveFinalApplicationFrame = resolve;
+    });
+    releaseFinalApplicationFrame = () => resolveFinalApplicationFrame?.();
   }
   const managerA = new WebRtcPeerManager({
     peerConnectionFactory: () => {
@@ -411,6 +422,7 @@ async function createConnectedClipboardTransfer(
     transferTimeoutMs: options.transferTimeoutMs,
     cleanupTimeoutMs: options.cleanupTimeoutMs,
   });
+  let responderManager: WebRtcPeerManager | undefined;
   const managerB = new WebRtcPeerManager({
     peerConnectionFactory: () => {
       const peer = new FakePeerConnection();
@@ -423,13 +435,30 @@ async function createConnectedClipboardTransfer(
       }
       return peer;
     },
-    emit: (event) => {
+    emit: async (event) => {
       responderEvents.push(event);
+      if (
+        finalApplicationFrameGate &&
+        event.kind === "application-frame" &&
+        event.frame.type === "clipboard-secure-chunk" &&
+        responderEvents.filter(
+          (candidate) =>
+            candidate.kind === "application-frame" &&
+            candidate.frame.type === "clipboard-secure-chunk",
+        ).length === encryptedChunks.length
+      ) {
+        await responderManager!.sendClipboardVerified({
+          transferId,
+          plaintextByteLength: packageToSend.plaintextByteLength,
+        });
+        await finalApplicationFrameGate;
+      }
     },
     now: options.now,
     transferTimeoutMs: options.transferTimeoutMs,
     cleanupTimeoutMs: options.cleanupTimeoutMs,
   });
+  responderManager = managerB;
 
   await managerA.startClipboardTransfer({
     transferId,
@@ -488,6 +517,7 @@ async function createConnectedClipboardTransfer(
     responderChannel,
     expectedPlaintextByteLength: packageToSend.plaintextByteLength,
     releaseFinalProgress,
+    releaseFinalApplicationFrame,
   };
 }
 
@@ -867,6 +897,31 @@ test("clipboard sender accepts immediate final verification while final progress
   );
 });
 
+test("clipboard responder records the final frame before deferred application completion", async () => {
+  const harness = await createConnectedClipboardTransfer({
+    deferFinalApplicationFrame: true,
+  });
+  await waitFor(() => hasStatus(harness.responderEvents, "succeeded"));
+  assert.equal(countStatus(harness.responderEvents, "failed"), 0);
+  assert.equal(countStatus(harness.initiatorEvents, "failed"), 0);
+
+  const succeededIndex = harness.responderEvents.findIndex(
+    (event) => event.kind === "status" && event.state === "succeeded",
+  );
+  assert.ok(succeededIndex >= 0);
+  assert.equal(
+    harness.responderEvents.slice(succeededIndex + 1).some(
+      (event) =>
+        event.kind === "status" &&
+        (event.state === "receiving" || event.state === "sending"),
+    ),
+    false,
+  );
+  harness.releaseFinalApplicationFrame?.();
+  await waitFor(() => harness.managerA.size === 0 && harness.managerB.size === 0);
+  assert.equal(countStatus(harness.responderEvents, "succeeded"), 1);
+});
+
 test("large clipboard transfers preserve frame order, bounds, verification, and throttled progress", async () => {
   const encryptedChunks = Array.from({ length: 192 }, (_, index) => {
     const bytes = new Uint8Array(DIRECT_APPLICATION_MAX_FRAME_BYTES);
@@ -914,6 +969,34 @@ test("large clipboard transfers preserve frame order, bounds, verification, and 
   assert.equal(countStatus(harness.responderEvents, "failed"), 0);
   assert.equal(countStatus(harness.initiatorEvents, "succeeded"), 1);
   assert.equal(countStatus(harness.responderEvents, "succeeded"), 1);
+  const progress = harness.responderEvents.filter(
+    (event): event is Extract<DirectManagerEvent, { kind: "status" }> =>
+      event.kind === "status" &&
+      event.state === "receiving" &&
+      event.bytesReceived !== undefined &&
+      event.byteLength !== undefined,
+  );
+  assert.ok(progress.length > 0);
+  for (let index = 1; index < progress.length; index += 1) {
+    assert.ok(progress[index]!.bytesReceived! >= progress[index - 1]!.bytesReceived!);
+  }
+  assert.ok(progress.every((event) => event.bytesReceived! <= event.byteLength!));
+  const finalProgress = progress[progress.length - 1]!;
+  assert.equal(finalProgress.bytesReceived, finalProgress.byteLength);
+  const sentProgress = harness.initiatorEvents.filter(
+    (event): event is Extract<DirectManagerEvent, { kind: "status" }> =>
+      event.kind === "status" &&
+      event.state === "sending" &&
+      event.bytesSent !== undefined &&
+      event.byteLength !== undefined,
+  );
+  assert.ok(sentProgress.length > 0);
+  for (let index = 1; index < sentProgress.length; index += 1) {
+    assert.ok(sentProgress[index]!.bytesSent! >= sentProgress[index - 1]!.bytesSent!);
+  }
+  assert.ok(sentProgress.every((event) => event.bytesSent! <= event.byteLength!));
+  const finalSentProgress = sentProgress[sentProgress.length - 1]!;
+  assert.equal(finalSentProgress.bytesSent, finalSentProgress.byteLength);
   assert.ok(
     countStatus(harness.initiatorEvents, "sending") < encryptedChunks.length / 4,
   );
@@ -940,9 +1023,12 @@ test("clipboard receiver rejects a chunk beyond the signed manifest count", asyn
 });
 
 test("mid-transfer clipboard channel failure cleans up without verification", async () => {
-  const encryptedChunks = Array.from({ length: 32 }, (_, index) =>
-    bytesToBase64(new Uint8Array([index, index + 1, index + 2])),
-  );
+  const encryptedChunks = Array.from({ length: 32 }, (_, index) => {
+    const bytes = new Uint8Array(7);
+    new DataView(bytes.buffer).setUint32(0, index, false);
+    bytes.set([index, index + 1, index + 2], 4);
+    return bytesToBase64(bytes);
+  });
   const harness = await createConnectedClipboardTransfer({
     encryptedChunks,
     closeInitiatorAfterBinarySendCount: 4,
