@@ -22,7 +22,7 @@ const Views = () => {
   }, [currentView]);
 
   return (
-    <section className="h-full">
+    <section>
       <Toast />
       {view}
     </section>

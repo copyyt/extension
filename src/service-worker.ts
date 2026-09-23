@@ -35,7 +35,7 @@ function socketFactory(url: string, options: SocketOptions): SocketLike {
 
 const runtime = new CopyytServiceWorkerRuntime({
   socketUrl: SOCKET_URL,
-  appVersion: "2.0.1",
+  appVersion: "3.0.0",
   sessionStore: new ChromeSessionStore(),
   statusStore: new ChromeStatusStore(),
   trustStore: new IndexedDBTrustStore(),

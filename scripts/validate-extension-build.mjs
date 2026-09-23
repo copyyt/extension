@@ -11,8 +11,8 @@ const sourceDirectories = [path.resolve("src"), path.resolve("public")];
 const manifestPath = path.join(outputDirectory, "manifest.json");
 const popupPath = path.join(outputDirectory, "index.html");
 const workerPath = path.join(outputDirectory, "assets/service-worker.js");
-const expectedStoreHostPermissions = ["https://api.copyyt.psami.com/*"];
-const expectedStoreEndpoint = "https://api.copyyt.psami.com";
+const expectedStoreHostPermissions = ["https://api.copyyt.com/*"];
+const expectedStoreEndpoint = "https://api.copyyt.com";
 const expectedStorePermissions = [
   "identity",
   "clipboardRead",
@@ -180,8 +180,8 @@ if (extensionEnvironment === "store") {
   if (manifest.manifest_version !== 3) {
     throw new Error("The Store manifest must use manifest_version 3");
   }
-  if (manifest.version !== "2.0.1") {
-    throw new Error(`The Store manifest must be version 2.0.1; got ${manifest.version}`);
+  if (manifest.version !== "3.0.0") {
+    throw new Error(`The Store manifest must be version 3.0.0; got ${manifest.version}`);
   }
   if (
     process.env.VITE_API_URL !== expectedStoreEndpoint ||

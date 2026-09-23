@@ -113,7 +113,7 @@ function Home() {
   }
 
   return (
-    <section className="flex h-full flex-col">
+    <section className="flex flex-col">
       <header className="flex items-center justify-between gap-3">
         <div className="font-sora flex items-center gap-2 text-lg font-bold text-ink">
           <Logo /> Copyyt
