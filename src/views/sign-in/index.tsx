@@ -72,29 +72,29 @@ const SignIn = () => {
   useViewLoader([signInGoogle.isPending, loading, signIn.isPending]);
 
   return (
-    <div className="w-full bg-white">
-      <div className="font-sora flex items-center gap-2 text-lg font-bold text-[#0F3449]">
+    <div className="w-full bg-surface">
+      <div className="font-sora flex items-center gap-2 text-lg font-bold text-ink">
         <Logo /> Copyyt
       </div>
 
-      <h1 className="font-sora mt-8 text-2xl font-bold text-[#0F3449]">
+      <h1 className="font-sora mt-8 text-2xl font-bold text-ink">
         Copy here, paste anywhere
       </h1>
-      <p className="font-work mt-2 text-sm leading-6 text-[#4B5563]">
+      <p className="font-work mt-2 text-sm leading-6 text-muted">
         Your clipboard, end-to-end encrypted across your browsers and phone.
         Sign in to get started.
       </p>
       <button
         onClick={handleGoogleAuth}
-        className="font-work mt-6 flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border border-[#D1D5DB] p-3 font-semibold text-[#0F3449] transition-colors hover:bg-[#F8FAFC]"
+        className="font-work mt-6 flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border border-line bg-surface p-3 font-semibold text-ink transition-colors hover:bg-soft"
       >
         <GoogleIcon /> Continue with Google
       </button>
 
-      <div className="font-work mt-5 flex w-full items-center gap-3 text-xs text-[#9CA3AF]">
-        <div className="flex-[1] border-b border-b-[#E4E7EC]" />
+      <div className="font-work mt-5 flex w-full items-center gap-3 text-xs text-muted">
+        <div className="flex-[1] border-b border-b-line" />
         or use your email
-        <div className="flex-[1] border-b border-b-[#E4E7EC]" />
+        <div className="flex-[1] border-b border-b-line" />
       </div>
 
       <form onSubmit={handleSubmit}>

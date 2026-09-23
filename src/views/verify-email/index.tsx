@@ -38,17 +38,17 @@ const VerifyEmail = () => {
   useViewLoader([verifyEmail.isPending, resendEmailOtp.isPending]);
 
   return (
-    <div className="w-full bg-white">
-      <div className="font-sora flex items-center gap-2 text-lg font-bold text-[#0F3449]">
+    <div className="w-full bg-surface">
+      <div className="font-sora flex items-center gap-2 text-lg font-bold text-ink">
         <Logo /> Copyyt
       </div>
 
-      <h1 className="font-sora mt-8 text-2xl font-bold text-[#0F3449]">
+      <h1 className="font-sora mt-8 text-2xl font-bold text-ink">
         Check your email
       </h1>
 
-      <p className="font-work mt-2 text-sm leading-6 text-[#4B5563]">
-        We sent a 6-digit code to <span className="font-semibold text-[#0F3449]">{email}</span>.
+      <p className="font-work mt-2 text-sm leading-6 text-muted">
+        We sent a 6-digit code to <span className="font-semibold text-ink">{email}</span>.
         It expires in 10 minutes.
       </p>
 
@@ -76,7 +76,7 @@ const VerifyEmail = () => {
           Continue
         </Button>
 
-        <p className="font-work mt-6 text-center text-sm text-[#4B5563]">
+        <p className="font-work mt-6 text-center text-sm text-muted">
           Didn't get the code?{" "}
           <button
             type="button"

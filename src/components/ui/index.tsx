@@ -12,9 +12,9 @@ export function Card({
   className?: string;
 }) {
   const tones = {
-    default: "border-[#E4E7EC] bg-white",
-    accent: "border-[#B9DFF1] bg-[#F3FAFE]",
-    danger: "border-[#FFC2C6] bg-[#FFF7F7]",
+    default: "border-line bg-surface",
+    accent: "border-primary bg-soft",
+    danger: "border-danger bg-danger-soft",
   };
   return (
     <div className={`rounded-2xl border p-4 ${tones[tone]} ${className}`}>{children}</div>
@@ -22,11 +22,11 @@ export function Card({
 }
 
 export function CardTitle({ children }: { children: React.ReactNode }) {
-  return <p className="font-sora text-sm font-semibold text-[#0F3449]">{children}</p>;
+  return <p className="font-sora text-sm font-semibold text-ink">{children}</p>;
 }
 
 export function Muted({ children, className = "" }: { children: React.ReactNode; className?: string }) {
-  return <p className={`font-work text-xs leading-5 text-[#4B5563] ${className}`}>{children}</p>;
+  return <p className={`font-work text-xs leading-5 text-muted ${className}`}>{children}</p>;
 }
 
 type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
@@ -36,18 +36,18 @@ type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
 
 export function UiButton({ tone = "primary", size = "md", className = "", ...props }: ButtonProps) {
   const tones = {
-    primary: "bg-[#2D9CDB] text-white hover:bg-[#2682B6] border-transparent",
-    secondary: "bg-white text-[#1E6892] border-[#2D9CDB] hover:bg-[#F3FAFE]",
-    danger: "bg-[#FF2635] text-white border-transparent hover:bg-[#E0212F]",
-    "danger-outline": "bg-white text-[#FF2635] border-[#FF2635] hover:bg-[#FFF7F7]",
-    ghost: "bg-transparent text-[#4B5563] border-transparent hover:text-[#0F3449] underline-offset-4 hover:underline",
+    primary: "bg-primary text-on-primary hover:bg-primary-hover border-transparent",
+    secondary: "bg-surface text-primary border-primary hover:bg-soft",
+    danger: "bg-danger text-on-danger border-transparent hover:opacity-85",
+    "danger-outline": "bg-surface text-danger border-danger hover:bg-danger-soft",
+    ghost: "bg-transparent text-muted border-transparent hover:text-ink underline-offset-4 hover:underline",
   };
   const sizes = { md: "px-3 py-2 text-sm", lg: "px-4 py-3 text-base" };
   return (
     <button
       type="button"
       {...props}
-      className={`font-work inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl border font-semibold transition-colors disabled:cursor-not-allowed disabled:border-transparent disabled:bg-[#E5E7EB] disabled:text-[#9CA3AF] ${tones[tone]} ${sizes[size]} ${className}`}
+      className={`font-work inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl border font-semibold transition-colors disabled:cursor-not-allowed disabled:border-transparent disabled:bg-disabled disabled:text-on-disabled ${tones[tone]} ${sizes[size]} ${className}`}
     />
   );
 }
@@ -60,9 +60,9 @@ export function Alert({
   children: React.ReactNode;
 }) {
   const tones = {
-    info: "bg-[#F3FAFE] text-[#1E6892]",
-    error: "bg-[#FFF1F2] text-[#B4121E]",
-    success: "bg-[#F0FDF4] text-[#15803D]",
+    info: "bg-soft text-primary",
+    error: "bg-danger-soft text-on-danger-soft",
+    success: "bg-success-soft text-on-success-soft",
   };
   return (
     <p role={tone === "error" ? "alert" : "status"} className={`font-work rounded-xl px-3 py-2 text-xs leading-5 break-words ${tones[tone]}`}>
@@ -73,11 +73,11 @@ export function Alert({
 
 export function StatusPill({ tone, children }: { tone: "ok" | "wait" | "bad"; children: React.ReactNode }) {
   const tones = {
-    ok: "bg-[#F0FDF4] text-[#15803D]",
-    wait: "bg-[#FEF9C3] text-[#854D0E]",
-    bad: "bg-[#FFF1F2] text-[#B4121E]",
+    ok: "bg-success-soft text-on-success-soft",
+    wait: "bg-warning-soft text-on-warning-soft",
+    bad: "bg-danger-soft text-on-danger-soft",
   };
-  const dots = { ok: "bg-[#16A34A]", wait: "bg-[#CA8A04]", bad: "bg-[#DC2626]" };
+  const dots = { ok: "bg-success", wait: "bg-warning", bad: "bg-danger" };
   return (
     <span className={`font-work inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold ${tones[tone]}`}>
       <span className={`h-1.5 w-1.5 rounded-full ${dots[tone]}`} />
@@ -89,7 +89,7 @@ export function StatusPill({ tone, children }: { tone: "ok" | "wait" | "bad"; ch
 /** The pairing code, large and easy to compare. */
 export function Fingerprint({ value }: { value: string }) {
   return (
-    <p className="rounded-xl bg-[#E3F3FB] px-3 py-3 text-center font-mono text-base font-bold tracking-wider break-all text-[#0F3449]">
+    <p className="rounded-xl bg-soft px-3 py-3 text-center font-mono text-base font-bold tracking-wider break-all text-ink">
       {value}
     </p>
   );
@@ -101,7 +101,7 @@ export function TextArea(props: React.TextareaHTMLAttributes<HTMLTextAreaElement
       autoComplete="off"
       spellCheck={false}
       {...props}
-      className={`focus:border-primary h-24 w-full resize-none rounded-xl border border-[#E4E7EC] p-3 font-mono text-[11px] outline-none ${props.className ?? ""}`}
+      className={`focus:border-primary bg-surface text-ink placeholder:text-muted h-24 w-full resize-none rounded-xl border border-line p-3 font-mono text-[11px] outline-none ${props.className ?? ""}`}
     />
   );
 }
@@ -110,7 +110,7 @@ export function TextInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
   return (
     <input
       {...props}
-      className={`focus:border-primary font-work w-full rounded-xl border border-[#E4E7EC] px-3 py-2.5 text-sm outline-none placeholder:text-[#9CA3AF] ${props.className ?? ""}`}
+      className={`focus:border-primary bg-surface text-ink placeholder:text-muted font-work w-full rounded-xl border border-line px-3 py-2.5 text-sm outline-none ${props.className ?? ""}`}
     />
   );
 }

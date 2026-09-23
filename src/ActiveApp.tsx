@@ -25,9 +25,9 @@ function ActiveApp() {
   }, []);
 
   const extensionClassName =
-    "shadow-copyt relative max-h-[600px] w-[430px] overflow-y-auto p-6 pt-10";
+    "shadow-copyt relative max-h-[600px] w-[430px] overflow-y-auto bg-surface p-6 pt-10 text-ink";
   const webClassName =
-    "shadow-copyt relative mx-auto mt-[5vh] h-[90vh] w-full p-6 pt-10 sm:mt-[calc(50vh-300px)] sm:h-max sm:max-h-[600px] sm:w-[430px]";
+    "shadow-copyt relative mx-auto mt-[5vh] h-[90vh] w-full border border-line bg-surface p-6 pt-10 text-ink sm:mt-[calc(50vh-300px)] sm:h-max sm:max-h-[600px] sm:w-[430px]";
 
   return (
     <>
@@ -36,7 +36,7 @@ function ActiveApp() {
       >
         {APP_TYPE === "extension" ? (
           <CloseIcon
-            className="absolute top-2 right-2 cursor-pointer hover:opacity-60"
+            className="absolute top-2 right-2 cursor-pointer text-muted hover:text-ink"
             onClick={() => window.close()}
           />
         ) : null}

@@ -115,14 +115,14 @@ function Home() {
   return (
     <section className="flex h-full flex-col">
       <header className="flex items-center justify-between gap-3">
-        <div className="font-sora flex items-center gap-2 text-lg font-bold text-[#0F3449]">
+        <div className="font-sora flex items-center gap-2 text-lg font-bold text-ink">
           <Logo /> Copyyt
         </div>
         <div className="flex items-center gap-2">
           <StatusPill tone={pill.tone}>{pill.label}</StatusPill>
           <div
             title={account?.email ?? ""}
-            className="font-sora flex h-8 w-8 items-center justify-center rounded-full bg-[#1E6892] text-sm font-semibold text-white uppercase"
+            className="font-sora flex h-8 w-8 items-center justify-center rounded-full bg-primary text-sm font-semibold text-on-primary uppercase"
           >
             {(account?.name ?? account?.email ?? "C").slice(0, 1)}
           </div>
@@ -148,7 +148,7 @@ function Tabs({ tab, setTab, devicesBadge }: { tab: Tab; setTab: (tab: Tab) => v
     { id: "settings", label: "Settings" },
   ];
   return (
-    <nav className="grid grid-cols-3 gap-1 rounded-xl bg-[#F1F5F9] p-1" role="tablist">
+    <nav className="grid grid-cols-3 gap-1 rounded-xl bg-soft p-1" role="tablist">
       {tabs.map((item) => (
         <button
           key={item.id}
@@ -157,12 +157,12 @@ function Tabs({ tab, setTab, devicesBadge }: { tab: Tab; setTab: (tab: Tab) => v
           aria-selected={tab === item.id}
           onClick={() => setTab(item.id)}
           className={`font-work relative cursor-pointer rounded-lg py-1.5 text-sm font-semibold transition-colors ${
-            tab === item.id ? "bg-white text-[#0F3449] shadow-sm" : "text-[#4B5563] hover:text-[#0F3449]"
+            tab === item.id ? "bg-surface text-ink shadow-sm" : "text-muted hover:text-ink"
           }`}
         >
           {item.label}
           {item.id === "devices" && devicesBadge ? (
-            <span className="absolute top-1.5 right-4 h-2 w-2 rounded-full bg-[#FF2635]" />
+            <span className="absolute top-1.5 right-4 h-2 w-2 rounded-full bg-danger" />
           ) : null}
         </button>
       ))}
@@ -297,8 +297,8 @@ function HomeTab({
               onClick={() => void setMode(item.mode)}
               className={`font-work cursor-pointer rounded-lg border px-2 py-2 text-xs font-semibold transition-colors disabled:cursor-wait ${
                 mode === item.mode
-                  ? "border-[#2D9CDB] bg-[#E3F3FB] text-[#0F3449]"
-                  : "border-[#E4E7EC] bg-white text-[#4B5563] hover:border-[#B9DFF1]"
+                  ? "border-primary bg-soft text-ink"
+                  : "border-line bg-surface text-muted hover:border-primary"
               }`}
             >
               {item.label}
@@ -442,7 +442,7 @@ function FirstSetupScreen({ run }: { run: Run }) {
   const [busy, setBusy] = useState(false);
   return (
     <Card>
-      <p className="font-sora text-xl font-bold text-[#0F3449]">Welcome to Copyyt</p>
+      <p className="font-sora text-xl font-bold text-ink">Welcome to Copyyt</p>
       <Muted className="mt-2">
         This is the first device on your account, so it becomes your account root: the device that approves every
         other device you add. You&apos;ll save a recovery credential next, in case you lose it.
@@ -480,7 +480,7 @@ function PairingScreen({ status, run, reload }: { status: RuntimeStatus; run: Ru
   return (
     <>
       <Card>
-        <p className="font-sora text-lg font-bold text-[#0F3449]">Pair this device</p>
+        <p className="font-sora text-lg font-bold text-ink">Pair this device</p>
         {pairing ? (
           <>
             <Muted className="mt-2">
@@ -553,7 +553,7 @@ function RemovedScreen({ run }: { run: Run }) {
   const [busy, setBusy] = useState(false);
   return (
     <Card tone="danger">
-      <p className="font-sora text-lg font-bold text-[#0F3449]">This device was removed</p>
+      <p className="font-sora text-lg font-bold text-ink">This device was removed</p>
       <Muted className="mt-2">
         It was removed from your account and can&apos;t sync. Setting it up again creates a new device that your root
         device must approve, like a fresh install.
@@ -851,16 +851,16 @@ function DeviceManager() {
     <Card>
       <CardTitle>Your devices</CardTitle>
       {devices === null && !error ? <Muted className="mt-2">Loading…</Muted> : null}
-      <ul className="mt-2 divide-y divide-[#F1F5F9]">
+      <ul className="mt-2 divide-y divide-line">
         {devices?.map((device) => (
           <li key={device.deviceId} className="flex items-center justify-between gap-3 py-2.5">
             <div className="flex min-w-0 items-center gap-3">
-              <span className="font-sora flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#E3F3FB] text-xs font-bold text-[#1E6892]">
+              <span className="font-sora flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-soft text-xs font-bold text-primary">
                 {device.platform === "android" ? "AND" : "WEB"}
               </span>
               <div className="min-w-0">
-                <p className="font-work truncate text-sm font-semibold text-[#0F3449]">{device.name}</p>
-                <p className="font-work text-xs text-[#4B5563]">
+                <p className="font-work truncate text-sm font-semibold text-ink">{device.name}</p>
+                <p className="font-work text-xs text-muted">
                   {[
                     platformLabel(device.platform),
                     device.current ? "This device" : null,

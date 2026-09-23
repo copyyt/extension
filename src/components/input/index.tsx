@@ -9,14 +9,14 @@ export const InputField = (
   return (
     <div className="w-full">
       {props.label ? (
-        <label className="font-work mb-3 block text-sm" htmlFor={props.id}>
+        <label className="font-work mb-3 block text-sm text-ink" htmlFor={props.id}>
           {props.label}
         </label>
       ) : null}
 
       <input
         {...props}
-        className={`focus:border-primary rounded-xl border border-[#E4E7EC] p-4 font-medium outline-none placeholder:text-[#9CA3AF] ${props.className} w-full`}
+        className={`focus:border-primary bg-surface text-ink placeholder:text-muted w-full rounded-xl border border-line p-4 font-medium outline-none ${props.className ?? ""}`}
       />
     </div>
   );

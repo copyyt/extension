@@ -7,13 +7,13 @@ const Button = (
   > & { variant?: "primary" | "outlined" },
 ) => {
   const variantStyles = {
-    primary: "border-transparent text-white bg-primary",
-    outlined: "border-primary text-primary bg-white",
+    primary: "border-transparent text-on-primary bg-primary hover:bg-primary-hover",
+    outlined: "border-primary text-primary bg-surface hover:bg-soft",
   };
   return (
     <button
       {...props}
-      className={`cursor-pointer rounded-xl border px-4 py-1 leading-6 font-bold transition-all duration-300 hover:opacity-45 disabled:bg-[#E5E7EB] disabled:text-[#9CA3AF] ${
+      className={`cursor-pointer rounded-xl border px-4 py-1 leading-6 font-bold transition-colors disabled:bg-disabled disabled:text-on-disabled ${
         variantStyles[props.variant ?? "primary"]
       } ${props.className}`}
     />

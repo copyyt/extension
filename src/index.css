@@ -1,13 +1,109 @@
 @import url("https://fonts.googleapis.com/css2?family=Sora:wght@100..800&family=Work+Sans:ital,wght@0,100..900;1,100..900&display=swap");
 @import "tailwindcss";
-@theme {
-  --font-work: "Work Sans", serif;
-  --font-sora: "Sora", serif;
 
-  --color-primary: #2d9cdb;
+/* Warm Paper. These @theme variables generate Tailwind utilities such as bg-page. */
+@theme {
+  --font-work: "Work Sans", sans-serif;
+  --font-sora: "Sora", sans-serif;
+
+  --color-brand: #2d9cdb;
+  --color-primary: #1e6892;
+  --color-primary-hover: #175372;
+  --color-on-primary: #ffffff;
+  --color-page: #f7f5f1;
+  --color-surface: #ffffff;
+  --color-soft: #e3f3fb;
+  --color-ink: #0f3449;
+  --color-muted: #4b5f6c;
+  --color-line: #d5e3e9;
+  --color-success: #3c7d72;
+  --color-success-soft: #e5f3ee;
+  --color-on-success-soft: #245c52;
+  --color-danger: #ff2635;
+  --color-on-danger: #08141c;
+  --color-danger-soft: #ffe4e6;
+  --color-on-danger-soft: #7f1d1d;
+  --color-warning: #8a5714;
+  --color-warning-soft: #f8ebd9;
+  --color-on-warning-soft: #674313;
+  --color-disabled: #e7ecef;
+  --color-on-disabled: #697884;
+
   --shadow-copyt: 0px 4px 20px 0px #0000001a;
 }
 
+:root {
+  color-scheme: light;
+}
+
+/* Harbor Dark follows the operating system, as it does in the Android app. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --color-primary: #56b3e6;
+    --color-primary-hover: #8ccbee;
+    --color-on-primary: #002235;
+    --color-page: #08141c;
+    --color-surface: #0f2230;
+    --color-soft: #16303f;
+    --color-ink: #e2eef5;
+    --color-muted: #a9bcc8;
+    --color-line: #2b4a5c;
+    --color-success: #75c7b0;
+    --color-success-soft: #173b37;
+    --color-on-success-soft: #a6e8d4;
+    --color-danger: #ff6b75;
+    --color-on-danger: #08141c;
+    --color-danger-soft: #4a1016;
+    --color-on-danger-soft: #ffdadc;
+    --color-warning: #e9c37a;
+    --color-warning-soft: #4d3820;
+    --color-on-warning-soft: #ffe1ab;
+    --color-disabled: #263946;
+    --color-on-disabled: #8da3b0;
+    --shadow-copyt: 0px 4px 20px 0px #00000040;
+  }
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
 body {
+  background-color: var(--color-page);
+  color: var(--color-ink);
+  font-family: var(--font-work);
   font-size: 100%;
+}
+
+:where(input, textarea, select) {
+  background-color: var(--color-surface);
+  color: var(--color-ink);
+}
+
+:where(input, textarea)::placeholder {
+  color: var(--color-muted);
+}
+
+:where(a, button, input, textarea, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+::selection {
+  background-color: var(--color-soft);
+  color: var(--color-ink);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }

@@ -14,6 +14,7 @@
     "test:runtime": "node --experimental-strip-types --test \"src/runtime/*.test.ts\"",
     "test:direct": "node --experimental-strip-types --test \"src/direct/*.test.ts\"",
     "test:auth": "node --experimental-strip-types --test \"src/hooks/*.test.ts\" \"src/utils/*.test.ts\"",
+    "test:palette": "node --experimental-strip-types --test \"src/theme/*.test.ts\"",
     "test:chrome:keys": "node tests/chrome/run-key-persistence.mjs",
     "test:chrome": "node tests/chrome/run-extension-harness.mjs",
     "preview": "vite preview"
