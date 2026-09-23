@@ -7,6 +7,7 @@ export function createRuntimeApi(accessToken: string) {
     baseURL: `${API_URL}/api/v1`,
     timeout: 120000,
     withCredentials: true,
+    headers: { "X-Copyyt-Client": "extension" },
   });
   axiosInstance.interceptors.request.use((config) => {
     config.headers.Accept = "application/json";

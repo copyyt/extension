@@ -7,6 +7,8 @@ import {
 
 export const CRYPTO_PROTOCOL_VERSION = 1 as const;
 export const DEVICE_APPROVAL_MESSAGE_VERSION = "copyyt-device-approval-v1";
+export const DEVICE_MANAGEMENT_MESSAGE_VERSION = "copyyt-device-management-v1";
+export const DEVICE_RECOVERY_MESSAGE_VERSION = "copyyt-device-recovery-v1";
 export const CLIPBOARD_ENVELOPE_SIGNATURE_MESSAGE_VERSION =
   "copyyt-clipboard-envelope-v1";
 export const SOCKET_AUTH_MESSAGE_VERSION = "copyyt-socket-auth-v1";
@@ -145,6 +147,88 @@ export interface DeviceApprovalMessageInput {
   pendingKeyVersion: number;
   pendingEncryptionPublicKey: string;
   pendingSigningPublicKey: string;
+}
+
+export interface DeviceManagementMessageInput {
+  action: "update" | "revoke";
+  userId: string;
+  requestingDeviceId: string;
+  requestingKeyVersion: number;
+  targetDeviceId: string;
+  targetKeyVersion: number;
+  timestamp: number;
+  nonce: string;
+  name?: string;
+  platform?: string;
+  capabilities?: string[];
+  appVersion?: string;
+  recoveryPublicKey?: string;
+}
+
+function buildLengthPrefixedMessage(
+  version: string,
+  fields: Array<[string, string | number]>,
+): Uint8Array {
+  return utf8Encode(
+    [version, ...fields.map(([key, value]) => `${key}=${String(value)}`)]
+      .map((value) => `${utf8Encode(value).byteLength}:${value}`)
+      .join(""),
+  );
+}
+
+/** Exact canonical bytes required by the backend device-management DTO. */
+export function buildDeviceManagementMessage(
+  input: DeviceManagementMessageInput,
+): Uint8Array {
+  return buildLengthPrefixedMessage(DEVICE_MANAGEMENT_MESSAGE_VERSION, [
+    ["action", input.action],
+    ["userId", input.userId],
+    ["requestingDeviceId", input.requestingDeviceId],
+    ["requestingKeyVersion", input.requestingKeyVersion],
+    ["targetDeviceId", input.targetDeviceId],
+    ["targetKeyVersion", input.targetKeyVersion],
+    ["timestamp", input.timestamp],
+    ["nonce", input.nonce],
+    ["name", input.name ?? ""],
+    ["platform", input.platform ?? ""],
+    ["capabilities", JSON.stringify(input.capabilities ?? [])],
+    ["appVersion", input.appVersion ?? ""],
+    ["recoveryPublicKey", input.recoveryPublicKey ?? ""],
+  ]);
+}
+
+export interface DeviceRecoveryMessageInput {
+  userId: string;
+  rootDeviceId: string;
+  deviceId: string;
+  name: string;
+  platform: string;
+  encryptionPublicKey: string;
+  signingPublicKey: string;
+  capabilities: string[];
+  appVersion?: string;
+  timestamp: number;
+  nonce: string;
+  newRecoveryPublicKey: string;
+}
+
+export function buildDeviceRecoveryMessage(
+  input: DeviceRecoveryMessageInput,
+): Uint8Array {
+  return buildLengthPrefixedMessage(DEVICE_RECOVERY_MESSAGE_VERSION, [
+    ["userId", input.userId],
+    ["rootDeviceId", input.rootDeviceId],
+    ["deviceId", input.deviceId],
+    ["name", input.name],
+    ["platform", input.platform],
+    ["encryptionPublicKey", input.encryptionPublicKey],
+    ["signingPublicKey", input.signingPublicKey],
+    ["capabilities", JSON.stringify(input.capabilities)],
+    ["appVersion", input.appVersion ?? ""],
+    ["timestamp", input.timestamp],
+    ["nonce", input.nonce],
+    ["newRecoveryPublicKey", input.newRecoveryPublicKey],
+  ]);
 }
 
 export function buildDeviceApprovalMessage(

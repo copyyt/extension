@@ -18,7 +18,7 @@ import { isCanonicalBase64Bytes } from "./bytes.ts";
 import { validClipboardCapabilities } from "../clipboard/capabilities.ts";
 
 export type LocalTrustState = "root" | "verified" | "unverified" | "revoked";
-export type TrustOrigin = "initial-tofu" | "pairing";
+export type TrustOrigin = "initial-tofu" | "pairing" | "recovery";
 
 export interface LocalDeviceRecord {
   userId: string;
@@ -58,6 +58,16 @@ export interface ClientTrustStore {
   getDevice(userId: string, deviceId: string): MaybePromise<LocalDeviceRecord | null>;
   upsertServerReportedDevice(device: ServerReportedDevice): MaybePromise<LocalDeviceRecord>;
   bootstrapInitialTrustAnchor(
+    userId: string,
+    identity: DeviceIdentity,
+    metadata?: Partial<LocalDeviceRecord>,
+  ): MaybePromise<ClientVerifiedDevice>;
+  /**
+   * Atomically replaces any stale local account roots after a server-approved
+   * offline recovery. The caller must only invoke this after the signed
+   * recovery request has been accepted by the backend.
+   */
+  recoverTrustAnchor(
     userId: string,
     identity: DeviceIdentity,
     metadata?: Partial<LocalDeviceRecord>,
@@ -196,7 +206,8 @@ function assertValidTrustRecord(record: unknown): asserts record is LocalDeviceR
     candidate.pinnedAt !== undefined;
   if (candidate.trustOrigin !== undefined &&
       candidate.trustOrigin !== "initial-tofu" &&
-      candidate.trustOrigin !== "pairing") {
+      candidate.trustOrigin !== "pairing" &&
+      candidate.trustOrigin !== "recovery") {
     throw new TrustStoreError("Persisted trust state is corrupt");
   }
   if (candidate.trustState === "root" && !candidate.trustOrigin) {
@@ -212,6 +223,10 @@ function assertValidTrustRecord(record: unknown): asserts record is LocalDeviceR
         candidate.pairedForDeviceId === candidate.deviceId ||
         !PAIRING_FINGERPRINT_PATTERN.test(candidate.pairingFingerprint ?? "") ||
         !isValidTimestamp(candidate.pinnedAt))) {
+    throw new TrustStoreError("Persisted trust state is corrupt");
+  }
+  if (candidate.trustOrigin === "recovery" &&
+      (candidate.trustState !== "root" || hasPairingMetadata)) {
     throw new TrustStoreError("Persisted trust state is corrupt");
   }
   if (candidate.trustOrigin !== "pairing" && hasPairingMetadata) {
@@ -346,6 +361,7 @@ function deviceFromIdentity(
   identity: DeviceIdentity,
   trustState: "root" | "verified",
   metadata: Partial<LocalDeviceRecord> = {},
+  trustOrigin: "initial-tofu" | "recovery" = "initial-tofu",
 ): ClientVerifiedDevice {
   validIdentityFields(userId, identity);
   return {
@@ -356,7 +372,7 @@ function deviceFromIdentity(
     encryptionPublicKey: identity.encryptionPublicKeyBase64,
     signingPublicKey: identity.signingPublicKeyBase64,
     trustState,
-    trustOrigin: "initial-tofu",
+    trustOrigin,
   };
 }
 
@@ -497,6 +513,43 @@ export class InMemoryTrustStore implements ClientTrustStore {
     }
     assertValidTrustRecord(device);
     this.devices.set(deviceKey(userId, identity.deviceId), device);
+    return cloneDevice(device) as ClientVerifiedDevice;
+  }
+
+  recoverTrustAnchor(
+    userId: string,
+    identity: DeviceIdentity,
+    metadata: Partial<LocalDeviceRecord> = {},
+  ): ClientVerifiedDevice {
+    const device = deviceFromIdentity(userId, identity, "root", metadata, "recovery");
+    const current = this.getDevice(userId, identity.deviceId);
+    if (current && (
+      current.deviceId !== device.deviceId ||
+      current.encryptionPublicKey !== device.encryptionPublicKey ||
+      current.signingPublicKey !== device.signingPublicKey
+    )) {
+      throw new TrustStoreError("The recovered identity does not match the stored device");
+    }
+    // Build and validate the complete next state before mutating the map. A
+    // recovered profile must not retain a stale root from the old profile.
+    const next = new Map(this.devices);
+    for (const candidate of next.values()) {
+      if (candidate.userId !== userId || candidate.trustState !== "root") continue;
+      const retired = {
+        ...candidate,
+        trustState: "revoked",
+        trustOrigin: undefined,
+        pairedForDeviceId: undefined,
+        pairingFingerprint: undefined,
+        pinnedAt: undefined,
+      } satisfies LocalDeviceRecord;
+      assertValidTrustRecord(retired);
+      next.set(deviceKey(userId, candidate.deviceId), retired);
+    }
+    assertValidTrustRecord(device);
+    next.set(deviceKey(userId, identity.deviceId), device);
+    this.devices.clear();
+    for (const [key, value] of next) this.devices.set(key, value);
     return cloneDevice(device) as ClientVerifiedDevice;
   }
 
@@ -906,6 +959,94 @@ export class IndexedDBTrustStore implements ClientTrustStore {
               fail(error);
               return;
             }
+          }
+          currentReady = true;
+          attempt();
+        };
+        allRequest.onerror = () => fail(allRequest.error ?? new TrustStoreError("Unable to read trust state"));
+        allRequest.onsuccess = () => {
+          try {
+            allDevices = (allRequest.result as unknown[]).map((candidate) => {
+              assertValidTrustRecord(candidate);
+              return candidate;
+            });
+          } catch (error) {
+            fail(error);
+            return;
+          }
+          allReady = true;
+          attempt();
+        };
+      },
+    );
+  }
+
+  async recoverTrustAnchor(
+    userId: string,
+    identity: DeviceIdentity,
+    metadata: Partial<LocalDeviceRecord> = {},
+  ): Promise<ClientVerifiedDevice> {
+    const device = deviceFromIdentity(userId, identity, "root", metadata, "recovery");
+    assertValidTrustRecord(device);
+    return withReadwriteTransaction<ClientVerifiedDevice>(
+      [IDENTITY_STORE, TRUST_DEVICE_STORE],
+      (transaction, finish, fail) => {
+        const identityStore = transaction.objectStore(IDENTITY_STORE);
+        const store = transaction.objectStore(TRUST_DEVICE_STORE);
+        const identityRequest = identityStore.get(userId);
+        const currentRequest = store.get(deviceKey(userId, identity.deviceId));
+        const allRequest = store.getAll();
+        let persistedIdentity: StoredIdentityRecord | undefined;
+        let current: LocalDeviceRecord | undefined;
+        let allDevices: LocalDeviceRecord[] | undefined;
+        let identityReady = false;
+        let currentReady = false;
+        let allReady = false;
+        const attempt = (): void => {
+          if (!identityReady || !currentReady || !allReady) return;
+          try {
+            if (!persistedIdentity || !isPersistedIdentityMatch(persistedIdentity, userId, identity)) {
+              throw new TrustStoreError("The identity is not the account's stored local identity");
+            }
+            if (current && (
+              current.deviceId !== device.deviceId ||
+              current.encryptionPublicKey !== device.encryptionPublicKey ||
+              current.signingPublicKey !== device.signingPublicKey
+            )) {
+              throw new TrustStoreError("The recovered identity does not match the stored device");
+            }
+            // All reads and validation happen before any write, so this is a
+            // single durable transition from stale roots to the recovery root.
+            for (const candidate of allDevices!) {
+              if (candidate.userId !== userId || candidate.trustState !== "root") continue;
+              const retired = {
+                ...candidate,
+                trustState: "revoked",
+                trustOrigin: undefined,
+                pairedForDeviceId: undefined,
+                pairingFingerprint: undefined,
+                pinnedAt: undefined,
+              } satisfies LocalDeviceRecord;
+              assertValidTrustRecord(retired);
+              store.put(retired, deviceKey(userId, candidate.deviceId));
+            }
+            store.put(device, deviceKey(userId, identity.deviceId));
+            finish(device);
+          } catch (error) {
+            fail(error);
+          }
+        };
+        identityRequest.onerror = () => fail(identityRequest.error ?? new TrustStoreError("Unable to read device identity"));
+        identityRequest.onsuccess = () => {
+          persistedIdentity = identityRequest.result as StoredIdentityRecord | undefined;
+          identityReady = true;
+          attempt();
+        };
+        currentRequest.onerror = () => fail(currentRequest.error ?? new TrustStoreError("Unable to read trust state"));
+        currentRequest.onsuccess = () => {
+          current = currentRequest.result as LocalDeviceRecord | undefined;
+          if (current) {
+            try { assertValidTrustRecord(current); } catch (error) { fail(error); return; }
           }
           currentReady = true;
           attempt();

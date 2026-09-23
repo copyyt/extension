@@ -11,6 +11,8 @@ import {
 import {
   buildClipboardEnvelopeSignatureMessage,
   buildDeviceApprovalMessage,
+  buildDeviceManagementMessage,
+  buildDeviceRecoveryMessage,
   buildDirectClipboardManifestMessage,
   buildDirectClipboardWrapContext,
   buildKeyWrapContext,
@@ -494,6 +496,71 @@ export async function signDeviceApproval(input: {
     ...input.pendingDevice,
   });
   return bytesToBase64(await signWithIdentity(input.approvingIdentity, message));
+}
+
+export async function signDeviceManagement(input: {
+  userId: string;
+  identity: DeviceIdentity;
+  action: "update" | "revoke";
+  targetDeviceId: string;
+  targetKeyVersion: number;
+  timestamp: number;
+  nonce: string;
+  name?: string;
+  platform?: string;
+  capabilities?: string[];
+  appVersion?: string;
+  recoveryPublicKey?: string;
+}): Promise<string> {
+  if (input.identity.userId !== input.userId) {
+    throw new CryptoProtocolError("The management identity belongs to another account");
+  }
+  const requestingKeyVersion = input.identity.keyVersion;
+  if (requestingKeyVersion === null) {
+    throw new CryptoProtocolError("The device must be registered before signing management");
+  }
+  return bytesToBase64(
+    await signWithIdentity(
+      input.identity,
+      buildDeviceManagementMessage({
+        action: input.action,
+        userId: input.userId,
+        requestingDeviceId: input.identity.deviceId,
+        requestingKeyVersion,
+        targetDeviceId: input.targetDeviceId,
+        targetKeyVersion: input.targetKeyVersion,
+        timestamp: input.timestamp,
+        nonce: input.nonce,
+        name: input.name,
+        platform: input.platform,
+        capabilities: input.capabilities,
+        appVersion: input.appVersion,
+        recoveryPublicKey: input.recoveryPublicKey,
+      }),
+    ),
+  );
+}
+
+export async function signDeviceRecovery(input: {
+  recoveryPrivateKey: CryptoKey;
+  message: Parameters<typeof buildDeviceRecoveryMessage>[0];
+}): Promise<string> {
+  if (
+    input.recoveryPrivateKey.type !== "private" ||
+    input.recoveryPrivateKey.algorithm.name !== "Ed25519" ||
+    !input.recoveryPrivateKey.usages.includes("sign")
+  ) {
+    throw new CryptoProtocolError("The recovery credential is not an Ed25519 signing key");
+  }
+  const signature = new Uint8Array(
+    await globalThis.crypto.subtle.sign(
+      ED25519,
+      input.recoveryPrivateKey,
+      asBufferSource(buildDeviceRecoveryMessage(input.message)),
+    ),
+  );
+  assertLength(signature, 64, "Ed25519 recovery signature");
+  return bytesToBase64(signature);
 }
 
 export async function verifyDeviceApproval(input: {

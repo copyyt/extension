@@ -422,7 +422,6 @@ async function createConnectedClipboardTransfer(
     transferTimeoutMs: options.transferTimeoutMs,
     cleanupTimeoutMs: options.cleanupTimeoutMs,
   });
-  let responderManager: WebRtcPeerManager | undefined;
   const managerB = new WebRtcPeerManager({
     peerConnectionFactory: () => {
       const peer = new FakePeerConnection();
@@ -447,7 +446,7 @@ async function createConnectedClipboardTransfer(
             candidate.frame.type === "clipboard-secure-chunk",
         ).length === encryptedChunks.length
       ) {
-        await responderManager!.sendClipboardVerified({
+        await managerB.sendClipboardVerified({
           transferId,
           plaintextByteLength: packageToSend.plaintextByteLength,
         });
@@ -458,8 +457,6 @@ async function createConnectedClipboardTransfer(
     transferTimeoutMs: options.transferTimeoutMs,
     cleanupTimeoutMs: options.cleanupTimeoutMs,
   });
-  responderManager = managerB;
-
   await managerA.startClipboardTransfer({
     transferId,
     remoteDeviceId: recipientDeviceId,

@@ -1,18 +1,25 @@
 import { getApis } from "@/api";
-import { API_URL } from "@/utils/constants";
+import { API_URL, APP_TYPE } from "@/utils/constants";
 import axios from "axios";
+import {
+  clearWebAccessToken,
+  getWebAccessToken,
+} from "./web-session";
 
 export const useAuthAxios = () => {
   const axiosInstance = axios.create({
     baseURL: API_URL + "/api/v1",
     timeout: 120000,
+    withCredentials: APP_TYPE === "web",
+    headers: APP_TYPE === "web" ? { "X-Copyyt-Client": "web" } : undefined,
   });
 
   // add interceptors
   axiosInstance.interceptors.response.use(
     (response) => response,
     (error) => {
-      if (error.response.status === 401) {
+      if (error?.response?.status === 401) {
+        clearWebAccessToken();
         window.location.href = "/";
       }
 
@@ -23,14 +30,17 @@ export const useAuthAxios = () => {
   axiosInstance.interceptors.request.use(
     async (config) => {
       config.headers.Accept = "application/json";
-      config.headers.authorization = `Bearer ${localStorage.getItem(
-        "accessToken",
-      )}`;
+      const accessToken = getWebAccessToken();
+      if (accessToken) {
+        config.headers.authorization = `Bearer ${accessToken}`;
+      } else {
+        delete config.headers.authorization;
+      }
       config.timeout = 120000;
       return config;
     },
     (error) => {
-      Promise.reject(error);
+      return Promise.reject(error);
     },
   );
 
@@ -41,6 +51,8 @@ export const useAxios = () => {
   const axiosInstance = axios.create({
     baseURL: API_URL + "/api/v1",
     timeout: 120000,
+    withCredentials: APP_TYPE === "web",
+    headers: APP_TYPE === "web" ? { "X-Copyyt-Client": "web" } : undefined,
   });
 
   // add interceptors
@@ -52,7 +64,7 @@ export const useAxios = () => {
       return config;
     },
     (error) => {
-      Promise.reject(error);
+      return Promise.reject(error);
     },
   );
 

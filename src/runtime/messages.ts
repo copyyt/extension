@@ -72,6 +72,9 @@ export interface RuntimeStatus {
     keyVersion?: number;
     registration: DeviceRegistrationState;
     trustState: DeviceTrustState;
+    recoveryAvailable?: boolean;
+    recoveryExportedAt?: string;
+    recoveryRotationPending?: boolean;
   };
   socket: {
     connected: boolean;
@@ -149,6 +152,13 @@ export interface AuthenticatedRuntimeResult {
   user: IUser;
 }
 
+export interface RecoveryCredentialResult {
+  /** Prefix prevents confusing this with a device signing key export. */
+  format: "copyyt-recovery-v1";
+  rootDeviceId: string;
+  privateKeyPkcs8Base64: string;
+}
+
 export type RuntimeCommand =
   | { type: "runtime:get-status" }
   | {
@@ -161,6 +171,9 @@ export type RuntimeCommand =
   | { type: "runtime:complete-pending-image"; itemId: string }
   | { type: "runtime:release-pending-image"; itemId: string }
   | { type: "runtime:bootstrap-trust-anchor" }
+  | { type: "runtime:export-recovery-credential" }
+  | { type: "runtime:confirm-recovery-credential-saved" }
+  | { type: "runtime:recover-device"; credential: string }
   | { type: "runtime:refresh-onboarding" }
   | {
       type: "runtime:approve-pending-device";

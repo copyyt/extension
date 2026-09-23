@@ -381,6 +381,9 @@ function makeRuntime(overrides: Partial<{
   identityLoader: (userId: string) => Promise<DeviceIdentity | null>;
   identityCreator: (userId: string) => Promise<DeviceIdentity>;
   registerDevice: RuntimeDependencies["registerDevice"];
+  recoverDevice: RuntimeDependencies["recoverDevice"];
+  exportRecoveryKey: RuntimeDependencies["exportRecoveryKey"];
+  sealRecoveryKey: RuntimeDependencies["sealRecoveryKey"];
   socketFactory: RuntimeDependencies["socketFactory"];
   signChallenge: RuntimeDependencies["signChallenge"];
   recoveryAlarm: RuntimeDependencies["recoveryAlarm"];
@@ -419,6 +422,7 @@ function makeRuntime(overrides: Partial<{
     getDevice: async () => localDevice,
     upsertServerReportedDevice: async (device) => ({ ...device, trustState: "unverified" }),
     bootstrapInitialTrustAnchor: async () => ({ ...localDevice, trustState: "root", trustOrigin: "initial-tofu" }),
+    recoverTrustAnchor: async () => ({ ...localDevice, trustState: "root", trustOrigin: "recovery" }),
     pinPairedApprover: async () => { throw new Error("not used"); },
     pinInitialDevice: async () => { throw new Error("not used"); },
     applyApproval: async () => { throw new Error("not used"); },
@@ -466,6 +470,9 @@ function makeRuntime(overrides: Partial<{
     identityLoader: overrides.identityLoader ?? (async () => runtimeIdentity),
     identityCreator: overrides.identityCreator ?? (async () => runtimeIdentity),
     registerDevice: overrides.registerDevice ?? (async () => ({ identity: runtimeIdentity, device: runtimeRegisteredDevice })),
+    recoverDevice: overrides.recoverDevice ?? (async () => { throw new Error("not used"); }),
+    exportRecoveryKey: overrides.exportRecoveryKey ?? (async () => { throw new Error("not used"); }),
+    sealRecoveryKey: overrides.sealRecoveryKey ?? (async () => { throw new Error("not used"); }),
     signChallenge: overrides.signChallenge ?? (async () => "signed-challenge"),
     signApproval: overrides.signApproval,
     recoveryAlarm: overrides.recoveryAlarm,
@@ -4137,6 +4144,7 @@ function makePairingTrustStore(
       return next;
     },
     bootstrapInitialTrustAnchor: async () => records.get(key(rootIdentity.deviceId))! as ClientVerifiedDevice,
+    recoverTrustAnchor: async () => records.get(key(rootIdentity.deviceId))! as ClientVerifiedDevice,
     pinPairedApprover: async (_userId, localIdentity, approverDeviceId, confirmedFingerprint) => {
       const approver = records.get(key(approverDeviceId));
       if (!approver || approver.trustState !== "unverified") throw new Error("approver missing");
@@ -6383,4 +6391,169 @@ test("Send Off during automatic auth recovery prevents publish and replay after 
       { type: "start", resetBaseline: true },
     ],
   );
+});
+
+test("exporting the recovery credential does not seal it until the user confirms", async () => {
+  let exports = 0;
+  const sealed: DeviceIdentity[] = [];
+  const sealedIdentity = { ...identity, recoveryExportedAt: "2026-09-23T12:00:00.000Z" } as DeviceIdentity;
+  const { runtime } = makeRuntime({
+    localTrustState: "root",
+    registeredDevice: { ...registeredDevice, recoveryKeyActive: true },
+    exportRecoveryKey: async () => {
+      exports += 1;
+      return "UEtDUzg=";
+    },
+    sealRecoveryKey: async (target) => {
+      sealed.push(target);
+      return sealedIdentity;
+    },
+  });
+  await runtime.start();
+
+  // A popup that closes before the user copies the text can simply export again.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const exported = await runtime.handleMessage(runtimeMessage({ type: "runtime:export-recovery-credential" }));
+    assert.equal(exported.ok, true);
+    assert.deepEqual(exported.data, {
+      format: "copyyt-recovery-v1",
+      rootDeviceId: identity.deviceId,
+      privateKeyPkcs8Base64: "UEtDUzg=",
+    });
+  }
+  assert.equal(exports, 2);
+  assert.equal(sealed.length, 0);
+
+  const confirmed = await runtime.handleMessage(runtimeMessage({ type: "runtime:confirm-recovery-credential-saved" }));
+  assert.equal(confirmed.ok, true);
+  assert.equal(sealed.length, 1);
+  assert.equal(sealed[0]?.deviceId, identity.deviceId);
+});
+
+test("only an unsealed root device can export or seal the recovery credential", async () => {
+  const neverCalled = async (): Promise<never> => {
+    throw new Error("must not be called");
+  };
+  const nonRoot = makeRuntime({
+    localTrustState: "verified",
+    exportRecoveryKey: neverCalled,
+    sealRecoveryKey: neverCalled,
+  });
+  await nonRoot.runtime.start();
+  for (const type of ["runtime:export-recovery-credential", "runtime:confirm-recovery-credential-saved"] as const) {
+    const result = await nonRoot.runtime.handleMessage(runtimeMessage({ type }));
+    assert.equal(result.ok, false);
+    assert.equal(result.error?.code, "DEVICE_NOT_LOCALLY_TRUSTED");
+  }
+
+  const sealedIdentity = { ...identity, recoveryExportedAt: "2026-09-23T12:00:00.000Z" } as DeviceIdentity;
+  const alreadySealed = makeRuntime({
+    identity: sealedIdentity,
+    registeredDevice: { ...registeredDevice, recoveryKeyActive: true },
+    localTrustState: "root",
+    exportRecoveryKey: neverCalled,
+    sealRecoveryKey: neverCalled,
+  });
+  await alreadySealed.runtime.start();
+  const exported = await alreadySealed.runtime.handleMessage(runtimeMessage({ type: "runtime:export-recovery-credential" }));
+  assert.equal(exported.ok, false);
+});
+
+test("a root device cannot export a recovery key the server has not confirmed", async () => {
+  const { runtime } = makeRuntime({
+    localTrustState: "root",
+    registeredDevice: { ...registeredDevice, recoveryKeyActive: false },
+    exportRecoveryKey: async () => {
+      throw new Error("must not be called");
+    },
+  });
+  await runtime.start();
+
+  const status = runtime.getStatus();
+  assert.equal(status.device.recoveryAvailable, false);
+  assert.equal(status.device.recoveryRotationPending, true);
+  const exported = await runtime.handleMessage(runtimeMessage({ type: "runtime:export-recovery-credential" }));
+  assert.equal(exported.ok, false);
+});
+
+test("a recovery whose rotation failed is retried by re-registration and clears once confirmed", async () => {
+  let registrations = 0;
+  let serverConfirms = false;
+  const recoverableIdentity = {
+    ...identity,
+    recoveryPublicKeyBase64: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+  } as DeviceIdentity;
+  const { runtime } = makeRuntime({
+    identity: recoverableIdentity,
+    localTrustState: "root",
+    registerDevice: async () => {
+      registrations += 1;
+      return {
+        identity: recoverableIdentity,
+        device: { ...registeredDevice, recoveryKeyActive: serverConfirms },
+      };
+    },
+    recoverDevice: async () => ({
+      identity: recoverableIdentity,
+      device: registeredDevice,
+      recoveryKeyRotated: false,
+    }),
+  });
+  await runtime.start();
+  const registrationsBeforeRecovery = registrations;
+
+  // The retry registration right after recovery still fails to rotate.
+  await runtime.handleMessage(runtimeMessage({
+    type: "runtime:recover-device",
+    credential: "copyyt-recovery-v1\nrootDeviceId=x\nprivateKeyPkcs8Base64=y",
+  }));
+  assert.ok(registrations > registrationsBeforeRecovery, "recovery must re-register to retry rotation");
+  assert.equal(runtime.getStatus().device.recoveryRotationPending, true);
+  assert.equal(runtime.getStatus().device.recoveryAvailable, false);
+
+  // A later registration (e.g. the next reconnect) succeeds in rotating the key.
+  serverConfirms = true;
+  await runtime.reconcileConnectivity("network-restored");
+  assert.equal(runtime.getStatus().device.recoveryRotationPending, undefined);
+  assert.equal(runtime.getStatus().device.recoveryAvailable, true);
+});
+
+test("recovering a device reports a pending key rotation and marks onboarding complete", async () => {
+  const recoveryCalls: string[] = [];
+  const { runtime } = makeRuntime({
+    localTrustState: "root",
+    recoverDevice: async (_api, options) => {
+      recoveryCalls.push(String(options.credential));
+      return { identity, device: registeredDevice, recoveryKeyRotated: false };
+    },
+  });
+  await runtime.start();
+
+  const result = await runtime.handleMessage(runtimeMessage({
+    type: "runtime:recover-device",
+    credential: "copyyt-recovery-v1\nrootDeviceId=x\nprivateKeyPkcs8Base64=y",
+  }));
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(recoveryCalls, ["copyyt-recovery-v1\nrootDeviceId=x\nprivateKeyPkcs8Base64=y"]);
+  const status = runtime.getStatus();
+  assert.equal(status.device.recoveryRotationPending, true);
+  assert.equal(status.onboarding.state, "complete");
+});
+
+test("a failed recovery surfaces an error and leaves the device untrusted", async () => {
+  const { runtime } = makeRuntime({
+    recoverDevice: async () => {
+      throw new Error("invalid_recovery_signature");
+    },
+  });
+  await runtime.start();
+
+  const result = await runtime.handleMessage(runtimeMessage({
+    type: "runtime:recover-device",
+    credential: "copyyt-recovery-v1\nrootDeviceId=x\nprivateKeyPkcs8Base64=y",
+  }));
+
+  assert.equal(result.ok, false);
+  assert.notEqual(runtime.getStatus().onboarding.state, "complete");
 });

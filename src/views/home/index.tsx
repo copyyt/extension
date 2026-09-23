@@ -4,6 +4,7 @@ import { base64ToBytes } from "@/crypto/bytes";
 import { sendRuntimeCommand } from "@/runtime/client";
 import type {
   PendingAssistedImageCopyResult,
+  RecoveryCredentialResult,
   RuntimeStatus,
 } from "@/runtime/messages";
 import { useRuntimeStatus } from "@/hooks/runtime-status.hook";
@@ -50,6 +51,9 @@ function Home() {
   const [directBusy, setDirectBusy] = useState(false);
   const [confirmedFingerprint, setConfirmedFingerprint] = useState("");
   const [message, setMessage] = useState<string | null>(null);
+  const [recoveryCredential, setRecoveryCredential] = useState<string | null>(null);
+  const [recoveryCredentialInput, setRecoveryCredentialInput] = useState("");
+  const [recovering, setRecovering] = useState(false);
 
   const sendCurrentClipboard = async () => {
     setSending(true);
@@ -161,6 +165,66 @@ function Home() {
       setMessage(error instanceof Error ? error.message : "Unable to trust this device");
     } finally {
       setTrusting(false);
+    }
+  };
+
+  const exportRecoveryCredential = async () => {
+    setMessage(null);
+    try {
+      const result = await sendRuntimeCommand<RecoveryCredentialResult>({
+        type: "runtime:export-recovery-credential",
+      });
+      setRecoveryCredential(
+        `${result.format}\nrootDeviceId=${result.rootDeviceId}\nprivateKeyPkcs8Base64=${result.privateKeyPkcs8Base64}`,
+      );
+      setMessage(
+        "Save this recovery credential offline, then confirm below. Until you confirm, you can export it again.",
+      );
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to export recovery credential");
+    }
+  };
+
+  const confirmRecoveryCredentialSaved = async () => {
+    setMessage(null);
+    try {
+      await sendRuntimeCommand<RuntimeStatus>({
+        type: "runtime:confirm-recovery-credential-saved",
+      });
+      setRecoveryCredential(null);
+      setMessage("Recovery credential saved. It has been removed from this device.");
+      await reload();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to confirm the recovery credential");
+    }
+  };
+
+  const recoverDevice = async () => {
+    const credential = recoveryCredentialInput.trim();
+    if (!credential) {
+      setMessage("Paste your offline recovery credential first.");
+      return;
+    }
+    setRecovering(true);
+    setMessage(null);
+    try {
+      const result = await sendRuntimeCommand<RuntimeStatus>({
+        type: "runtime:recover-device",
+        credential,
+      });
+      setMessage(
+        result.device.recoveryRotationPending
+          ? "Device recovered, but the new recovery key is not confirmed yet. Keep your existing offline credential; Copyyt will retry automatically."
+          : "Device recovered. Export the new rotated recovery credential now.",
+      );
+      await reload();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to recover this device");
+    } finally {
+      // Never retain the imported old private key in popup state, even after
+      // a rejected request.
+      setRecoveryCredentialInput("");
+      setRecovering(false);
     }
   };
 
@@ -324,6 +388,82 @@ function Home() {
         >
           {trusting ? "Trusting device…" : "Trust this device (first setup)"}
         </Button>
+      ) : null}
+
+      {status?.device.trustState === "root" &&
+      status.device.recoveryAvailable &&
+      !status.device.recoveryRotationPending &&
+      !status.device.recoveryExportedAt ? (
+        <div className="mt-3 rounded-lg border border-[#D1D5DB] p-4 text-xs">
+          <p className="text-sm font-semibold">Offline recovery credential</p>
+          <p className="mt-2 text-[#4B5563]">
+            Export this once and store it offline. Anyone with it can recover the account root,
+            so never paste it into chat or upload it to a website.
+          </p>
+          <Button
+            variant="outlined"
+            className="mt-3 w-full"
+            onClick={() => void exportRecoveryCredential()}
+            disabled={Boolean(recoveryCredential)}
+          >
+            Export recovery credential
+          </Button>
+          {recoveryCredential ? (
+            <>
+              <textarea
+                className="mt-3 h-28 w-full resize-none rounded border border-[#D1D5DB] p-2 font-mono text-[10px]"
+                readOnly
+                value={recoveryCredential}
+                aria-label="Offline recovery credential"
+              />
+              <Button
+                className="mt-3 w-full"
+                onClick={() => void confirmRecoveryCredentialSaved()}
+              >
+                I have saved it offline
+              </Button>
+            </>
+          ) : null}
+        </div>
+      ) : null}
+
+      {status?.device.recoveryRotationPending ? (
+        <div className="mt-3 rounded-lg border border-[#D1D5DB] p-4 text-xs">
+          <p className="text-sm font-semibold">Recovery key not confirmed yet</p>
+          <p className="mt-2 text-[#4B5563]">
+            The server has not confirmed this device&apos;s recovery key yet, so there is nothing
+            to export. Copyyt retries automatically each time this device reconnects. Until then,
+            keep your existing offline recovery credential.
+          </p>
+        </div>
+      ) : null}
+
+      {status?.device.registration === "registered" &&
+      status.device.trustState === "unverified" &&
+      status.onboarding.state !== "complete" ? (
+        <div className="mt-3 rounded-lg border border-[#D1D5DB] p-4 text-xs">
+          <p className="text-sm font-semibold">Recover this device</p>
+          <p className="mt-2 text-[#4B5563]">
+            Paste the offline recovery credential from your previous Copyyt root device.
+            The credential is used once, rotated immediately, and never stored by this extension.
+          </p>
+          <textarea
+            className="mt-3 h-28 w-full resize-none rounded border border-[#D1D5DB] p-2 font-mono text-[10px]"
+            value={recoveryCredentialInput}
+            onChange={(event) => setRecoveryCredentialInput(event.target.value)}
+            aria-label="Offline recovery credential to import"
+            autoComplete="off"
+            spellCheck={false}
+          />
+          <Button
+            variant="outlined"
+            className="mt-3 w-full"
+            onClick={() => void recoverDevice()}
+            disabled={recovering || !recoveryCredentialInput.trim()}
+          >
+            {recovering ? "Recovering device…" : "Recover device"}
+          </Button>
+        </div>
       ) : null}
 
       {status?.onboarding?.state === "pairing-required" ? (

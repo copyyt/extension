@@ -7,6 +7,8 @@ import {
   encryptClipboardItem,
   getDeviceIdentity,
   getOrCreateDeviceIdentity,
+  exportRecoveryPrivateKey,
+  sealRecoveryCredential,
   signDeviceApproval,
   signSocketChallenge,
   type ClipboardItemEnvelope,
@@ -46,6 +48,7 @@ import {
 } from "../crypto/direct-clipboard.ts";
 import {
   registerCurrentDevice,
+  recoverCurrentDevice,
   type ApproveDeviceRequest,
   type DeviceRegistrationApi,
   type RegisteredDeviceListResponse,
@@ -86,6 +89,7 @@ import {
   POPUP_SOURCE,
   RUNTIME_SOURCE,
   type AuthenticatedRuntimeResult,
+  type RecoveryCredentialResult,
   type RuntimeCommand,
   type RuntimeResponse,
   type RuntimeStatus,
@@ -186,6 +190,9 @@ export interface RuntimeDependencies {
   identityLoader?: (userId: string) => Promise<DeviceIdentity | null>;
   identityCreator?: (userId: string) => Promise<DeviceIdentity>;
   registerDevice?: typeof registerCurrentDevice;
+  recoverDevice?: typeof recoverCurrentDevice;
+  exportRecoveryKey?: typeof exportRecoveryPrivateKey;
+  sealRecoveryKey?: typeof sealRecoveryCredential;
   encrypt?: typeof encryptClipboardItem;
   decrypt?: typeof decryptClipboardItemBytes;
   prepareDirect?: typeof prepareDirectClipboardTransfer;
@@ -652,6 +659,9 @@ function commandFallbackErrorCode(command: RuntimeCommand): RuntimeErrorCode {
     case "runtime:cancel-direct-test":
       return "DIRECT_TRANSPORT_FAILED";
     case "runtime:bootstrap-trust-anchor":
+    case "runtime:export-recovery-credential":
+    case "runtime:confirm-recovery-credential-saved":
+    case "runtime:recover-device":
     case "runtime:refresh-onboarding":
     case "runtime:approve-pending-device":
     case "runtime:confirm-paired-approver":
@@ -668,6 +678,9 @@ export class CopyytServiceWorkerRuntime {
   ) => Promise<DeviceIdentity | null>;
   private readonly identityCreator: (userId: string) => Promise<DeviceIdentity>;
   private readonly registerDevice: typeof registerCurrentDevice;
+  private readonly recoverDeviceWithCredential: typeof recoverCurrentDevice;
+  private readonly exportRecoveryKey: typeof exportRecoveryPrivateKey;
+  private readonly sealRecoveryKey: typeof sealRecoveryCredential;
   private readonly encrypt: typeof encryptClipboardItem;
   private readonly decrypt: typeof decryptClipboardItemBytes;
   private readonly prepareDirect: typeof prepareDirectClipboardTransfer;
@@ -691,6 +704,12 @@ export class CopyytServiceWorkerRuntime {
   private challengeInFlight = false;
   private challengeReceived = false;
   private serverDeviceState: ServerDeviceState = "unknown";
+  /**
+   * Whether the server confirmed, on the latest registration, that this
+   * device's recovery public key is the account's active recovery key. Only
+   * then is the local recovery private key worth exporting. Fails closed.
+   */
+  private recoveryKeyActive = false;
   private startup: Promise<void> | null = null;
   private initialization: Promise<void> | null = null;
   private refreshInFlight: Promise<RuntimeSession> | null = null;
@@ -754,6 +773,11 @@ export class CopyytServiceWorkerRuntime {
     this.identityCreator =
       dependencies.identityCreator ?? getOrCreateDeviceIdentity;
     this.registerDevice = dependencies.registerDevice ?? registerCurrentDevice;
+    this.recoverDeviceWithCredential =
+      dependencies.recoverDevice ?? recoverCurrentDevice;
+    this.exportRecoveryKey =
+      dependencies.exportRecoveryKey ?? exportRecoveryPrivateKey;
+    this.sealRecoveryKey = dependencies.sealRecoveryKey ?? sealRecoveryCredential;
     this.encrypt = dependencies.encrypt ?? encryptClipboardItem;
     this.decrypt = dependencies.decrypt ?? decryptClipboardItemBytes;
     this.prepareDirect = dependencies.prepareDirect ?? prepareDirectClipboardTransfer;
@@ -1058,6 +1082,7 @@ export class CopyytServiceWorkerRuntime {
       // Network, Socket.IO, and temporary backend availability errors are
       // connection state—not runtime startup death. Do not poison the worker.
       this.serverDeviceState = "unknown";
+      this.recoveryKeyActive = false;
       this.setConnectionRecovering(
         error instanceof RuntimeError ? error.code : "SOCKET_NOT_READY",
         error instanceof Error
@@ -1177,6 +1202,7 @@ export class CopyytServiceWorkerRuntime {
     };
     await this.refreshPendingAssistedImageStatus();
     this.serverDeviceState = "unknown";
+    this.recoveryKeyActive = false;
     this.socketReady = false;
     this.challengeInFlight = false;
     this.challengeReceived = false;
@@ -3079,6 +3105,12 @@ export class CopyytServiceWorkerRuntime {
         return this.getStatus();
       case "runtime:bootstrap-trust-anchor":
         return this.bootstrapTrustAnchor();
+      case "runtime:export-recovery-credential":
+        return this.exportRecoveryCredential();
+      case "runtime:confirm-recovery-credential-saved":
+        return this.confirmRecoveryCredentialSaved();
+      case "runtime:recover-device":
+        return this.recoverDevice(command.credential);
       case "runtime:refresh-onboarding":
         await this.refreshOnboarding();
         this.maybeConnectSocket();
@@ -3246,6 +3278,7 @@ export class CopyytServiceWorkerRuntime {
       this.maybeConnectSocket();
     } catch (error) {
       this.serverDeviceState = "unknown";
+      this.recoveryKeyActive = false;
       this.report(
         error,
         "DEVICE_NOT_REGISTERED",
@@ -3265,11 +3298,13 @@ export class CopyytServiceWorkerRuntime {
       await this.ensureAccountInitialized();
       await this.refreshOnboarding().catch(() => {
         this.serverDeviceState = "unknown";
+        this.recoveryKeyActive = false;
         this.setOnboarding({ state: "unknown", bootstrapEligible: false });
       });
       this.maybeConnectSocket();
     } catch (error) {
       this.serverDeviceState = "unknown";
+      this.recoveryKeyActive = false;
       this.report(
         error,
         "DEVICE_NOT_REGISTERED",
@@ -3330,6 +3365,12 @@ export class CopyytServiceWorkerRuntime {
     response: SignInResponse,
     expected?: { session: RuntimeSession; generation: number },
   ): Promise<void> {
+    if (typeof response.refreshToken !== "string" || !response.refreshToken.trim()) {
+      throw new RuntimeError(
+        "AUTH_REQUIRED",
+        "The extension sign-in response did not include a refresh credential",
+      );
+    }
     const session: RuntimeSession = {
       schemaVersion: 2,
       accessToken: response.accessToken,
@@ -3388,6 +3429,7 @@ export class CopyytServiceWorkerRuntime {
       }
       this.session = session;
       this.serverDeviceState = "unknown";
+      this.recoveryKeyActive = false;
       this.setStatus({
         ...DEFAULT_STATUS,
         connectionState: "account-authenticated",
@@ -3458,6 +3500,7 @@ export class CopyytServiceWorkerRuntime {
     this.destroySocket(this.socket);
     this.pendingConnectivityIntent = null;
     this.serverDeviceState = "unknown";
+    this.recoveryKeyActive = false;
     this.setStatus({
       ...DEFAULT_STATUS,
       connectionState: "signed-out",
@@ -3517,6 +3560,90 @@ export class CopyytServiceWorkerRuntime {
     });
     await this.updateDeviceStatus(identity);
     this.setOnboarding({ state: "complete", bootstrapEligible: false });
+    return this.getStatus();
+  }
+
+  private async requireExportableRootIdentity(): Promise<DeviceIdentity> {
+    const session = this.requireSession();
+    const identity = await this.identityLoader(session.user.id);
+    if (!identity || identity.keyVersion === null) {
+      throw new RuntimeError(
+        "DEVICE_NOT_REGISTERED",
+        "Register this device before exporting its recovery credential",
+      );
+    }
+    const trust = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      identity.deviceId,
+    );
+    if (trust?.trustState !== "root") {
+      throw new RuntimeError(
+        "DEVICE_NOT_LOCALLY_TRUSTED",
+        "Only the account root device can export its recovery credential",
+      );
+    }
+    if (identity.recoveryExportedAt) {
+      throw new RuntimeError(
+        "PAIRING_FAILED",
+        "This recovery credential has already been exported",
+      );
+    }
+    if (!this.recoveryKeyActive) {
+      throw new RuntimeError(
+        "PAIRING_FAILED",
+        "The server has not confirmed this device's recovery key yet; reconnect and try again",
+      );
+    }
+    return identity;
+  }
+
+  /**
+   * Returns the credential without sealing it. A popup can close before the
+   * user copies it, so the private key is only deleted once the user confirms
+   * the offline copy via runtime:confirm-recovery-credential-saved.
+   */
+  private async exportRecoveryCredential(): Promise<RecoveryCredentialResult> {
+    const identity = await this.requireExportableRootIdentity();
+    const privateKeyPkcs8Base64 = await this.exportRecoveryKey(identity);
+    return {
+      format: "copyyt-recovery-v1",
+      rootDeviceId: identity.deviceId,
+      privateKeyPkcs8Base64,
+    };
+  }
+
+  private async confirmRecoveryCredentialSaved(): Promise<RuntimeStatus> {
+    const identity = await this.requireExportableRootIdentity();
+    await this.updateDeviceStatus(await this.sealRecoveryKey(identity));
+    return this.getStatus();
+  }
+
+  private async recoverDevice(credential: string): Promise<RuntimeStatus> {
+    const session = this.requireSession();
+    const registered = await this.recoverDeviceWithCredential(
+      this.dependencies.apiFactory(session.accessToken).devices,
+      {
+        userId: session.user.id,
+        name: "Copyyt Chrome",
+        capabilities: [...CLIPBOARD_RECEIVE_CAPABILITIES],
+        appVersion: this.dependencies.appVersion,
+        credential,
+        trustStore: this.dependencies.trustStore,
+      },
+    );
+    // The recovery endpoint has already authorized this identity. Keep the
+    // success state visible even if a follow-up device snapshot is
+    // temporarily unavailable (the durable trust transition above is atomic).
+    this.serverDeviceState = "trusted";
+    this.recoveryKeyActive = registered.recoveryKeyRotated;
+    await this.updateDeviceStatus(registered.identity);
+    // Re-register now so the server reports the active recovery key; for a
+    // recovery whose rotation failed, this signed registration retries it.
+    // A failure leaves recoveryRotationPending set; startup retries again.
+    await this.ensureAccountInitialized().catch(() => undefined);
+    this.setOnboarding({ state: "complete", bootstrapEligible: false });
+    this.maybeConnectSocket();
+    void this.refreshOnboarding().catch(() => undefined);
     return this.getStatus();
   }
 
@@ -4264,6 +4391,7 @@ export class CopyytServiceWorkerRuntime {
           },
         );
         identity = registered.identity;
+        this.recoveryKeyActive = registered.device.recoveryKeyActive === true;
         this.serverDeviceState =
           registered.device.trustState === "trusted"
             ? "trusted"
@@ -4312,6 +4440,18 @@ export class CopyytServiceWorkerRuntime {
         registration:
           identity.keyVersion === null ? "not-registered" : "registered",
         trustState: trust?.trustState ?? "unverified",
+        recoveryAvailable:
+          this.recoveryKeyActive &&
+          typeof identity.recoveryPublicKeyBase64 === "string" &&
+          identity.recoveryPublicKeyBase64.length > 0,
+        // A root whose recovery key the server has not confirmed (e.g. a
+        // recovery whose key rotation failed). Registration retries it.
+        ...(trust?.trustState === "root" && !this.recoveryKeyActive
+          ? { recoveryRotationPending: true }
+          : {}),
+        ...(identity.recoveryExportedAt
+          ? { recoveryExportedAt: identity.recoveryExportedAt }
+          : {}),
       },
       syncReady:
         this.serverDeviceState === "trusted" &&

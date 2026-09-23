@@ -2,30 +2,105 @@ import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import type { AxiosResponse } from "axios";
 import { CLIPBOARD_RECEIVE_CAPABILITIES } from "../clipboard/capabilities.ts";
-import { bytesToBase64 } from "./bytes.ts";
+import { base64ToBytes, bytesToBase64 } from "./bytes.ts";
 import {
   pairingFingerprint,
   signDeviceApproval,
   signSocketChallenge,
 } from "./crypto-core.ts";
+import { buildDeviceManagementMessage, buildDeviceRecoveryMessage } from "./protocol.ts";
 import {
   registerCurrentDevice,
+  recoverCurrentDevice,
+  parseRecoveryCredential,
   type DeviceRegistrationApi,
   type DeviceRegistrationRequest,
   type RegisteredDeviceResponse,
 } from "./device-registration.ts";
 import {
   createDeviceIdentityForTesting,
+  exportRecoveryPrivateKey,
   getDeviceIdentity,
   getPrivateKeyHandles,
+  RecoveryCredentialSealedError,
+  sealRecoveryCredential,
   type StoredIdentityRecord,
 } from "./key-store.ts";
 import { IDENTITY_STORE, TRUST_DEVICE_STORE } from "./storage.ts";
-import { IndexedDBTrustStore } from "./trust-store.ts";
+import { InMemoryTrustStore, IndexedDBTrustStore } from "./trust-store.ts";
 
 const userId = "11111111-1111-4111-8111-111111111111";
 const localDeviceId = "00000000-0000-4000-8000-000000000001";
 const approverDeviceId = "00000000-0000-4000-8000-000000000002";
+
+test("device-management message matches the backend canonical vector", () => {
+  assert.equal(
+    new TextDecoder().decode(
+      buildDeviceManagementMessage({
+        action: "update",
+        userId,
+        requestingDeviceId: localDeviceId,
+        requestingKeyVersion: 9,
+        targetDeviceId: localDeviceId,
+        targetKeyVersion: 9,
+        timestamp: 1700000000000,
+        nonce: "00000000-0000-4000-8000-000000000009",
+        name: "Copyyt Chrome",
+        platform: "chrome",
+        capabilities: ["clipboard", "clipboard-html-v1"],
+        appVersion: "2.0.1",
+        recoveryPublicKey: "",
+      }),
+    ),
+    "27:copyyt-device-management-v113:action=update43:userId=11111111-1111-4111-8111-11111111111155:requestingDeviceId=00000000-0000-4000-8000-00000000000122:requestingKeyVersion=951:targetDeviceId=00000000-0000-4000-8000-00000000000118:targetKeyVersion=923:timestamp=170000000000042:nonce=00000000-0000-4000-8000-00000000000918:name=Copyyt Chrome15:platform=chrome46:capabilities=[\"clipboard\",\"clipboard-html-v1\"]16:appVersion=2.0.118:recoveryPublicKey=",
+  );
+});
+
+test("recovery canonical fields are length-prefixed and delimiters cannot alias", () => {
+  const base = {
+    userId,
+    rootDeviceId: localDeviceId,
+    deviceId: approverDeviceId,
+    name: "name=with\nseparator",
+    platform: "chrome",
+    encryptionPublicKey: bytesToBase64(new Uint8Array(32).fill(1)),
+    signingPublicKey: bytesToBase64(new Uint8Array(32).fill(2)),
+    capabilities: ["clipboard"],
+    timestamp: 1700000000000,
+    nonce: "00000000-0000-4000-8000-000000000009",
+    newRecoveryPublicKey: bytesToBase64(new Uint8Array(32).fill(3)),
+  } as const;
+  const first = new TextDecoder().decode(buildDeviceRecoveryMessage({
+    userId,
+    rootDeviceId: localDeviceId,
+    deviceId: approverDeviceId,
+    name: base.name,
+    platform: base.platform,
+    encryptionPublicKey: base.encryptionPublicKey,
+    signingPublicKey: base.signingPublicKey,
+    capabilities: [...base.capabilities],
+    appVersion: "1=2",
+    timestamp: base.timestamp,
+    nonce: base.nonce,
+    newRecoveryPublicKey: base.newRecoveryPublicKey,
+  }));
+  const second = new TextDecoder().decode(buildDeviceRecoveryMessage({
+    userId,
+    rootDeviceId: localDeviceId,
+    deviceId: approverDeviceId,
+    name: "name=with",
+    platform: "\nseparator",
+    encryptionPublicKey: base.encryptionPublicKey,
+    signingPublicKey: base.signingPublicKey,
+    capabilities: [...base.capabilities],
+    appVersion: "1=2",
+    timestamp: base.timestamp,
+    nonce: base.nonce,
+    newRecoveryPublicKey: base.newRecoveryPublicKey,
+  }));
+  assert.notEqual(first, second);
+  assert.match(first, /24:name=name=with\nseparator/);
+});
 
 test("registration refresh advertises assisted PNG receive support and preserves identity, keys, and pairing", async (context) => {
   const record = await storedIdentity(localDeviceId, 9);
@@ -102,6 +177,42 @@ test("registration refresh advertises assisted PNG receive support and preserves
   assert.equal(requests[0]!.deviceId, originalIdentity.deviceId);
   assert.equal(requests[0]!.encryptionPublicKey, originalIdentity.encryptionPublicKeyBase64);
   assert.equal(requests[0]!.signingPublicKey, originalIdentity.signingPublicKeyBase64);
+  assert.equal(requests[0]!.recoveryPublicKey, originalIdentity.recoveryPublicKeyBase64);
+  assert.equal(requests[0]!.requestingDeviceId, originalIdentity.deviceId);
+  assert.equal(requests[0]!.requestingKeyVersion, originalIdentity.keyVersion);
+  assert.ok(requests[0]!.managementTimestamp);
+  assert.ok(requests[0]!.managementNonce);
+  assert.ok(requests[0]!.managementSignature);
+  const managementPublicKey = await globalThis.crypto.subtle.importKey(
+    "raw",
+    base64ToBytes(originalIdentity.signingPublicKeyBase64),
+    { name: "Ed25519" },
+    true,
+    ["verify"],
+  );
+  assert.equal(
+    await globalThis.crypto.subtle.verify(
+      { name: "Ed25519" },
+      managementPublicKey,
+      base64ToBytes(requests[0]!.managementSignature!),
+      buildDeviceManagementMessage({
+        action: "update",
+        userId,
+        requestingDeviceId: originalIdentity.deviceId,
+        requestingKeyVersion: originalIdentity.keyVersion!,
+        targetDeviceId: originalIdentity.deviceId,
+        targetKeyVersion: originalIdentity.keyVersion!,
+        timestamp: requests[0]!.managementTimestamp!,
+        nonce: requests[0]!.managementNonce!,
+        name: requests[0]!.name,
+        platform: requests[0]!.platform,
+        capabilities: requests[0]!.capabilities,
+        appVersion: requests[0]!.appVersion,
+        recoveryPublicKey: requests[0]!.recoveryPublicKey,
+      }),
+    ),
+    true,
+  );
   const refreshedApprover = await trustStore.upsertServerReportedDevice({
     userId,
     deviceId: approverIdentity.deviceId,
@@ -164,6 +275,8 @@ test("registration refresh advertises assisted PNG receive support and preserves
     );
     assert.equal(getPrivateKeyHandles(refreshed).signingPrivateKey.extractable, false);
     assert.equal(getPrivateKeyHandles(refreshed).encryptionPrivateKey.extractable, false);
+    assert.equal(getPrivateKeyHandles(refreshed).recoveryPrivateKey?.extractable, true);
+    assert.equal(refreshed.recoveryPublicKeyBase64.length > 0, true);
   }
   const reloadedTrustStore = new IndexedDBTrustStore();
   const refreshedLocal = await reloadedTrustStore.getDevice(userId, localDeviceId);
@@ -182,6 +295,32 @@ test("registration refresh advertises assisted PNG receive support and preserves
   assert.equal(reloadedApprover?.pinnedAt, pairingBefore?.pinnedAt);
   assert.deepEqual(reloadedApprover?.capabilities, ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"]);
   assert.equal((await reloadedTrustStore.listEncryptionRecipients(userId)).length, 2);
+});
+
+test("sealing an exported recovery credential deletes the private key but keeps the public key", async (context) => {
+  installIdentityDatabase(context, await storedIdentity(localDeviceId, 3));
+  const identity = await getDeviceIdentity(userId);
+  assert.ok(identity);
+  const recoveryPublicKey = identity.recoveryPublicKeyBase64;
+  assert.ok((await exportRecoveryPrivateKey(identity)).length > 0);
+  // Exporting alone does not seal: a popup closed before copying can retry.
+  assert.equal(identity.recoveryExportedAt, null);
+
+  const sealed = await sealRecoveryCredential(identity);
+  assert.equal(typeof sealed.recoveryExportedAt, "string");
+  assert.equal(getPrivateKeyHandles(sealed).recoveryPrivateKey, undefined);
+  await assert.rejects(exportRecoveryPrivateKey(sealed), RecoveryCredentialSealedError);
+
+  const reloaded = await getDeviceIdentity(userId);
+  assert.ok(reloaded);
+  assert.equal(
+    reloaded.recoveryPublicKeyBase64,
+    recoveryPublicKey,
+    "a sealed record must not regenerate a recovery pair the server does not know",
+  );
+  assert.equal(reloaded.recoveryExportedAt, sealed.recoveryExportedAt);
+  assert.equal(getPrivateKeyHandles(reloaded).recoveryPrivateKey, undefined);
+  await assert.rejects(exportRecoveryPrivateKey(reloaded), RecoveryCredentialSealedError);
 });
 
 test("registration capabilities and server trust labels do not establish local trust", async (context) => {
@@ -206,6 +345,197 @@ test("registration capabilities and server trust labels do not establish local t
   assert.deepEqual(await trustStore.listEncryptionRecipients(userId), []);
 });
 
+test("offline recovery rotates the credential and replaces stale local roots", async (context) => {
+  const record = await storedIdentity(localDeviceId, 9);
+  installIdentityDatabase(context, record);
+  const identity = await getDeviceIdentity(userId);
+  assert.ok(identity);
+  const oldPrivateKey = await exportRecoveryPrivateKey(identity);
+  const oldRecoveryPublicKey = identity.recoveryPublicKeyBase64;
+  const trustStore = new InMemoryTrustStore();
+  const staleDeviceId = "00000000-0000-4000-8000-000000000003";
+  const staleIdentity = await createDeviceIdentityForTesting({
+    userId,
+    deviceId: staleDeviceId,
+    keyVersion: 2,
+    signingPrivateKey: (await globalThis.crypto.subtle.generateKey(
+      { name: "Ed25519" }, false, ["sign", "verify"],
+    ) as CryptoKeyPair).privateKey,
+    signingPublicKey: (await globalThis.crypto.subtle.generateKey(
+      { name: "Ed25519" }, false, ["sign", "verify"],
+    ) as CryptoKeyPair).publicKey,
+    encryptionPrivateKey: (await globalThis.crypto.subtle.generateKey(
+      { name: "X25519" }, false, ["deriveBits"],
+    ) as CryptoKeyPair).privateKey,
+    encryptionPublicKey: (await globalThis.crypto.subtle.generateKey(
+      { name: "X25519" }, false, ["deriveBits"],
+    ) as CryptoKeyPair).publicKey,
+  });
+  await trustStore.bootstrapInitialTrustAnchor(userId, staleIdentity);
+  await trustStore.upsertServerReportedDevice({
+    userId,
+    deviceId: identity.deviceId,
+    keyVersion: identity.keyVersion!,
+    encryptionPublicKey: identity.encryptionPublicKeyBase64,
+    signingPublicKey: identity.signingPublicKeyBase64,
+    trustState: "pending",
+  });
+
+  let request: Parameters<DeviceRegistrationApi["recoverDevice"]>[0] | undefined;
+  const api: DeviceRegistrationApi = {
+    async registerDevice() { throw new Error("not used"); },
+    async listPendingDevices() { throw new Error("not used"); },
+    async approveDevice() { throw new Error("not used"); },
+    async recoverDevice(input) {
+      request = input;
+      return {
+        data: {
+          deviceId: identity.deviceId,
+          name: "Recovered Chrome",
+          platform: "chrome",
+          encryptionPublicKey: identity.encryptionPublicKeyBase64,
+          signingPublicKey: identity.signingPublicKeyBase64,
+          trustState: "trusted",
+          keyVersion: 10,
+          capabilities: ["clipboard"],
+          appVersion: "2.0.1",
+        },
+      } as unknown as AxiosResponse<RegisteredDeviceResponse>;
+    },
+  };
+  const credential = [
+    "copyyt-recovery-v1",
+    `rootDeviceId=${identity.deviceId}`,
+    `privateKeyPkcs8Base64=${oldPrivateKey}`,
+  ].join("\n");
+  const result = await recoverCurrentDevice(api, {
+    userId,
+    name: "Recovered Chrome",
+    appVersion: "2.0.1",
+    capabilities: ["clipboard"],
+    credential,
+    trustStore,
+  });
+  assert.ok(request);
+  const recoveryRequest = request;
+  const oldPublicKey = await globalThis.crypto.subtle.importKey(
+    "raw",
+    base64ToBytes(oldRecoveryPublicKey),
+    { name: "Ed25519" },
+    false,
+    ["verify"],
+  );
+  assert.equal(
+    await globalThis.crypto.subtle.verify(
+      { name: "Ed25519" },
+      oldPublicKey,
+      base64ToBytes(recoveryRequest.signature),
+      buildDeviceRecoveryMessage({ ...recoveryRequest, userId }),
+    ),
+    true,
+  );
+  assert.notEqual(recoveryRequest.newRecoveryPublicKey, oldRecoveryPublicKey);
+  assert.equal(result.identity.recoveryPublicKeyBase64, recoveryRequest.newRecoveryPublicKey);
+  assert.equal((await trustStore.getDevice(userId, identity.deviceId))?.trustOrigin, "recovery");
+  assert.equal((await trustStore.getDevice(userId, staleDeviceId))?.trustState, "revoked");
+  assert.deepEqual(
+    (await trustStore.listEncryptionRecipients(userId)).map((device) => device.deviceId),
+    [identity.deviceId],
+  );
+  assert.notEqual(await exportRecoveryPrivateKey(result.identity), oldPrivateKey);
+});
+
+test("recovery rejects malformed credentials and does not rotate on backend failure", async (context) => {
+  const record = await storedIdentity(localDeviceId, 9);
+  installIdentityDatabase(context, record);
+  const identity = await getDeviceIdentity(userId);
+  assert.ok(identity);
+  await assert.rejects(() => parseRecoveryCredential("copyyt-recovery-v1\nrootDeviceId=x\nprivateKeyPkcs8Base64=x\nextra"));
+  const oldPublicKey = identity.recoveryPublicKeyBase64;
+  const credential = [
+    "copyyt-recovery-v1",
+    `rootDeviceId=${identity.deviceId}`,
+    `privateKeyPkcs8Base64=${await exportRecoveryPrivateKey(identity)}`,
+  ].join("\n");
+  const api: DeviceRegistrationApi = {
+    async registerDevice() { throw new Error("not used"); },
+    async listPendingDevices() { throw new Error("not used"); },
+    async approveDevice() { throw new Error("not used"); },
+    async recoverDevice() { throw new Error("recovery rejected"); },
+  };
+  await assert.rejects(() => recoverCurrentDevice(api, {
+    userId,
+    name: "Chrome",
+    appVersion: "2.0.1",
+    credential,
+  }), /recovery rejected/);
+  assert.equal((await getDeviceIdentity(userId))?.recoveryPublicKeyBase64, oldPublicKey);
+});
+
+test("recovery keeps the imported credential when the backend reports rotation pending", async (context) => {
+  const record = await storedIdentity(localDeviceId, 9);
+  installIdentityDatabase(context, record);
+  const identity = await getDeviceIdentity(userId);
+  assert.ok(identity);
+  const oldPrivateKey = await exportRecoveryPrivateKey(identity);
+  const api: DeviceRegistrationApi = {
+    async registerDevice() { throw new Error("not used"); },
+    async listPendingDevices() { throw new Error("not used"); },
+    async approveDevice() { throw new Error("not used"); },
+    async recoverDevice() {
+      return {
+        data: {
+          deviceId: identity.deviceId,
+          name: "Recovered Chrome",
+          platform: "chrome",
+          encryptionPublicKey: identity.encryptionPublicKeyBase64,
+          signingPublicKey: identity.signingPublicKeyBase64,
+          trustState: "trusted",
+          keyVersion: 10,
+          capabilities: ["clipboard"],
+          recoveryKeyRotated: false,
+        },
+      } as unknown as AxiosResponse<RegisteredDeviceResponse>;
+    },
+  };
+  const result = await recoverCurrentDevice(api, {
+    userId,
+    name: "Recovered Chrome",
+    appVersion: "2.0.1",
+    credential: [
+      "copyyt-recovery-v1",
+      `rootDeviceId=${identity.deviceId}`,
+      `privateKeyPkcs8Base64=${oldPrivateKey}`,
+    ].join("\n"),
+  });
+  assert.equal(result.recoveryKeyRotated, false);
+  assert.equal(await exportRecoveryPrivateKey(result.identity), oldPrivateKey);
+});
+
+test("durable recovery trust transition survives a store reload", async (context) => {
+  const record = await storedIdentity(localDeviceId, 9);
+  installIdentityDatabase(context, record);
+  const identity = await getDeviceIdentity(userId);
+  assert.ok(identity);
+  const trustStore = new IndexedDBTrustStore();
+  await trustStore.upsertServerReportedDevice({
+    userId,
+    deviceId: identity.deviceId,
+    keyVersion: identity.keyVersion!,
+    encryptionPublicKey: identity.encryptionPublicKeyBase64,
+    signingPublicKey: identity.signingPublicKeyBase64,
+    trustState: "pending",
+  });
+  const recovered = await trustStore.recoverTrustAnchor(userId, identity, {
+    name: "Recovered Chrome",
+    platform: "chrome",
+  });
+  assert.equal(recovered.trustOrigin, "recovery");
+  const reloaded = await new IndexedDBTrustStore().getDevice(userId, identity.deviceId);
+  assert.equal(reloaded?.trustState, "root");
+  assert.equal(reloaded?.trustOrigin, "recovery");
+});
+
 function registrationApi(
   requests: DeviceRegistrationRequest[],
   keyVersion: number,
@@ -215,13 +545,16 @@ function registrationApi(
       requests.push(request);
       return {
         data: { ...request, keyVersion, trustState: "trusted" },
-      } as AxiosResponse<RegisteredDeviceResponse>;
+      } as unknown as AxiosResponse<RegisteredDeviceResponse>;
     },
     async listPendingDevices() {
       throw new Error("Metadata refresh must not start pairing");
     },
     async approveDevice() {
       throw new Error("Metadata refresh must not request a new approval");
+    },
+    async recoverDevice() {
+      throw new Error("Metadata refresh must not request recovery");
     },
   };
 }

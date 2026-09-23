@@ -7,6 +7,7 @@ import {
 } from "../interfaces/auth.interface";
 import type {
   DeviceRegistrationRequest,
+  DeviceRecoveryRequest,
   ApproveDeviceRequest,
   RegisteredDeviceResponse,
   RegisteredDeviceListResponse,
@@ -23,11 +24,13 @@ export const getApis = (axiosInstance: AxiosInstance) => ({
         { withCredentials: true },
       ),
     verifyEmail: async (data: IVerifyEmail) =>
-      axiosInstance.post<SignInResponse>("/auth/verify-email", data),
+      axiosInstance.post<SignInResponse>("/auth/verify-email", data, {
+        withCredentials: true,
+      }),
     refreshTokens: async (refreshToken?: string) =>
       axiosInstance.post<SignInResponse>(
         "/auth/refresh-tokens",
-        refreshToken === undefined ? null : { refreshToken },
+        refreshToken === undefined ? {} : { refreshToken },
         {
           withCredentials: true,
         },
@@ -35,7 +38,7 @@ export const getApis = (axiosInstance: AxiosInstance) => ({
     logout: async (refreshToken?: string) =>
       axiosInstance.post(
         "/auth/logout",
-        refreshToken === undefined ? null : { refreshToken },
+        refreshToken === undefined ? {} : { refreshToken },
         {
           withCredentials: true,
         },
@@ -52,5 +55,7 @@ export const getApis = (axiosInstance: AxiosInstance) => ({
       axiosInstance.get<RegisteredDeviceListResponse>("/devices/pending"),
     approveDevice: async (data: ApproveDeviceRequest) =>
       axiosInstance.post<RegisteredDeviceResponse>("/devices/approve", data),
+    recoverDevice: async (data: DeviceRecoveryRequest) =>
+      axiosInstance.post<RegisteredDeviceResponse>("/devices/recover", data),
   },
 });

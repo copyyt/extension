@@ -5,6 +5,8 @@ export {
   computePairingFingerprint,
   pairingFingerprint,
   signDeviceApproval,
+  signDeviceManagement,
+  signDeviceRecovery,
   signSocketChallenge,
   unwrapContentKeyForRecipient,
   verifyClipboardEnvelopeSignature,
@@ -33,6 +35,10 @@ export {
   getDeviceIdentity,
   getOrCreateDeviceIdentity,
   clearDeviceIdentity,
+  exportRecoveryPrivateKey,
+  generateRecoveryKeyPair,
+  persistRecoveryKeyPair,
+  sealRecoveryCredential,
   type DeviceIdentity,
 } from "./key-store.ts";
 export {
@@ -45,12 +51,19 @@ export {
   type LocalTrustState,
   type TrustOrigin,
 } from "./trust-store.ts";
-export { registerCurrentDevice } from "./device-registration.ts";
+export {
+  parseRecoveryCredential,
+  recoverCurrentDevice,
+  registerCurrentDevice,
+} from "./device-registration.ts";
 export type {
   DeviceRegistrationApi,
   ApproveDeviceRequest,
   DeviceApprovalRequest,
   DeviceRegistrationRequest,
+  DeviceRecoveryRequest,
+  RecoveryCredential,
+  RecoverCurrentDeviceOptions,
   RegisteredDeviceResponse,
   RegisterCurrentDeviceOptions,
 } from "./device-registration.ts";
@@ -60,6 +73,8 @@ export {
   buildDirectClipboardManifestMessage,
   buildDirectClipboardWrapContext,
   buildDeviceApprovalMessage,
+  buildDeviceManagementMessage,
+  buildDeviceRecoveryMessage,
   buildKeyWrapContext,
   buildPairingFingerprintContext,
   buildPayloadAad,
