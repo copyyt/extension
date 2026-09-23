@@ -8,6 +8,7 @@ import {
 import type {
   DeviceRegistrationRequest,
   DeviceRecoveryRequest,
+  DeviceManagementRequest,
   ApproveDeviceRequest,
   RegisteredDeviceResponse,
   RegisteredDeviceListResponse,
@@ -15,6 +16,13 @@ import type {
 
 export const getApis = (axiosInstance: AxiosInstance) => ({
   auth: {
+    requestAccountResetCode: async () =>
+      axiosInstance.post<{ message: string }>("/auth/account-reset/code", {}),
+    resetAccount: async (code: number) =>
+      axiosInstance.post<{ message: string; removedDevices: number }>(
+        "/auth/account-reset",
+        { code },
+      ),
     signInPasswordless: async (data: ILoginIn) =>
       axiosInstance.post<ILoginResponse>("/auth/sign-in-passwordless", data),
     googleSign: async (token: string) =>
@@ -57,5 +65,10 @@ export const getApis = (axiosInstance: AxiosInstance) => ({
       axiosInstance.post<RegisteredDeviceResponse>("/devices/approve", data),
     recoverDevice: async (data: DeviceRecoveryRequest) =>
       axiosInstance.post<RegisteredDeviceResponse>("/devices/recover", data),
+    revokeDevice: async (deviceId: string, data: DeviceManagementRequest) =>
+      axiosInstance.delete<RegisteredDeviceResponse>(
+        `/devices/${encodeURIComponent(deviceId)}`,
+        { data },
+      ),
   },
 });

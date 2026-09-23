@@ -89,6 +89,12 @@ export interface ClientTrustStore {
     certificate: DeviceApprovalCertificate,
   ): Promise<ClientVerifiedDevice>;
   revokeDevice(userId: string, deviceId: string): MaybePromise<void>;
+  /**
+   * Drops every local trust record for the account. Only used when this
+   * device was revoked and is being set up again under a new identity, which
+   * must go through pairing from scratch.
+   */
+  clearAccount?(userId: string): MaybePromise<void>;
   listEncryptionRecipients(userId: string): MaybePromise<ClientVerifiedDevice[]>;
 }
 
@@ -329,6 +335,22 @@ function refreshMutableMetadata(
       ? [...incoming.capabilities]
       : undefined,
     appVersion: incoming.appVersion,
+  };
+}
+
+/**
+ * A revoked record keeps its keys (so they are never trusted again) but not
+ * its root ceremony: a trust origin and pairing metadata are only valid on a
+ * root, so revoking a root must drop them.
+ */
+function revokedRecord(device: LocalDeviceRecord): LocalDeviceRecord {
+  return {
+    ...device,
+    trustState: "revoked",
+    trustOrigin: undefined,
+    pairedForDeviceId: undefined,
+    pairingFingerprint: undefined,
+    pinnedAt: undefined,
   };
 }
 
@@ -685,12 +707,15 @@ export class InMemoryTrustStore implements ClientTrustStore {
   revokeDevice(userId: string, deviceId: string): void {
     const device = this.getDevice(userId, deviceId);
     if (device) {
-      const revoked = {
-        ...device,
-        trustState: "revoked",
-      } satisfies LocalDeviceRecord;
+      const revoked = revokedRecord(device);
       assertValidTrustRecord(revoked);
       this.devices.set(deviceKey(userId, deviceId), revoked);
+    }
+  }
+
+  clearAccount(userId: string): void {
+    for (const [key, device] of this.devices) {
+      if (device.userId === userId) this.devices.delete(key);
     }
   }
 
@@ -1319,13 +1344,32 @@ export class IndexedDBTrustStore implements ClientTrustStore {
               finish(undefined);
               return;
             }
-            const revoked = { ...device, trustState: "revoked" } satisfies LocalDeviceRecord;
+            const revoked = revokedRecord(device);
             assertValidTrustRecord(revoked);
             store.put(revoked, deviceKey(userId, deviceId));
             finish(undefined);
           } catch (error) {
             fail(error);
           }
+        };
+      },
+    );
+  }
+
+  async clearAccount(userId: string): Promise<void> {
+    await withReadwriteTransaction<void>(
+      TRUST_DEVICE_STORE,
+      (transaction, finish, fail) => {
+        const request = transaction.objectStore(TRUST_DEVICE_STORE).openCursor();
+        request.onerror = () => fail(request.error ?? new TrustStoreError("Unable to clear trust state"));
+        request.onsuccess = () => {
+          const cursor = request.result;
+          if (!cursor) {
+            finish(undefined);
+            return;
+          }
+          if ((cursor.value as LocalDeviceRecord | undefined)?.userId === userId) cursor.delete();
+          cursor.continue();
         };
       },
     );

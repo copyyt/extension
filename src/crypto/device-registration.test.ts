@@ -33,6 +33,15 @@ const userId = "11111111-1111-4111-8111-111111111111";
 const localDeviceId = "00000000-0000-4000-8000-000000000001";
 const approverDeviceId = "00000000-0000-4000-8000-000000000002";
 
+test("a recovery credential survives CRLF line endings and surrounding whitespace", async () => {
+  const pair = (await globalThis.crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"])) as CryptoKeyPair;
+  const pkcs8 = bytesToBase64(new Uint8Array(await globalThis.crypto.subtle.exportKey("pkcs8", pair.privateKey)));
+  const saved = `\r\n  copyyt-recovery-v1 \r\nrootDeviceId=${localDeviceId}\r\nprivateKeyPkcs8Base64=${pkcs8}  \r\n\r\n`;
+  const parsed = await parseRecoveryCredential(saved);
+  assert.equal(parsed.rootDeviceId, localDeviceId);
+  await assert.rejects(parseRecoveryCredential("copyyt-recovery-v1\nrootDeviceId=x"), /format is invalid/);
+});
+
 test("device-management message matches the backend canonical vector", () => {
   assert.equal(
     new TextDecoder().decode(
@@ -418,6 +427,11 @@ test("offline recovery rotates the credential and replaces stale local roots", a
   });
   assert.ok(request);
   const recoveryRequest = request;
+  // Exactly the backend RecoverDeviceDto fields; it rejects anything else (HTTP 400).
+  assert.deepEqual(Object.keys(recoveryRequest).sort(), [
+    "appVersion", "capabilities", "deviceId", "encryptionPublicKey", "name", "newRecoveryPublicKey",
+    "nonce", "platform", "rootDeviceId", "signature", "signingPublicKey", "timestamp",
+  ]);
   const oldPublicKey = await globalThis.crypto.subtle.importKey(
     "raw",
     base64ToBytes(oldRecoveryPublicKey),

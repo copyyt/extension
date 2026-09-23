@@ -72,25 +72,29 @@ const SignIn = () => {
   useViewLoader([signInGoogle.isPending, loading, signIn.isPending]);
 
   return (
-    <div className="w-full items-center justify-center bg-white">
-      <div className="font-sora flex items-center gap-2 font-bold">
+    <div className="w-full bg-white">
+      <div className="font-sora flex items-center gap-2 text-lg font-bold text-[#0F3449]">
         <Logo /> Copyyt
       </div>
 
-      <p className="font-sora mt-6 text-center text-sm font-medium">
-        Start copying and pasting between browsers and computers in seconds
+      <h1 className="font-sora mt-8 text-2xl font-bold text-[#0F3449]">
+        Copy here, paste anywhere
+      </h1>
+      <p className="font-work mt-2 text-sm leading-6 text-[#4B5563]">
+        Your clipboard, end-to-end encrypted across your browsers and phone.
+        Sign in to get started.
       </p>
       <button
         onClick={handleGoogleAuth}
-        className="mt-3 flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border border-[#D1D5DB] p-2 hover:opacity-40"
+        className="font-work mt-6 flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border border-[#D1D5DB] p-3 font-semibold text-[#0F3449] transition-colors hover:bg-[#F8FAFC]"
       >
-        <GoogleIcon /> Continue with google
+        <GoogleIcon /> Continue with Google
       </button>
 
-      <div className="mt-4 flex w-full items-center gap-3 text-sm">
-        <div className="flex-[1] border-b border-b-[#D1D5DB]" />
-        OR
-        <div className="flex-[1] border-b border-b-[#D1D5DB]" />
+      <div className="font-work mt-5 flex w-full items-center gap-3 text-xs text-[#9CA3AF]">
+        <div className="flex-[1] border-b border-b-[#E4E7EC]" />
+        or use your email
+        <div className="flex-[1] border-b border-b-[#E4E7EC]" />
       </div>
 
       <form onSubmit={handleSubmit}>
@@ -104,10 +108,10 @@ const SignIn = () => {
         />
 
         <Button
-          className="mt-3 w-full rounded-xl !py-4 !text-lg !font-medium"
+          className="mt-3 w-full rounded-xl !py-3 !text-base !font-semibold"
           disabled={!email}
         >
-          Continue
+          Email me a code
         </Button>
       </form>
     </div>

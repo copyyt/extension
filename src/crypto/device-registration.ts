@@ -49,6 +49,15 @@ export interface RegisteredDeviceResponse {
   recoveryKeyActive?: boolean;
 }
 
+/** Signed proof that a trusted device authorized a revoke. */
+export interface DeviceManagementRequest {
+  requestingDeviceId: string;
+  requestingKeyVersion: number;
+  timestamp: number;
+  nonce: string;
+  signature: string;
+}
+
 export interface DeviceRecoveryRequest {
   rootDeviceId: string;
   deviceId: string;
@@ -115,7 +124,13 @@ export async function parseRecoveryCredential(
   if (typeof value !== "string") {
     throw new TypeError("The recovery credential must be text");
   }
-  const lines = value.split("\n");
+  // Tolerate what saving and re-pasting commonly adds: CRLF line endings,
+  // surrounding blank lines and trailing spaces on each line.
+  const lines = value
+    .replace(/\r\n?/g, "\n")
+    .trim()
+    .split("\n")
+    .map((line) => line.trim());
   if (lines.length !== 3 || lines[0] !== "copyyt-recovery-v1") {
     throw new TypeError("The recovery credential format is invalid");
   }
@@ -206,8 +221,12 @@ export async function recoverCurrentDevice(
       nonce,
       newRecoveryPublicKey: recovery.publicKeyBase64,
     };
+    // userId is bound by the signature, but the backend takes it from the
+    // authenticated session and rejects it as an unknown body field.
+    const { userId: _signedUserId, ...body } = message;
+    void _signedUserId;
     const request: DeviceRecoveryRequest = {
-      ...message,
+      ...body,
       signature: await signDeviceRecovery({
         recoveryPrivateKey,
         message,

@@ -1,6 +1,7 @@
 import { isAxiosError, type AxiosResponse } from "axios";
 import { jwtDecode } from "jwt-decode";
 import {
+  clearDeviceIdentity,
   computePairingFingerprint,
   decryptClipboardItemBytes,
   decryptDirectClipboardTransfer,
@@ -10,6 +11,7 @@ import {
   exportRecoveryPrivateKey,
   sealRecoveryCredential,
   signDeviceApproval,
+  signDeviceManagement,
   signSocketChallenge,
   type ClipboardItemEnvelope,
   type DeviceIdentity,
@@ -50,6 +52,7 @@ import {
   registerCurrentDevice,
   recoverCurrentDevice,
   type ApproveDeviceRequest,
+  type DeviceManagementRequest,
   type DeviceRegistrationApi,
   type RegisteredDeviceListResponse,
   type RegisteredDeviceResponse,
@@ -89,6 +92,7 @@ import {
   POPUP_SOURCE,
   RUNTIME_SOURCE,
   type AuthenticatedRuntimeResult,
+  type ManagedDevice,
   type RecoveryCredentialResult,
   type RuntimeCommand,
   type RuntimeResponse,
@@ -131,9 +135,15 @@ export interface RuntimeApi {
     refreshTokens(refreshToken?: string): Promise<AxiosResponse<SignInResponse>>;
     logout(refreshToken?: string): Promise<AxiosResponse<unknown>>;
     resendEmailOtp(email: string): Promise<AxiosResponse<unknown>>;
+    requestAccountResetCode(): Promise<AxiosResponse<unknown>>;
+    resetAccount(code: number): Promise<AxiosResponse<unknown>>;
   };
   devices: DeviceRegistrationApi & {
     listDevices(): Promise<AxiosResponse<RegisteredDeviceListResponse>>;
+    revokeDevice(
+      deviceId: string,
+      request: DeviceManagementRequest,
+    ): Promise<AxiosResponse<RegisteredDeviceResponse>>;
   };
 }
 
@@ -191,6 +201,7 @@ export interface RuntimeDependencies {
   identityCreator?: (userId: string) => Promise<DeviceIdentity>;
   registerDevice?: typeof registerCurrentDevice;
   recoverDevice?: typeof recoverCurrentDevice;
+  clearIdentity?: typeof clearDeviceIdentity;
   exportRecoveryKey?: typeof exportRecoveryPrivateKey;
   sealRecoveryKey?: typeof sealRecoveryCredential;
   encrypt?: typeof encryptClipboardItem;
@@ -246,6 +257,8 @@ const DIRECT_SIGNAL_VALIDATION_TTL_MS = 15_000;
 const DIRECT_SIGNAL_VALIDATION_MAX = 8;
 
 export const LIVE_CLIPBOARD_TTL_MS = 60_000;
+/** Minimum spacing of trust refreshes triggered by an unknown item source. */
+export const UNKNOWN_SOURCE_REFRESH_MS = 10_000;
 export const MAX_CLOCK_SKEW_MS = 5 * 60_000;
 const ASSISTED_PNG_SUPPRESSION_TTL_MS = 15_000;
 
@@ -372,6 +385,55 @@ function resolveAccountRoot(
   if (candidates.length === 1)
     return { state: "available", device: candidates[0] };
   return { state: candidates.length === 0 ? "missing" : "ambiguous" };
+}
+
+/**
+ * This device is the account root and may approve new devices: either the
+ * first device (trust on first use) or one restored with the offline
+ * recovery credential after the previous root was removed.
+ */
+function isApprovingRoot(device: LocalDeviceRecord | null | undefined): boolean {
+  return Boolean(
+    device &&
+      device.trustState === "root" &&
+      (device.trustOrigin === "initial-tofu" || device.trustOrigin === "recovery"),
+  );
+}
+
+/**
+ * A user-facing reason for an unexpected failure: the backend's error
+ * description, or the message of a local validation/trust error. Never the
+ * raw text of arbitrary exceptions, which may be opaque or leak internals.
+ */
+function describeFailure(error: unknown): string | undefined {
+  if (isAxiosError(error)) {
+    const data = error.response?.data as
+      | { description?: unknown; message?: unknown }
+      | undefined;
+    // Nest validation failures report `message` as an array of problems.
+    const detail =
+      typeof data?.description === "string"
+        ? data.description
+        : typeof data?.message === "string"
+          ? data.message
+          : Array.isArray(data?.message) &&
+              data.message.every((item) => typeof item === "string")
+            ? `The Copyyt server rejected the request: ${data.message.join("; ")}`
+            : undefined;
+    if (detail) return detail;
+    return error.response
+      ? `The Copyyt server rejected the request (HTTP ${error.response.status})`
+      : "The Copyyt server could not be reached";
+  }
+  if (
+    error instanceof Error &&
+    (error.name === "TrustStoreError" ||
+      error.name === "CryptoProtocolError" ||
+      (error instanceof TypeError && /recovery credential|recovery private key/i.test(error.message)))
+  ) {
+    return error.message;
+  }
+  return undefined;
 }
 
 function accountRootError(root: AccountRootResolution): RuntimeError {
@@ -662,6 +724,11 @@ function commandFallbackErrorCode(command: RuntimeCommand): RuntimeErrorCode {
     case "runtime:export-recovery-credential":
     case "runtime:confirm-recovery-credential-saved":
     case "runtime:recover-device":
+    case "runtime:list-devices":
+    case "runtime:reset-device":
+    case "runtime:request-account-reset-code":
+    case "runtime:reset-account":
+    case "runtime:revoke-device":
     case "runtime:refresh-onboarding":
     case "runtime:approve-pending-device":
     case "runtime:confirm-paired-approver":
@@ -679,6 +746,7 @@ export class CopyytServiceWorkerRuntime {
   private readonly identityCreator: (userId: string) => Promise<DeviceIdentity>;
   private readonly registerDevice: typeof registerCurrentDevice;
   private readonly recoverDeviceWithCredential: typeof recoverCurrentDevice;
+  private readonly clearIdentity: typeof clearDeviceIdentity;
   private readonly exportRecoveryKey: typeof exportRecoveryPrivateKey;
   private readonly sealRecoveryKey: typeof sealRecoveryCredential;
   private readonly encrypt: typeof encryptClipboardItem;
@@ -710,6 +778,7 @@ export class CopyytServiceWorkerRuntime {
    * then is the local recovery private key worth exporting. Fails closed.
    */
   private recoveryKeyActive = false;
+  private lastUnknownSourceRefreshAt = Number.NEGATIVE_INFINITY;
   private startup: Promise<void> | null = null;
   private initialization: Promise<void> | null = null;
   private refreshInFlight: Promise<RuntimeSession> | null = null;
@@ -775,6 +844,7 @@ export class CopyytServiceWorkerRuntime {
     this.registerDevice = dependencies.registerDevice ?? registerCurrentDevice;
     this.recoverDeviceWithCredential =
       dependencies.recoverDevice ?? recoverCurrentDevice;
+    this.clearIdentity = dependencies.clearIdentity ?? clearDeviceIdentity;
     this.exportRecoveryKey =
       dependencies.exportRecoveryKey ?? exportRecoveryPrivateKey;
     this.sealRecoveryKey = dependencies.sealRecoveryKey ?? sealRecoveryCredential;
@@ -2141,7 +2211,7 @@ export class CopyytServiceWorkerRuntime {
             : asRuntimeError(
                 error,
                 commandFallbackErrorCode(message.command),
-                "The runtime operation failed",
+                describeFailure(error) ?? "The runtime operation failed",
               );
       this.recordOperationError(runtimeError.code, runtimeError.message);
       return {
@@ -2647,11 +2717,11 @@ export class CopyytServiceWorkerRuntime {
           "The device is not registered",
         );
       }
-      const source = await this.dependencies.trustStore.getDevice(
-        session.user.id,
+      const source = await this.locallyVerifiedSource(
+        session,
         envelope.sourceDeviceId,
       );
-      if (!isLocallyVerified(source)) {
+      if (!source) {
         throw new RuntimeError(
           "SOURCE_UNTRUSTED",
           "The clipboard source is not locally trusted",
@@ -3111,6 +3181,19 @@ export class CopyytServiceWorkerRuntime {
         return this.confirmRecoveryCredentialSaved();
       case "runtime:recover-device":
         return this.recoverDevice(command.credential);
+      case "runtime:list-devices":
+        return this.listManagedDevices();
+      case "runtime:reset-device":
+        return this.resetRemovedDevice();
+      case "runtime:request-account-reset-code":
+        await this.dependencies
+          .apiFactory(this.requireSession().accessToken)
+          .auth.requestAccountResetCode();
+        return this.getStatus();
+      case "runtime:reset-account":
+        return this.resetAccount(command.code);
+      case "runtime:revoke-device":
+        return this.revokeAccountDevice(command.deviceId);
       case "runtime:refresh-onboarding":
         await this.refreshOnboarding();
         this.maybeConnectSocket();
@@ -3647,6 +3730,169 @@ export class CopyytServiceWorkerRuntime {
     return this.getStatus();
   }
 
+  /**
+   * Returns the locally verified source device. A device approved by the
+   * root after this device last refreshed is unknown here until its approval
+   * certificate is checked, so an unknown source triggers one trust refresh
+   * (at most every UNKNOWN_SOURCE_REFRESH_MS, since the source ID is
+   * relay-supplied) before the item is rejected.
+   */
+  private async locallyVerifiedSource(
+    session: RuntimeSession,
+    sourceDeviceId: string,
+  ): Promise<LocalDeviceRecord | null> {
+    const known = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      sourceDeviceId,
+    );
+    if (isLocallyVerified(known)) return known;
+    const now = this.now().getTime();
+    if (now - this.lastUnknownSourceRefreshAt < UNKNOWN_SOURCE_REFRESH_MS) {
+      return null;
+    }
+    this.lastUnknownSourceRefreshAt = now;
+    await this.refreshOnboarding().catch(() => undefined);
+    const refreshed = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      sourceDeviceId,
+    );
+    return isLocallyVerified(refreshed) ? refreshed : null;
+  }
+
+  /**
+   * A revoked identity can never be reactivated. Setting the device up again
+   * discards it and all local trust for the account, then registers a brand
+   * new identity, which must be paired and approved by the root like any new
+   * device.
+   */
+  private async resetRemovedDevice(): Promise<RuntimeStatus> {
+    const session = this.requireSession();
+    if (this.serverDeviceState !== "revoked") {
+      throw new RuntimeError(
+        "PAIRING_FAILED",
+        "Only a device removed from the account can be set up again",
+      );
+    }
+    return this.startWithFreshIdentity(session);
+  }
+
+  /**
+   * Account reset, confirmed with an emailed code. The server revokes every
+   * device and clears the recovery anchor; this device then starts over with
+   * a new identity and is offered first-time setup as the new root.
+   */
+  private async resetAccount(code: number): Promise<RuntimeStatus> {
+    const session = this.requireSession();
+    if (!Number.isSafeInteger(code) || code < 100000 || code > 999999) {
+      throw new RuntimeError("PAIRING_FAILED", "Enter the 6-digit code from the email");
+    }
+    await this.dependencies.apiFactory(session.accessToken).auth.resetAccount(code);
+    return this.startWithFreshIdentity(session);
+  }
+
+  /** Discards the local identity and trust for the account and registers anew. */
+  private async startWithFreshIdentity(session: RuntimeSession): Promise<RuntimeStatus> {
+    this.destroySocket(this.socket);
+    await this.dependencies.trustStore.clearAccount?.(session.user.id);
+    await this.clearIdentity(session.user.id);
+    this.serverDeviceState = "unknown";
+    this.recoveryKeyActive = false;
+    await this.ensureAccountInitialized();
+    await this.refreshOnboarding();
+    this.maybeConnectSocket();
+    return this.getStatus();
+  }
+
+  private async listManagedDevices(): Promise<ManagedDevice[]> {
+    const session = this.requireSession();
+    const identity = await this.identityLoader(session.user.id);
+    const snapshot = await this.fetchDeviceSnapshot(session);
+    const toManaged = (
+      device: RegisteredDeviceResponse,
+      state: ManagedDevice["state"],
+    ): ManagedDevice => ({
+      deviceId: device.deviceId,
+      name: device.name,
+      platform: device.platform,
+      state,
+      current: device.deviceId === identity?.deviceId,
+      root:
+        state === "trusted" &&
+        snapshot.accountRoot.state === "available" &&
+        snapshot.accountRoot.device.deviceId === device.deviceId,
+      ...(device.lastSeenAt ? { lastSeenAt: device.lastSeenAt } : {}),
+    });
+    return [
+      ...snapshot.trustedDevices.map((device) => toManaged(device, "trusted")),
+      ...snapshot.pendingDevices.map((device) => toManaged(device, "pending")),
+    ];
+  }
+
+  /**
+   * Revokes another device on the account. The backend only accepts the
+   * request with a fresh signature from a currently trusted device, so this
+   * device must be registered and locally verified.
+   */
+  private async revokeAccountDevice(deviceId: string): Promise<ManagedDevice[]> {
+    const session = this.requireSession();
+    const identity = await this.identityLoader(session.user.id);
+    if (!identity || identity.keyVersion === null) {
+      throw new RuntimeError(
+        "DEVICE_NOT_REGISTERED",
+        "Register this device before managing other devices",
+      );
+    }
+    if (deviceId === identity.deviceId) {
+      throw new RuntimeError(
+        "PAIRING_FAILED",
+        "Remove this device from another trusted device",
+      );
+    }
+    const self = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      identity.deviceId,
+    );
+    if (!isLocallyVerified(self) || this.serverDeviceState !== "trusted") {
+      throw new RuntimeError(
+        "DEVICE_NOT_LOCALLY_TRUSTED",
+        "Only a trusted device can remove other devices",
+      );
+    }
+    const snapshot = await this.fetchDeviceSnapshot(session);
+    const target = [...snapshot.trustedDevices, ...snapshot.pendingDevices].find(
+      (device) => device.deviceId === deviceId,
+    );
+    if (!target) {
+      throw new RuntimeError("PAIRING_FAILED", "That device is not on this account");
+    }
+    const timestamp = this.now().getTime();
+    const nonce = globalThis.crypto.randomUUID();
+    const signature = await signDeviceManagement({
+      userId: session.user.id,
+      identity,
+      action: "revoke",
+      targetDeviceId: target.deviceId,
+      targetKeyVersion: target.keyVersion,
+      timestamp,
+      nonce,
+    });
+    await this.dependencies.apiFactory(session.accessToken).devices.revokeDevice(
+      target.deviceId,
+      {
+        requestingDeviceId: identity.deviceId,
+        requestingKeyVersion: identity.keyVersion,
+        timestamp,
+        nonce,
+        signature,
+      },
+    );
+    // Revocation is sticky locally: the device never receives keys again,
+    // even if a stale server snapshot still lists it.
+    await this.dependencies.trustStore.revokeDevice(session.user.id, target.deviceId);
+    await this.refreshOnboarding().catch(() => undefined);
+    return this.listManagedDevices();
+  }
+
   private async getBootstrapEligibility(
     session: RuntimeSession,
     identity: DeviceIdentity,
@@ -3712,13 +3958,12 @@ export class CopyytServiceWorkerRuntime {
       );
     }
     if (
-      localApprover.trustState !== "root" ||
-      localApprover.trustOrigin !== "initial-tofu" ||
+      !isApprovingRoot(localApprover) ||
       !identityMatchesLocalDevice(identity, localApprover)
     ) {
       throw new RuntimeError(
         "DEVICE_NOT_LOCALLY_TRUSTED",
-        "Only the initial account root can approve pairing",
+        "Only the account root can approve pairing",
       );
     }
     const snapshot = await this.fetchDeviceSnapshot(session);
@@ -4178,6 +4423,7 @@ export class CopyytServiceWorkerRuntime {
       this.serverDeviceState = "revoked";
       this.destroySocket(this.socket);
       this.setAccountAuthenticatedWithoutSocket();
+      await this.updateDeviceStatus(identity);
       this.setOnboarding({ state: "unknown", bootstrapEligible: false });
       return;
     }
@@ -4222,6 +4468,9 @@ export class CopyytServiceWorkerRuntime {
           state: "pairing-required",
           bootstrapEligible: false,
           error: { code: error.code, message: error.message },
+          // The root was removed: this trusted device can take over as root
+          // with the offline recovery credential.
+          ...(accountRoot.state === "missing" ? { rootMissing: true } : {}),
         });
         return;
       }
@@ -4230,8 +4479,7 @@ export class CopyytServiceWorkerRuntime {
         return;
       }
       if (
-        localCurrent.trustState !== "root" ||
-        localCurrent.trustOrigin !== "initial-tofu" ||
+        !isApprovingRoot(localCurrent) ||
         accountRoot.device.deviceId !== identity.deviceId
       ) {
         this.setOnboarding({
@@ -4444,6 +4692,7 @@ export class CopyytServiceWorkerRuntime {
           this.recoveryKeyActive &&
           typeof identity.recoveryPublicKeyBase64 === "string" &&
           identity.recoveryPublicKeyBase64.length > 0,
+        ...(this.serverDeviceState === "revoked" ? { removed: true } : {}),
         // A root whose recovery key the server has not confirmed (e.g. a
         // recovery whose key rotation failed). Registration retries it.
         ...(trust?.trustState === "root" && !this.recoveryKeyActive

@@ -25,7 +25,7 @@ function ActiveApp() {
   }, []);
 
   const extensionClassName =
-    "shadow-copyt relative max-h-[600px] w-[430px] p-6 pt-10";
+    "shadow-copyt relative max-h-[600px] w-[430px] overflow-y-auto p-6 pt-10";
   const webClassName =
     "shadow-copyt relative mx-auto mt-[5vh] h-[90vh] w-full p-6 pt-10 sm:mt-[calc(50vh-300px)] sm:h-max sm:max-h-[600px] sm:w-[430px]";
 

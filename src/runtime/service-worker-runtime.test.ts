@@ -22,6 +22,8 @@ import {
 } from "../crypto/direct-clipboard.ts";
 import type { RegisteredDeviceResponse } from "../crypto/device-registration.ts";
 import type { ClientTrustStore, ClientVerifiedDevice, LocalDeviceRecord } from "../crypto/trust-store.ts";
+import type { DeviceManagementRequest } from "../crypto/device-registration.ts";
+import { buildDeviceManagementMessage } from "../crypto/protocol.ts";
 import type { IUser } from "../interfaces/user.interface.ts";
 import type { ILoginResponse, SignInResponse } from "../interfaces/auth.interface.ts";
 import {
@@ -382,6 +384,7 @@ function makeRuntime(overrides: Partial<{
   identityCreator: (userId: string) => Promise<DeviceIdentity>;
   registerDevice: RuntimeDependencies["registerDevice"];
   recoverDevice: RuntimeDependencies["recoverDevice"];
+  clearIdentity: RuntimeDependencies["clearIdentity"];
   exportRecoveryKey: RuntimeDependencies["exportRecoveryKey"];
   sealRecoveryKey: RuntimeDependencies["sealRecoveryKey"];
   socketFactory: RuntimeDependencies["socketFactory"];
@@ -471,6 +474,7 @@ function makeRuntime(overrides: Partial<{
     identityCreator: overrides.identityCreator ?? (async () => runtimeIdentity),
     registerDevice: overrides.registerDevice ?? (async () => ({ identity: runtimeIdentity, device: runtimeRegisteredDevice })),
     recoverDevice: overrides.recoverDevice ?? (async () => { throw new Error("not used"); }),
+    clearIdentity: overrides.clearIdentity ?? (async () => { throw new Error("not used"); }),
     exportRecoveryKey: overrides.exportRecoveryKey ?? (async () => { throw new Error("not used"); }),
     sealRecoveryKey: overrides.sealRecoveryKey ?? (async () => { throw new Error("not used"); }),
     signChallenge: overrides.signChallenge ?? (async () => "signed-challenge"),
@@ -6556,4 +6560,346 @@ test("a failed recovery surfaces an error and leaves the device untrusted", asyn
 
   assert.equal(result.ok, false);
   assert.notEqual(runtime.getStatus().onboarding.state, "complete");
+});
+
+const phoneDevice: RegisteredDeviceResponse = {
+  ...registeredDevice,
+  deviceId: "00000000-0000-4000-8000-0000000000a1",
+  name: "Android · Pixel",
+  platform: "android",
+  encryptionPublicKey: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+  signingPublicKey: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+  capabilities: ["clipboard"],
+};
+
+/** Trust store where the phone becomes verified only once a refresh sees its approval. */
+function lateApprovalTrustStore(state: { approvedOnServer: boolean; verified: boolean }): ClientTrustStore {
+  const self: LocalDeviceRecord = {
+    userId: user.id,
+    deviceId: identity.deviceId,
+    keyVersion: 1,
+    encryptionPublicKey: registeredDevice.encryptionPublicKey,
+    signingPublicKey: registeredDevice.signingPublicKey,
+    trustState: "verified",
+  };
+  const phone = (): LocalDeviceRecord => ({
+    userId: user.id,
+    deviceId: phoneDevice.deviceId,
+    keyVersion: 1,
+    encryptionPublicKey: phoneDevice.encryptionPublicKey,
+    signingPublicKey: phoneDevice.signingPublicKey,
+    trustState: state.verified ? "verified" : "unverified",
+  });
+  return {
+    getDevice: async (_userId, deviceId) =>
+      deviceId === phoneDevice.deviceId ? phone() : self,
+    upsertServerReportedDevice: async (device) => {
+      if (device.deviceId === phoneDevice.deviceId && state.approvedOnServer) state.verified = true;
+      return device.deviceId === phoneDevice.deviceId ? phone() : self;
+    },
+    bootstrapInitialTrustAnchor: async () => { throw new Error("not used"); },
+    recoverTrustAnchor: async () => { throw new Error("not used"); },
+    pinPairedApprover: async () => { throw new Error("not used"); },
+    pinInitialDevice: async () => { throw new Error("not used"); },
+    applyApproval: async () => { throw new Error("not used"); },
+    revokeDevice: async () => undefined,
+    listEncryptionRecipients: async () => [],
+  } satisfies ClientTrustStore;
+}
+
+test("an item from a device approved after the last trust refresh is accepted after one refresh", async () => {
+  const state = { approvedOnServer: false, verified: false };
+  const written: string[] = [];
+  let snapshots = 0;
+  const setup = await startReady({
+    trustStore: lateApprovalTrustStore(state),
+    listDevices: async () => {
+      snapshots += 1;
+      return response([registeredDevice, ...(state.approvedOnServer ? [phoneDevice] : [])]);
+    },
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text: string) => { written.push(text); },
+    },
+  });
+  // The root approves the phone while this device is already running.
+  state.approvedOnServer = true;
+  const before = snapshots;
+
+  await setup.runtime.receiveClipboardItem({
+    ...inboundEnvelope("from-late-approved-phone"),
+    sourceDeviceId: phoneDevice.deviceId,
+  });
+
+  assert.ok(snapshots > before, "an unknown source must trigger a trust refresh");
+  assert.deepEqual(written, ["decrypted plaintext"]);
+});
+
+test("an unknown source that stays unverified is rejected and refreshes are rate limited", async () => {
+  const state = { approvedOnServer: false, verified: false };
+  let snapshots = 0;
+  const written: string[] = [];
+  const setup = await startReady({
+    trustStore: lateApprovalTrustStore(state),
+    listDevices: async () => {
+      snapshots += 1;
+      return response([registeredDevice]);
+    },
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text: string) => { written.push(text); },
+    },
+  });
+  const before = snapshots;
+  for (const itemId of ["unknown-1", "unknown-2", "unknown-3"]) {
+    await setup.runtime
+      .receiveClipboardItem({ ...inboundEnvelope(itemId), sourceDeviceId: phoneDevice.deviceId })
+      .catch(() => undefined);
+  }
+  assert.deepEqual(written, []);
+  assert.equal(snapshots - before, 1, "relay-supplied source IDs must not force a refresh per item");
+});
+
+test("a trusted device removes another device with a signed revoke and revokes it locally", async () => {
+  const approver = await makeDirectTestIdentity(identity.deviceId);
+  const self: RegisteredDeviceResponse = {
+    ...registeredDevice,
+    encryptionPublicKey: approver.encryptionPublicKeyBase64,
+    signingPublicKey: approver.signingPublicKeyBase64,
+  };
+  const revokeCalls: Array<{ deviceId: string; request: DeviceManagementRequest }> = [];
+  const setup = await startReady({
+    identity: approver,
+    registeredDevice: self,
+    listDevices: async () => response([self, phoneDevice]),
+    apiFactory: (_token, api) => ({
+      ...api,
+      devices: {
+        ...api.devices,
+        revokeDevice: async (deviceId: string, request: DeviceManagementRequest) => {
+          revokeCalls.push({ deviceId, request });
+          return response({ ...phoneDevice, trustState: "revoked" });
+        },
+      },
+    }),
+  });
+  const locallyRevoked: string[] = [];
+  setup.trustStore.revokeDevice = async (_userId, deviceId) => {
+    locallyRevoked.push(deviceId);
+  };
+
+  const result = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:revoke-device", deviceId: phoneDevice.deviceId }),
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(revokeCalls.length, 1);
+  const call = revokeCalls[0]!;
+  assert.equal(call.deviceId, phoneDevice.deviceId);
+  assert.equal(call.request.requestingDeviceId, approver.deviceId);
+  const signed = buildDeviceManagementMessage({
+    action: "revoke",
+    userId: user.id,
+    requestingDeviceId: approver.deviceId,
+    requestingKeyVersion: 1,
+    targetDeviceId: phoneDevice.deviceId,
+    targetKeyVersion: phoneDevice.keyVersion,
+    timestamp: call.request.timestamp,
+    nonce: call.request.nonce,
+  });
+  const publicKey = await crypto.subtle.importKey(
+    "raw", approver.signingPublicKey, "Ed25519", true, ["verify"],
+  );
+  assert.equal(
+    await crypto.subtle.verify("Ed25519", publicKey, base64ToBytes(call.request.signature), signed),
+    true,
+  );
+  assert.deepEqual(locallyRevoked, [phoneDevice.deviceId]);
+
+  const selfRevoke = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:revoke-device", deviceId: approver.deviceId }),
+  );
+  assert.equal(selfRevoke.ok, false);
+  assert.equal(revokeCalls.length, 1);
+});
+
+test("a removed device is flagged and can be set up again as a new pending device", async () => {
+  const state = { removed: true, cleared: false, trustCleared: false };
+  const freshIdentity = {
+    ...identity,
+    deviceId: "00000000-0000-4000-8000-0000000000b2",
+    keyVersion: 1,
+  } as DeviceIdentity;
+  const freshPending: RegisteredDeviceResponse = {
+    ...pendingDevice,
+    deviceId: freshIdentity.deviceId,
+    encryptionPublicKey: registeredDevice.encryptionPublicKey,
+    signingPublicKey: registeredDevice.signingPublicKey,
+  };
+  const setup = makeRuntime({
+    localTrustState: "verified",
+    identityLoader: async () => (state.cleared ? null : identity),
+    identityCreator: async () => freshIdentity,
+    registerDevice: async () => {
+      if (!state.cleared) throw new Error("device_revoked");
+      return { identity: freshIdentity, device: freshPending };
+    },
+    clearIdentity: async () => { state.cleared = true; },
+    // The removed device no longer appears on the server at all.
+    listDevices: async () => response([{ ...registeredDevice, deviceId: "00000000-0000-4000-8000-0000000000c3" }]),
+    listPendingDevices: async () => response(state.cleared ? [freshPending] : []),
+  });
+  setup.trustStore.clearAccount = async () => { state.trustCleared = true; };
+  await setup.runtime.start();
+  assert.equal(setup.runtime.getStatus().device.removed, true);
+
+  const reset = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:reset-device" }));
+
+  assert.equal(reset.ok, true);
+  assert.equal(state.cleared, true);
+  assert.equal(state.trustCleared, true);
+  const status = setup.runtime.getStatus();
+  assert.equal(status.device.removed, undefined);
+  assert.equal(status.device.deviceId, freshIdentity.deviceId);
+});
+
+test("an active device cannot be reset", async () => {
+  let cleared = false;
+  const setup = await startReady({ clearIdentity: async () => { cleared = true; } });
+  const reset = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:reset-device" }));
+  assert.equal(reset.ok, false);
+  assert.equal(cleared, false);
+});
+
+function localRootStore(trustOrigin: LocalDeviceRecord["trustOrigin"]): ClientTrustStore {
+  const self: LocalDeviceRecord = {
+    userId: user.id,
+    deviceId: identity.deviceId,
+    keyVersion: 1,
+    encryptionPublicKey: registeredDevice.encryptionPublicKey,
+    signingPublicKey: registeredDevice.signingPublicKey,
+    trustState: "root",
+    trustOrigin,
+  };
+  return {
+    getDevice: async (_userId, deviceId) =>
+      deviceId === identity.deviceId ? self : null,
+    upsertServerReportedDevice: async (device) => ({ ...device, trustState: "unverified" }) as LocalDeviceRecord,
+    bootstrapInitialTrustAnchor: async () => { throw new Error("not used"); },
+    recoverTrustAnchor: async () => { throw new Error("not used"); },
+    pinPairedApprover: async () => { throw new Error("not used"); },
+    pinInitialDevice: async () => { throw new Error("not used"); },
+    applyApproval: async () => { throw new Error("not used"); },
+    revokeDevice: async () => undefined,
+    listEncryptionRecipients: async () => [],
+  } satisfies ClientTrustStore;
+}
+
+test("a root restored with the recovery credential can approve new devices", async () => {
+  const setup = makeRuntime({
+    trustStore: localRootStore("recovery"),
+    listDevices: async () => response([registeredDevice]),
+    listPendingDevices: async () => response([pendingDevice]),
+  });
+  await setup.runtime.start();
+  const onboarding = setup.runtime.getStatus().onboarding;
+  assert.equal(onboarding.state, "pairing-ready");
+  assert.equal(onboarding.pairing?.role, "approver");
+  assert.equal(onboarding.pairing?.pendingDeviceId, pendingDevice.deviceId);
+});
+
+test("a verified device is told the root is missing so it can take over", async () => {
+  const approvedSelf: RegisteredDeviceResponse = {
+    ...registeredDevice,
+    approvedByDeviceId: "00000000-0000-4000-8000-0000000000d4",
+    approvalSignature: "c2lnbmF0dXJl",
+  };
+  const setup = makeRuntime({
+    localTrustState: "verified",
+    registeredDevice: approvedSelf,
+    listDevices: async () => response([approvedSelf]),
+  });
+  await setup.runtime.start();
+  const onboarding = setup.runtime.getStatus().onboarding;
+  assert.equal(onboarding.rootMissing, true);
+  assert.equal(setup.runtime.getStatus().device.trustState, "verified");
+});
+
+test("a backend rejection reaches the popup with the server's reason", async () => {
+  const approver = await makeDirectTestIdentity(identity.deviceId);
+  const self: RegisteredDeviceResponse = {
+    ...registeredDevice,
+    encryptionPublicKey: approver.encryptionPublicKeyBase64,
+    signingPublicKey: approver.signingPublicKeyBase64,
+  };
+  const setup = await startReady({
+    identity: approver,
+    registeredDevice: self,
+    listDevices: async () => response([self, phoneDevice]),
+    apiFactory: (_token, api) => ({
+      ...api,
+      devices: {
+        ...api.devices,
+        revokeDevice: async () => {
+          throw Object.assign(new Error("Request failed with status code 409"), {
+            isAxiosError: true,
+            response: { status: 409, data: { code: "x", description: "Configure an offline recovery credential first" } },
+          });
+        },
+      },
+    }),
+  });
+  const result = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:revoke-device", deviceId: phoneDevice.deviceId }),
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.message, "Configure an offline recovery credential first");
+});
+
+test("an account reset confirms the emailed code, then starts over with a fresh identity", async () => {
+  const calls: string[] = [];
+  let cleared = false;
+  const freshIdentity = { ...identity, deviceId: "00000000-0000-4000-8000-0000000000e5" } as DeviceIdentity;
+  const setup = await startReady({
+    identityLoader: async () => (cleared ? null : identity),
+    identityCreator: async () => freshIdentity,
+    registerDevice: async () => ({
+      identity: cleared ? freshIdentity : identity,
+      device: cleared ? { ...registeredDevice, deviceId: freshIdentity.deviceId } : registeredDevice,
+    }),
+    clearIdentity: async () => { cleared = true; calls.push("clear-identity"); },
+    apiFactory: (_token, api) => ({
+      ...api,
+      auth: {
+        ...api.auth,
+        requestAccountResetCode: async () => { calls.push("request-code"); return response({ message: "Email Sent" }); },
+        resetAccount: async (code: number) => { calls.push(`reset:${code}`); return response({ removedDevices: 3 }); },
+      },
+    }),
+  });
+  setup.trustStore.clearAccount = async () => { calls.push("clear-trust"); };
+
+  const requested = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:request-account-reset-code" }));
+  assert.equal(requested.ok, true);
+  const reset = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:reset-account", code: 123456 }));
+
+  assert.equal(reset.ok, true);
+  assert.deepEqual(calls, ["request-code", "reset:123456", "clear-trust", "clear-identity"]);
+  assert.equal(setup.runtime.getStatus().device.deviceId, freshIdentity.deviceId);
+});
+
+test("an account reset with a malformed code never reaches the server or local state", async () => {
+  let serverCalls = 0;
+  let cleared = false;
+  const setup = await startReady({
+    clearIdentity: async () => { cleared = true; },
+    apiFactory: (_token, api) => ({
+      ...api,
+      auth: { ...api.auth, resetAccount: async () => { serverCalls += 1; return response({}); } },
+    }),
+  });
+  const reset = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:reset-account", code: 12 }));
+  assert.equal(reset.ok, false);
+  assert.equal(serverCalls, 0);
+  assert.equal(cleared, false);
 });

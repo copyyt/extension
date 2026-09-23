@@ -75,6 +75,8 @@ export interface RuntimeStatus {
     recoveryAvailable?: boolean;
     recoveryExportedAt?: string;
     recoveryRotationPending?: boolean;
+    /** The server revoked this device; it can only be set up again as a new device. */
+    removed?: boolean;
   };
   socket: {
     connected: boolean;
@@ -102,6 +104,8 @@ export interface RuntimeStatus {
     state: OnboardingState;
     bootstrapEligible: boolean;
     pairing?: PairingStatus;
+    /** No account root is active; a trusted device can replace it via recovery. */
+    rootMissing?: boolean;
     error?: {
       code: RuntimeErrorCode;
       message: string;
@@ -152,6 +156,18 @@ export interface AuthenticatedRuntimeResult {
   user: IUser;
 }
 
+/** A device on the account as the server reports it, for management UI. */
+export interface ManagedDevice {
+  deviceId: string;
+  name: string;
+  platform: string;
+  state: "trusted" | "pending";
+  current: boolean;
+  /** The account root: removing it stops new devices from being paired until replaced. */
+  root: boolean;
+  lastSeenAt?: string;
+}
+
 export interface RecoveryCredentialResult {
   /** Prefix prevents confusing this with a device signing key export. */
   format: "copyyt-recovery-v1";
@@ -174,6 +190,11 @@ export type RuntimeCommand =
   | { type: "runtime:export-recovery-credential" }
   | { type: "runtime:confirm-recovery-credential-saved" }
   | { type: "runtime:recover-device"; credential: string }
+  | { type: "runtime:list-devices" }
+  | { type: "runtime:reset-device" }
+  | { type: "runtime:request-account-reset-code" }
+  | { type: "runtime:reset-account"; code: number }
+  | { type: "runtime:revoke-device"; deviceId: string }
   | { type: "runtime:refresh-onboarding" }
   | {
       type: "runtime:approve-pending-device";

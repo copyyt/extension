@@ -15,7 +15,10 @@ const Toast = () => {
   return (
     <>
       {toast.open && (
-        <div className="border-primary absolute top-2 left-[30%] rounded border p-2">
+        <div
+          role="status"
+          className="font-work absolute top-3 left-1/2 z-20 w-[85%] -translate-x-1/2 rounded-xl bg-[#0F3449] px-4 py-2.5 text-center text-sm text-white shadow-lg"
+        >
           {toast.text}
         </div>
       )}
