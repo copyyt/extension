@@ -3,7 +3,7 @@
 This document is for the Chrome Web Store submission and release handoff. The
 Store artifact is produced by `yarn build:store` at
 `build-extension-store/`; that command pins both REST and Socket.IO endpoints
-to `https://api.copyyt.psami.com` rather than inheriting development `.env`
+to `https://api.copyyt.com` rather than inheriting development `.env`
 values. It is an update to the existing Copyyt Web Store item and must keep
 the existing extension key/identity.
 
@@ -37,7 +37,7 @@ The Store manifest retains the six permissions used by the implementation:
 
 The only Store host permission is:
 
-`https://api.copyyt.psami.com/*`
+`https://api.copyyt.com/*`
 
 It is required for Copyyt's authenticated REST API and Socket.IO/WebSocket
 connection used for account sign-in, device registration/pairing, encrypted

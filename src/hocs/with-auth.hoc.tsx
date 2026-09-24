@@ -11,6 +11,10 @@ import {
   bootstrapExtensionAuth,
   shouldRefreshWebAuth,
 } from "./auth-bootstrap";
+import {
+  clearWebAccessToken,
+  getWebAccessToken,
+} from "@/hooks/web-session";
 
 export default function withAuth<T>(Component: React.FC<T>) {
   return function IsAuth(props: T & React.JSX.IntrinsicAttributes) {
@@ -40,13 +44,13 @@ export default function withAuth<T>(Component: React.FC<T>) {
           });
         return;
       }
-      if (shouldRefreshWebAuth(localStorage.getItem("accessToken"), checkJwtExpiry)) {
+      if (shouldRefreshWebAuth(getWebAccessToken(), checkJwtExpiry)) {
         refreshTokens.mutate(undefined, {
           onSuccess: () => {
             return setIsAuthenticated(true);
           },
           onError: () => {
-            localStorage.removeItem("accessToken");
+            clearWebAccessToken();
             setIsAuthenticated(false);
             return setCurrentView("sign-in");
           },

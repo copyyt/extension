@@ -6,7 +6,7 @@ const ViewLoader: React.FC<{ open?: boolean }> = ({ open = false }) => {
   return (
     <>
       {open || state ? (
-        <section className="absolute top-0 left-0 z-10 flex h-full w-full items-center justify-center bg-white">
+        <section className="absolute top-0 left-0 z-10 flex h-full w-full items-center justify-center bg-surface">
           <TailSpin width={40} height={40} color="#2D9CDB" />
         </section>
       ) : null}

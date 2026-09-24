@@ -1,18 +1,47 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import {
+  base64ToBytes,
+  bytesToBase64,
+  bytesToHex,
+  sha256,
+} from "../crypto/bytes.ts";
 import type { AxiosResponse } from "axios";
+import {
+  CLIPBOARD_BUNDLE_V1_MIME,
+  clipboardPayloadFromPlainText,
+  clipboardPayloadFromPngBytes,
+  decodeClipboardBundleV1,
+  encodeClipboardBundleV1,
+  type ClipboardPayloadV1,
+} from "../clipboard/payload.ts";
 import type { DeviceIdentity } from "../crypto/key-store.ts";
+import { createDeviceIdentityForTesting } from "../crypto/key-store.ts";
+import {
+  prepareDirectClipboardTransfer,
+} from "../crypto/direct-clipboard.ts";
 import type { RegisteredDeviceResponse } from "../crypto/device-registration.ts";
 import type { ClientTrustStore, ClientVerifiedDevice, LocalDeviceRecord } from "../crypto/trust-store.ts";
+import type { DeviceManagementRequest } from "../crypto/device-registration.ts";
+import { buildDeviceManagementMessage } from "../crypto/protocol.ts";
 import type { IUser } from "../interfaces/user.interface.ts";
 import type { ILoginResponse, SignInResponse } from "../interfaces/auth.interface.ts";
+import {
+  CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY,
+  CLIPBOARD_RECEIVE_CAPABILITIES,
+} from "../clipboard/capabilities.ts";
 import { RuntimeError } from "./errors.ts";
 import type { ClipboardAdapter } from "./clipboard-adapter.ts";
 import type { ClipboardWatcherOptions } from "./clipboard-watcher.ts";
+import type { DirectTransport } from "./direct-transport.ts";
 import { createRuntimeMessageListener } from "./service-worker-bootstrap.ts";
 import { createOffscreenClipboardWatcher } from "./offscreen-watcher.ts";
 import {
+  InMemoryAssistedPngSuppressionStore,
   InMemoryItemMetadataStore,
+  InMemoryPendingAssistedImageStore,
+  type AssistedPngSuppressionStore,
+  type PendingAssistedImageStore,
   type ProcessedItemRecord,
   type ProcessedItemStore,
 } from "./runtime-db.ts";
@@ -25,7 +54,13 @@ import {
   type SocketLike,
   type SocketOptions,
 } from "./service-worker-runtime.ts";
-import type { RuntimeCommand, RuntimeStatus } from "./messages.ts";
+import {
+  OFFSCREEN_SOURCE,
+  RUNTIME_SOURCE,
+  type PendingAssistedImageCopyResult,
+  type RuntimeCommand,
+  type RuntimeStatus,
+} from "./messages.ts";
 import {
   InMemorySyncPreferencesStore,
   type SyncPreferencesStore,
@@ -34,6 +69,7 @@ import {
   clipboardSyncMode,
   syncPreferencesForStatus,
 } from "../views/home/sync-preferences.ts";
+import type { DirectSignalDelivery } from "../direct/protocol.ts";
 
 const user: IUser = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -99,6 +135,49 @@ class RecordingProcessedItemStore implements ProcessedItemStore {
       ...record,
       key: `${record.userId}:${record.itemId}`,
     });
+  }
+}
+
+class ClockedAssistedPngSuppressionStore implements AssistedPngSuppressionStore {
+  readonly records = new Map<
+    string,
+    Parameters<AssistedPngSuppressionStore["put"]>[0]
+  >();
+  consumed = 0;
+  private readonly now: () => number;
+
+  constructor(now: () => number) {
+    this.now = now;
+  }
+
+  async put(
+    record: Parameters<AssistedPngSuppressionStore["put"]>[0],
+  ): Promise<void> {
+    this.records.set(`${record.userId}:${record.itemId}`, { ...record });
+  }
+
+  async consumeNext(userId: string): Promise<boolean> {
+    for (const [key, record] of this.records) {
+      if (record.userId !== userId) continue;
+      if (Date.parse(record.expiresAt) <= this.now()) {
+        this.records.delete(key);
+        continue;
+      }
+      this.records.delete(key);
+      this.consumed += 1;
+      return true;
+    }
+    return false;
+  }
+
+  async remove(userId: string, itemId: string): Promise<void> {
+    this.records.delete(`${userId}:${itemId}`);
+  }
+
+  async clearUser(userId: string): Promise<void> {
+    for (const [key, record] of this.records) {
+      if (record.userId === userId) this.records.delete(key);
+    }
   }
 }
 
@@ -295,6 +374,7 @@ function makeRuntime(overrides: Partial<{
   approveDevice: (request: unknown) => Promise<AxiosResponse<unknown>>;
   signApproval: RuntimeDependencies["signApproval"];
   decrypt: RuntimeDependencies["decrypt"];
+  decryptDirect: RuntimeDependencies["decryptDirect"];
   encrypt: RuntimeDependencies["encrypt"];
   identity: DeviceIdentity;
   registeredDevice: typeof registeredDevice;
@@ -303,12 +383,19 @@ function makeRuntime(overrides: Partial<{
   identityLoader: (userId: string) => Promise<DeviceIdentity | null>;
   identityCreator: (userId: string) => Promise<DeviceIdentity>;
   registerDevice: RuntimeDependencies["registerDevice"];
+  recoverDevice: RuntimeDependencies["recoverDevice"];
+  clearIdentity: RuntimeDependencies["clearIdentity"];
+  exportRecoveryKey: RuntimeDependencies["exportRecoveryKey"];
+  sealRecoveryKey: RuntimeDependencies["sealRecoveryKey"];
   socketFactory: RuntimeDependencies["socketFactory"];
   signChallenge: RuntimeDependencies["signChallenge"];
   recoveryAlarm: RuntimeDependencies["recoveryAlarm"];
   syncPreferencesStore: SyncPreferencesStore;
   processedItemStore: RuntimeDependencies["processedItemStore"];
   outboundItemStore: RuntimeDependencies["outboundItemStore"];
+  pendingAssistedImageStore: PendingAssistedImageStore;
+  assistedPngSuppressionStore: AssistedPngSuppressionStore;
+  directTransport: DirectTransport;
   now: () => Date;
 }> = {}) {
   const runtimeIdentity = overrides.identity ?? identity;
@@ -338,6 +425,7 @@ function makeRuntime(overrides: Partial<{
     getDevice: async () => localDevice,
     upsertServerReportedDevice: async (device) => ({ ...device, trustState: "unverified" }),
     bootstrapInitialTrustAnchor: async () => ({ ...localDevice, trustState: "root", trustOrigin: "initial-tofu" }),
+    recoverTrustAnchor: async () => ({ ...localDevice, trustState: "root", trustOrigin: "recovery" }),
     pinPairedApprover: async () => { throw new Error("not used"); },
     pinInitialDevice: async () => { throw new Error("not used"); },
     applyApproval: async () => { throw new Error("not used"); },
@@ -368,8 +456,11 @@ function makeRuntime(overrides: Partial<{
     statusStore,
     trustStore,
     clipboardAdapter,
+    directTransport: overrides.directTransport,
     processedItemStore,
     outboundItemStore,
+    pendingAssistedImageStore: overrides.pendingAssistedImageStore,
+    assistedPngSuppressionStore: overrides.assistedPngSuppressionStore,
     syncPreferencesStore,
     apiFactory: overrides.apiFactory
       ? (accessToken) => overrides.apiFactory!(accessToken, api)
@@ -382,6 +473,10 @@ function makeRuntime(overrides: Partial<{
     identityLoader: overrides.identityLoader ?? (async () => runtimeIdentity),
     identityCreator: overrides.identityCreator ?? (async () => runtimeIdentity),
     registerDevice: overrides.registerDevice ?? (async () => ({ identity: runtimeIdentity, device: runtimeRegisteredDevice })),
+    recoverDevice: overrides.recoverDevice ?? (async () => { throw new Error("not used"); }),
+    clearIdentity: overrides.clearIdentity ?? (async () => { throw new Error("not used"); }),
+    exportRecoveryKey: overrides.exportRecoveryKey ?? (async () => { throw new Error("not used"); }),
+    sealRecoveryKey: overrides.sealRecoveryKey ?? (async () => { throw new Error("not used"); }),
     signChallenge: overrides.signChallenge ?? (async () => "signed-challenge"),
     signApproval: overrides.signApproval,
     recoveryAlarm: overrides.recoveryAlarm,
@@ -398,7 +493,7 @@ function makeRuntime(overrides: Partial<{
       recipients: [],
       expiresAt: input.expiresAt,
     })),
-    decrypt: overrides.decrypt ?? (async () => ({ plaintext: "decrypted plaintext", plaintextBytes: new Uint8Array() })),
+    decrypt: overrides.decrypt ?? (async () => ({ plaintext: "decrypted plaintext", plaintextBytes: new TextEncoder().encode("decrypted plaintext") })),
   });
   return {
     runtime,
@@ -599,6 +694,1062 @@ function inboundEnvelope(
     expiresAt,
   };
 }
+
+function richClipboardBundle(plainText = "\uFEFF  fallback café e\u0301 🦊\r\n\t ") {
+  const html = '<div onclick="throw new Error(\'must remain data\')">HTML only<script>throw 1</script></div>';
+  const payload: ClipboardPayloadV1 = {
+    version: 1,
+    representations: [
+      { mime: "text/plain", encoding: "utf-8", data: plainText },
+      { mime: "text/html", encoding: "utf-8", data: html },
+    ],
+  };
+  return { payload, plainText, html, bytes: encodeClipboardBundleV1(payload) };
+}
+
+test("registration advertises assisted PNG receive capability", async () => {
+  const registrations: string[][] = [];
+  const setup = await startReady({
+    registerDevice: async (_api, options) => {
+      registrations.push(options.capabilities ?? []);
+      return { identity, device: registeredDevice };
+    },
+  });
+  assert.deepEqual(registrations, [[...CLIPBOARD_RECEIVE_CAPABILITIES]]);
+  assert.equal(setup.runtime.getStatus().device.deviceId, identity.deviceId);
+  assert.equal(setup.runtime.getStatus().syncReady, true);
+});
+
+test("legacy receive decodes exact UTF-8 bytes rather than a predecoded plaintext field", async () => {
+  const exactText = "\uFEFF  café e\u0301 日本語 🦊\r\n\t \u0000";
+  const writes: string[] = [];
+  let decryptions = 0;
+  const setup = await startReady({
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text) => { writes.push(text); },
+    },
+    decrypt: async () => {
+      decryptions += 1;
+      return {
+        plaintext: "must not use this convenience field",
+        plaintextBytes: new TextEncoder().encode(exactText),
+      };
+    },
+  });
+  const envelope = inboundEnvelope("legacy-exact-utf8");
+  await setup.runtime.receiveClipboardItem(envelope);
+  await setup.runtime.receiveClipboardItem(envelope);
+  assert.deepEqual(writes, [exactText]);
+  assert.equal(decryptions, 1);
+});
+
+test("bundle-v1 receive writes only its exact plain text fallback once", async () => {
+  const bundle = richClipboardBundle();
+  const writes: string[] = [];
+  const processedItemStore = new RecordingProcessedItemStore();
+  let decryptions = 0;
+  const setup = await startReady({
+    processedItemStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text) => { writes.push(text); },
+    },
+    decrypt: async () => {
+      decryptions += 1;
+      return { plaintext: bundle.html, plaintextBytes: bundle.bytes };
+    },
+  });
+  const envelope = { ...inboundEnvelope("bundle-fallback"), contentType: CLIPBOARD_BUNDLE_V1_MIME };
+  await setup.runtime.receiveClipboardItem(envelope);
+  await setup.runtime.receiveClipboardItem(envelope);
+  assert.deepEqual(writes, [bundle.plainText]);
+  assert.equal(decryptions, 1);
+  assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "applied");
+  assert.equal(setup.runtime.getStatus().lastSyncError, undefined);
+});
+
+test("image-only automatic observation and manual Send never encrypt or publish", async () => {
+  const image = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]),
+  );
+  let encryptCalls = 0;
+  const setup = await startReady({
+    clipboardAdapter: {
+      readText: async () => "",
+      readPayload: async () => image,
+      writeText: async () => undefined,
+    },
+    encrypt: async () => {
+      encryptCalls += 1;
+      return inboundEnvelope("unexpected-image-publish");
+    },
+  });
+
+  await setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: image,
+  });
+  assert.equal(encryptCalls, 0);
+  assert.equal(
+    setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
+    0,
+  );
+
+  const response = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:send-current-clipboard" }),
+  );
+  assert.equal(response.ok, false);
+  assert.equal(response.error?.code, "UNSUPPORTED_CLIPBOARD_CONTENT");
+  assert.equal(encryptCalls, 0);
+});
+
+test("mixed local image payloads project to exact text-only network content", async () => {
+  const image = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 2]),
+  );
+  const rich = {
+    version: 1 as const,
+    representations: [
+      { mime: "text/plain" as const, encoding: "utf-8" as const, data: "exact fallback" },
+      { mime: "text/html" as const, encoding: "utf-8" as const, data: "<b>rich</b>" },
+      ...image.representations,
+    ],
+  } satisfies ClipboardPayloadV1;
+  const encryptInputs: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0][] = [];
+  const setup = await startReady({
+    encrypt: async (input) => {
+      encryptInputs.push(input);
+      return {
+        ...inboundEnvelope("mixed-image-publish"),
+        contentType: input.contentType,
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+  await setup.runtime.publishClipboardPayload(rich);
+  assert.equal(encryptInputs.length, 1);
+  assert.equal(encryptInputs[0]!.contentType, "text/plain");
+  assert.equal(encryptInputs[0]!.plaintext, "exact fallback");
+  assert.equal(typeof encryptInputs[0]!.plaintext === "string" && encryptInputs[0]!.plaintext.includes(image.representations[0]!.data), false);
+});
+
+test("inbound image bundles stay out of the offscreen writer and create pending assisted state", async () => {
+  const pngBytes = new Uint8Array([
+    0x89,
+    0x50,
+    0x4e,
+    0x47,
+    0x0d,
+    0x0a,
+    0x1a,
+    0x0a,
+    3,
+    4,
+  ]);
+  const image = clipboardPayloadFromPngBytes(
+    pngBytes,
+  );
+  const bundle = encodeClipboardBundleV1(image);
+  const applied: ClipboardPayloadV1[] = [];
+  const withImageAdapter = await startReady({
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+      writePayload: async (payload) => { applied.push(payload); },
+    },
+    decrypt: async () => ({ plaintextBytes: bundle }),
+  });
+  await withImageAdapter.runtime.receiveClipboardItem({
+    ...inboundEnvelope("inbound-image-adapter"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+  assert.deepEqual(applied, []);
+  assert.equal(withImageAdapter.runtime.getStatus().pendingAssistedImages?.length, 1);
+
+  const copyResponse = await withImageAdapter.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:copy-pending-image",
+      itemId: "inbound-image-adapter",
+    }),
+  );
+  assert.equal(copyResponse.ok, true);
+  const transportedResponse = JSON.parse(JSON.stringify(copyResponse)) as typeof copyResponse;
+  const copyResult = transportedResponse.data as PendingAssistedImageCopyResult;
+  assert.equal("pngBytes" in copyResult, false);
+  assert.equal(typeof copyResult.pngBase64, "string");
+  assert.equal(copyResult.pngBase64, bytesToBase64(pngBytes));
+  assert.deepEqual(
+    base64ToBytes(copyResult.pngBase64),
+    pngBytes,
+  );
+  assert.equal(
+    JSON.stringify(withImageAdapter.runtime.getStatus()).includes(
+      copyResult.pngBase64,
+    ),
+    false,
+  );
+  assert.equal(
+    JSON.stringify(await withImageAdapter.statusStore.get()).includes(
+      copyResult.pngBase64,
+    ),
+    false,
+  );
+  await withImageAdapter.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: image,
+  });
+  // The assisted write is consumed by the durable suppression record, not
+  // republished as a new clipboard event.
+  assert.equal(withImageAdapter.runtime.getStatus().pendingAssistedImages?.length, 1);
+  await withImageAdapter.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:complete-pending-image",
+      itemId: "inbound-image-adapter",
+    }),
+  );
+  assert.equal(withImageAdapter.runtime.getStatus().pendingAssistedImages?.length, 0);
+
+  const textWrites: string[] = [];
+  const withoutImageAdapter = await startReady({
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async (text) => { textWrites.push(text); },
+    },
+    decrypt: async () => ({ plaintextBytes: bundle }),
+  });
+  await withoutImageAdapter.runtime.receiveClipboardItem({
+    ...inboundEnvelope("inbound-image-no-adapter"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+  assert.deepEqual(textWrites, []);
+  assert.equal(withoutImageAdapter.runtime.getStatus().pendingAssistedImages?.length, 1);
+  assert.equal(withoutImageAdapter.runtime.getStatus().lastSyncError, undefined);
+});
+
+test("normalized PNG observations use the assisted guard, not source-byte equality", async () => {
+  const sourceBytes = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x21,
+  ]);
+  const normalizedBytes = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x22,
+  ]);
+  const genuineBytes = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x23,
+  ]);
+  assert.notEqual(
+    bytesToHex(await sha256(sourceBytes)),
+    bytesToHex(await sha256(normalizedBytes)),
+  );
+
+  const sourceImage = clipboardPayloadFromPngBytes(sourceBytes);
+  const normalizedImage = clipboardPayloadFromPngBytes(normalizedBytes);
+  const genuineImage = clipboardPayloadFromPngBytes(genuineBytes);
+  const bundle = encodeClipboardBundleV1(sourceImage);
+  const capableDevice = {
+    ...registeredDevice,
+    capabilities: [...CLIPBOARD_RECEIVE_CAPABILITIES],
+  };
+  const pairing = makePairingTrustStore(identity, capableDevice);
+  const suppressionStore = new InMemoryAssistedPngSuppressionStore();
+  let encryptCalls = 0;
+  let rebaselineCalls = 0;
+  const setup = await startReady({
+    localTrustState: "root",
+    registeredDevice: capableDevice,
+    trustStore: pairing.trustStore,
+    assistedPngSuppressionStore: suppressionStore,
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+      rebaselineFromClipboard: async () => {
+        rebaselineCalls += 1;
+        throw new Error("simulated actual-clipboard read failure");
+      },
+    },
+    decrypt: async () => ({ plaintextBytes: bundle }),
+    encrypt: async (input) => {
+      encryptCalls += 1;
+      return {
+        ...inboundEnvelope(`genuine-normalized-test-${encryptCalls}`),
+        contentType: input.contentType,
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+  await setup.runtime.receiveClipboardItem({
+    ...inboundEnvelope("normalized-png-item"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+  const copied = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:copy-pending-image",
+      itemId: "normalized-png-item",
+    }),
+  );
+  assert.equal(copied.ok, true);
+
+  const completed = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:complete-pending-image",
+      itemId: "normalized-png-item",
+    }),
+  );
+  assert.equal(completed.ok, true);
+  assert.equal(rebaselineCalls, 1);
+  assert.deepEqual(setup.runtime.getStatus().pendingAssistedImages, []);
+
+  await setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: normalizedImage,
+  });
+  assert.equal(encryptCalls, 0);
+  assert.equal(
+    setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
+    0,
+  );
+  assert.equal(await suppressionStore.consumeNext(user.id), false);
+
+  await setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: genuineImage,
+  });
+  assert.equal(encryptCalls, 1);
+  assert.equal(
+    setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
+    1,
+  );
+});
+
+test("a PNG observation racing before re-baseline consumes the durable guard", async () => {
+  const sourceImage = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x31]),
+  );
+  const normalizedImage = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x32]),
+  );
+  const capableDevice = {
+    ...registeredDevice,
+    capabilities: [...CLIPBOARD_RECEIVE_CAPABILITIES],
+  };
+  const pairing = makePairingTrustStore(identity, capableDevice);
+  const suppressionStore = new InMemoryAssistedPngSuppressionStore();
+  let encryptCalls = 0;
+  const setup = await startReady({
+    localTrustState: "root",
+    registeredDevice: capableDevice,
+    trustStore: pairing.trustStore,
+    assistedPngSuppressionStore: suppressionStore,
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+      rebaselineFromClipboard: async () => undefined,
+    },
+    decrypt: async () => ({ plaintextBytes: encodeClipboardBundleV1(sourceImage) }),
+    encrypt: async () => {
+      encryptCalls += 1;
+      throw new Error("the racing assisted PNG must be suppressed");
+    },
+  });
+  await setup.runtime.receiveClipboardItem({
+    ...inboundEnvelope("racing-normalized-png"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+  const copied = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:copy-pending-image",
+      itemId: "racing-normalized-png",
+    }),
+  );
+  assert.equal(copied.ok, true);
+
+  await setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: normalizedImage,
+  });
+  assert.equal(encryptCalls, 0);
+  assert.equal(await suppressionStore.consumeNext(user.id), false);
+
+  const completed = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:complete-pending-image",
+      itemId: "racing-normalized-png",
+    }),
+  );
+  assert.equal(completed.ok, true);
+});
+
+test("successful re-baseline makes the watcher ignore the normalized PNG", async () => {
+  const sourceImage = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x41]),
+  );
+  const normalizedImage = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x42]),
+  );
+  const suppressionStore = new InMemoryAssistedPngSuppressionStore();
+  let clipboard = sourceImage;
+  const watcherRef: {
+    current?: ReturnType<typeof createOffscreenClipboardWatcher>;
+  } = {};
+  const callbacks = new Map<number, () => void>();
+  let nextTimerId = 1;
+  let encryptCalls = 0;
+  const setup = await startReady({
+    assistedPngSuppressionStore: suppressionStore,
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+      rebaselineFromClipboard: async () => {
+        watcherRef.current?.noteExternalWrite(clipboard);
+      },
+    },
+    decrypt: async () => ({ plaintextBytes: encodeClipboardBundleV1(sourceImage) }),
+    encrypt: async () => {
+      encryptCalls += 1;
+      throw new Error("the re-baselined PNG must not publish");
+    },
+  });
+  const watcher = createOffscreenClipboardWatcher({
+    readPayload: () => clipboard,
+    runtime: {
+      sendMessage: (message) => setup.runtime.handleClipboardObservation(message),
+    },
+    setIntervalFn: (handler) => {
+      const id = nextTimerId++;
+      callbacks.set(id, handler);
+      return id as unknown as ReturnType<typeof globalThis.setInterval>;
+    },
+    clearIntervalFn: (handle) => {
+      callbacks.delete(handle as unknown as number);
+    },
+  });
+  watcherRef.current = watcher;
+  watcher.start();
+  await flushRuntimeWork();
+
+  await setup.runtime.receiveClipboardItem({
+    ...inboundEnvelope("successful-png-rebaseline"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+  const copied = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:copy-pending-image",
+      itemId: "successful-png-rebaseline",
+    }),
+  );
+  assert.equal(copied.ok, true);
+
+  clipboard = normalizedImage;
+  const completed = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:complete-pending-image",
+      itemId: "successful-png-rebaseline",
+    }),
+  );
+  assert.equal(completed.ok, true);
+  assert.equal(await suppressionStore.consumeNext(user.id), false);
+
+  for (const callback of [...callbacks.values()]) callback();
+  await flushRuntimeWork();
+  assert.equal(encryptCalls, 0);
+  assert.equal(
+    setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
+    0,
+  );
+  watcher.stop();
+});
+
+test("assisted PNG suppression survives live envelope expiry until the watcher interval", async () => {
+  const baseTime = Date.now();
+  let nowMs = baseTime;
+  const pngBytes = new Uint8Array([
+    0x89,
+    0x50,
+    0x4e,
+    0x47,
+    0x0d,
+    0x0a,
+    0x1a,
+    0x0a,
+    7,
+  ]);
+  const image = clipboardPayloadFromPngBytes(pngBytes);
+  const bundle = encodeClipboardBundleV1(image);
+  const pendingAssistedImageStore = new InMemoryPendingAssistedImageStore();
+  const assistedPngSuppressionStore = new ClockedAssistedPngSuppressionStore(
+    () => nowMs,
+  );
+  let encryptCalls = 0;
+  const setup = await startReady({
+    now: () => new Date(nowMs),
+    pendingAssistedImageStore,
+    assistedPngSuppressionStore,
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+    },
+    decrypt: async () => ({ plaintextBytes: bundle }),
+    encrypt: async () => {
+      encryptCalls += 1;
+      throw new Error("the assisted PNG observation must be suppressed");
+    },
+  });
+  const envelopeExpiry = new Date(baseTime + 400).toISOString();
+  await setup.runtime.receiveClipboardItem({
+    ...inboundEnvelope("assisted-expiry-race", envelopeExpiry),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+
+  const copied = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:copy-pending-image",
+      itemId: "assisted-expiry-race",
+    }),
+  );
+  assert.equal(copied.ok, true);
+  const suppression = assistedPngSuppressionStore.records.get(
+    `${user.id}:assisted-expiry-race`,
+  );
+  assert.ok(suppression);
+  assert.equal(Date.parse(suppression.expiresAt), baseTime + 15_000);
+  assert.ok(Date.parse(suppression.expiresAt) > Date.parse(envelopeExpiry));
+
+  await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:complete-pending-image",
+      itemId: "assisted-expiry-race",
+    }),
+  );
+  assert.deepEqual(setup.runtime.getStatus().pendingAssistedImages, []);
+
+  let clipboard: ClipboardPayloadV1 = clipboardPayloadFromPlainText("baseline");
+  const callbacks = new Map<number, () => void>();
+  let nextTimerId = 1;
+  const watcher = createOffscreenClipboardWatcher({
+    readPayload: () => clipboard,
+    runtime: {
+      sendMessage: (message) => setup.runtime.handleClipboardObservation(message),
+    },
+    intervalMs: 800,
+    setIntervalFn: (handler, intervalMs) => {
+      assert.equal(intervalMs, 800);
+      const id = nextTimerId++;
+      callbacks.set(id, handler);
+      return id as unknown as ReturnType<typeof globalThis.setInterval>;
+    },
+    clearIntervalFn: (handle) => {
+      callbacks.delete(handle as unknown as number);
+    },
+  });
+  watcher.start();
+  await flushRuntimeWork();
+
+  // The normal watcher interval observes the image after its 400 ms live
+  // envelope has expired, but well before the 15-second suppression expiry.
+  nowMs = baseTime + 800;
+  clipboard = image;
+  for (const callback of [...callbacks.values()]) callback();
+  await waitForRuntimeCondition(
+    () => assistedPngSuppressionStore.consumed === 1,
+    "the assisted PNG suppression was not consumed",
+  );
+  watcher.stop();
+
+  assert.equal(encryptCalls, 0);
+  assert.equal(
+    setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
+    0,
+  );
+  assert.equal(assistedPngSuppressionStore.records.size, 0);
+  assert.deepEqual(setup.runtime.getStatus().pendingAssistedImages, []);
+  assert.equal(setup.runtime.getStatus().connectionState, "ready");
+  assert.equal(setup.runtime.getStatus().lastSyncError, undefined);
+});
+
+test("assisted completion leaves durable suppression for the real clipboard event order", async () => {
+  const pngBytes = new Uint8Array([
+    0x89,
+    0x50,
+    0x4e,
+    0x47,
+    0x0d,
+    0x0a,
+    0x1a,
+    0x0a,
+    4,
+  ]);
+  const image = clipboardPayloadFromPngBytes(pngBytes);
+  const bundle = encodeClipboardBundleV1(image);
+  const pendingAssistedImageStore = new InMemoryPendingAssistedImageStore();
+  const assistedPngSuppressionStore = new InMemoryAssistedPngSuppressionStore();
+  let encryptCalls = 0;
+  const setup = await startReady({
+    pendingAssistedImageStore,
+    assistedPngSuppressionStore,
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+    },
+    decrypt: async () => ({ plaintextBytes: bundle }),
+    encrypt: async () => {
+      encryptCalls += 1;
+      throw new Error("suppressed observations must not encrypt");
+    },
+  });
+  await setup.runtime.receiveClipboardItem({
+    ...inboundEnvelope("assisted-order-item"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+
+  const copyResponse = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:copy-pending-image",
+      itemId: "assisted-order-item",
+    }),
+  );
+  assert.equal(copyResponse.ok, true);
+
+  // The focused page has now successfully written the decoded PNG, so the
+  // popup immediately completes the pending UI action before the next poll.
+  const completeResponse = await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:complete-pending-image",
+      itemId: "assisted-order-item",
+    }),
+  );
+  assert.equal(completeResponse.ok, true);
+  assert.deepEqual(setup.runtime.getStatus().pendingAssistedImages, []);
+
+  // Reconstruct the worker before the offscreen event. The suppression record
+  // is shared durable metadata, while the pending UI state is already gone.
+  const recreatedSocket = new FakeSocket();
+  const recreated = await startReady({
+    sessionStore: setup.sessionStore,
+    pendingAssistedImageStore,
+    assistedPngSuppressionStore,
+    socket: recreatedSocket,
+    trustStore: setup.trustStore,
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+    },
+    encrypt: async () => {
+      encryptCalls += 1;
+      throw new Error("suppressed observations must not encrypt");
+    },
+  });
+  await recreated.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: image,
+  });
+
+  assert.equal(encryptCalls, 0);
+  assert.equal(
+    recreatedSocket.emissions.filter(
+      (emission) => emission.event === "clipboard:publish",
+    ).length,
+    0,
+  );
+  assert.deepEqual(recreated.runtime.getStatus().pendingAssistedImages, []);
+  assert.equal(
+    await assistedPngSuppressionStore.consumeNext(user.id),
+    false,
+  );
+});
+
+test("failed focused write release removes suppression and allows a genuine same-PNG copy", async () => {
+  const pngBytes = new Uint8Array([
+    0x89,
+    0x50,
+    0x4e,
+    0x47,
+    0x0d,
+    0x0a,
+    0x1a,
+    0x0a,
+    5,
+  ]);
+  const image = clipboardPayloadFromPngBytes(pngBytes);
+  const bundle = encodeClipboardBundleV1(image);
+  const capableDevice = {
+    ...registeredDevice,
+    capabilities: [...CLIPBOARD_RECEIVE_CAPABILITIES],
+  };
+  const pairing = makePairingTrustStore(identity, capableDevice);
+  const pendingAssistedImageStore = new InMemoryPendingAssistedImageStore();
+  const assistedPngSuppressionStore = new InMemoryAssistedPngSuppressionStore();
+  let encryptCalls = 0;
+  const setup = await startReady({
+    localTrustState: "root",
+    registeredDevice: capableDevice,
+    trustStore: pairing.trustStore,
+    pendingAssistedImageStore,
+    assistedPngSuppressionStore,
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+    },
+    decrypt: async () => ({ plaintextBytes: bundle }),
+    encrypt: async (input) => {
+      encryptCalls += 1;
+      return {
+        ...inboundEnvelope(`genuine-image-${encryptCalls}`),
+        contentType: input.contentType,
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+  await setup.runtime.receiveClipboardItem({
+    ...inboundEnvelope("release-item"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+  const copied = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:copy-pending-image", itemId: "release-item" }),
+  );
+  assert.equal(copied.ok, true);
+
+  // This is the popup's failure path after the focused ClipboardItem write
+  // rejects: release clears suppression, while the pending item remains.
+  const released = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:release-pending-image", itemId: "release-item" }),
+  );
+  assert.equal(released.ok, true);
+  assert.equal(setup.runtime.getStatus().pendingAssistedImages?.length, 1);
+
+  await setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: image,
+  });
+  assert.equal(encryptCalls, 1);
+  assert.equal(
+    setup.socket.emissions.filter(
+      (emission) => emission.event === "clipboard:publish",
+    ).length,
+    1,
+  );
+});
+
+test("expired assisted PNG suppression does not block a genuine later copy", async () => {
+  const baseTime = Date.now();
+  let nowMs = baseTime;
+  const pngBytes = new Uint8Array([
+    0x89,
+    0x50,
+    0x4e,
+    0x47,
+    0x0d,
+    0x0a,
+    0x1a,
+    0x0a,
+    6,
+  ]);
+  const image = clipboardPayloadFromPngBytes(pngBytes);
+  const bundle = encodeClipboardBundleV1(image);
+  const capableDevice = {
+    ...registeredDevice,
+    capabilities: [...CLIPBOARD_RECEIVE_CAPABILITIES],
+  };
+  const pairing = makePairingTrustStore(identity, capableDevice);
+  const pendingAssistedImageStore = new InMemoryPendingAssistedImageStore();
+  const assistedPngSuppressionStore = new ClockedAssistedPngSuppressionStore(
+    () => nowMs,
+  );
+  let encryptCalls = 0;
+  const setup = await startReady({
+    now: () => new Date(nowMs),
+    localTrustState: "root",
+    registeredDevice: capableDevice,
+    trustStore: pairing.trustStore,
+    pendingAssistedImageStore,
+    assistedPngSuppressionStore,
+    decrypt: async () => ({ plaintextBytes: bundle }),
+    encrypt: async (input) => {
+      encryptCalls += 1;
+      return {
+        ...inboundEnvelope(`expired-image-${encryptCalls}`),
+        contentType: input.contentType,
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+  await setup.runtime.receiveClipboardItem({
+    ...inboundEnvelope("expired-item"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  });
+  const copied = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:copy-pending-image", itemId: "expired-item" }),
+  );
+  assert.equal(copied.ok, true);
+  const suppression = assistedPngSuppressionStore.records.get(
+    `${user.id}:expired-item`,
+  );
+  assert.ok(suppression);
+  await setup.runtime.handleMessage(
+    runtimeMessage({
+      type: "runtime:complete-pending-image",
+      itemId: "expired-item",
+    }),
+  );
+  nowMs = Date.parse(suppression.expiresAt) + 1;
+  await setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: image,
+  });
+  assert.equal(assistedPngSuppressionStore.consumed, 0);
+  assert.equal(assistedPngSuppressionStore.records.size, 0);
+  assert.equal(encryptCalls, 1);
+  assert.equal(
+    setup.socket.emissions.filter(
+      (emission) => emission.event === "clipboard:publish",
+    ).length,
+    1,
+  );
+});
+
+test("unknown content types are consumed after crypto verification without decoding or retrying", async () => {
+  for (const contentType of ["application/x-copyyt-future", "text/html", "text/plain;charset=utf-8"]) {
+    const processedItemStore = new RecordingProcessedItemStore();
+    const writes: string[] = [];
+    let decryptions = 0;
+    const setup = await startReady({
+      processedItemStore,
+      clipboardAdapter: {
+        readText: async () => "",
+        writeText: async (text) => { writes.push(text); },
+      },
+      decrypt: async () => {
+        decryptions += 1;
+        return { plaintextBytes: new Uint8Array([0xff]) };
+      },
+    });
+    const envelope = { ...inboundEnvelope(`unsupported-${contentType}`), contentType };
+    await setup.runtime.receiveClipboardItem(envelope);
+    await setup.runtime.receiveClipboardItem(envelope);
+    assert.deepEqual(writes, []);
+    assert.equal(decryptions, 1);
+    assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "unsupported-content");
+    assert.equal(setup.runtime.getStatus().lastSyncError, undefined);
+    assert.equal(setup.runtime.getStatus().syncReady, true);
+  }
+});
+
+test("invalid UTF-8 and malformed bundles are consumed as invalid content rather than crypto failure", async () => {
+  const malformedItems = [
+    { contentType: "text/plain", plaintextBytes: new Uint8Array([0xc3, 0x28]) },
+    { contentType: CLIPBOARD_BUNDLE_V1_MIME, plaintextBytes: new Uint8Array([0xff]) },
+    { contentType: CLIPBOARD_BUNDLE_V1_MIME, plaintextBytes: new TextEncoder().encode("{not JSON") },
+    {
+      contentType: CLIPBOARD_BUNDLE_V1_MIME,
+      plaintextBytes: new TextEncoder().encode(JSON.stringify({
+        version: 1,
+        representations: [{ mime: "text/html", encoding: "utf-8", data: "<b>no fallback</b>" }],
+      })),
+    },
+  ];
+  for (const [index, item] of malformedItems.entries()) {
+    const processedItemStore = new RecordingProcessedItemStore();
+    const writes: string[] = [];
+    let decryptions = 0;
+    const setup = await startReady({
+      processedItemStore,
+      clipboardAdapter: {
+        readText: async () => "",
+        writeText: async (text) => { writes.push(text); },
+      },
+      decrypt: async () => {
+        decryptions += 1;
+        return { plaintext: "never write this", plaintextBytes: item.plaintextBytes };
+      },
+    });
+    const envelope = { ...inboundEnvelope(`invalid-content-${index}`), contentType: item.contentType };
+    await setup.runtime.receiveClipboardItem(envelope);
+    await setup.runtime.receiveClipboardItem(envelope);
+    assert.deepEqual(writes, []);
+    assert.equal(decryptions, 1);
+    assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "invalid-content");
+    assert.equal(setup.runtime.getStatus().lastSyncError?.code, "INVALID_CLIPBOARD_CONTENT");
+    assert.equal(setup.runtime.getStatus().syncReady, true);
+    assert.equal(JSON.stringify(setup.runtime.getStatus()).includes("never write this"), false);
+  }
+});
+
+test("stale bundles are consumed before decrypt and without content diagnostics", async () => {
+  const processedItemStore = new RecordingProcessedItemStore();
+  let decryptions = 0;
+  const writes: string[] = [];
+  const setup = await startReady({
+    processedItemStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text) => { writes.push(text); },
+    },
+    decrypt: async () => {
+      decryptions += 1;
+      throw new Error("stale bundles must not decrypt");
+    },
+  });
+  const envelope = {
+    ...inboundEnvelope("stale-bundle", new Date(Date.now() - 1).toISOString()),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  };
+  await setup.runtime.receiveClipboardItem(envelope);
+  assert.equal(decryptions, 0);
+  assert.deepEqual(writes, []);
+  assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "stale");
+  assert.equal(setup.runtime.getStatus().lastSyncError, undefined);
+});
+
+test("bundle self-echo is verified and consumed without clipboard write", async () => {
+  const bundle = richClipboardBundle();
+  const processedItemStore = new RecordingProcessedItemStore();
+  const writes: string[] = [];
+  let decryptions = 0;
+  const setup = await startReady({
+    processedItemStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text) => { writes.push(text); },
+    },
+    decrypt: async () => {
+      decryptions += 1;
+      return { plaintextBytes: bundle.bytes };
+    },
+  });
+  const envelope = { ...inboundEnvelope("bundle-self-echo"), contentType: CLIPBOARD_BUNDLE_V1_MIME };
+  await setup.outboundItemStore.mark({
+    userId: user.id,
+    itemId: envelope.itemId,
+    publishedAt: new Date().toISOString(),
+    sourceDeviceId: identity.deviceId,
+  });
+  await setup.runtime.receiveClipboardItem(envelope);
+  assert.equal(decryptions, 1);
+  assert.deepEqual(writes, []);
+  assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "self-echo");
+});
+
+test("Receive Off consumes a bundle before decrypt and blocks replay after re-enable", async () => {
+  const syncPreferencesStore = new InMemorySyncPreferencesStore();
+  await syncPreferencesStore.set({ schemaVersion: 1, sendEnabled: true, receiveEnabled: false });
+  const processedItemStore = new RecordingProcessedItemStore();
+  const writes: string[] = [];
+  let decryptions = 0;
+  const setup = await startReady({
+    syncPreferencesStore,
+    processedItemStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text) => { writes.push(text); },
+    },
+    decrypt: async () => {
+      decryptions += 1;
+      return { plaintextBytes: richClipboardBundle().bytes };
+    },
+  });
+  const envelope = { ...inboundEnvelope("disabled-bundle"), contentType: CLIPBOARD_BUNDLE_V1_MIME };
+  await setup.runtime.receiveClipboardItem(envelope);
+  await setup.runtime.handleMessage(runtimeMessage({
+    type: "runtime:set-sync-preferences", sendEnabled: true, receiveEnabled: true,
+  }));
+  await setup.runtime.receiveClipboardItem(envelope);
+  assert.equal(decryptions, 0);
+  assert.deepEqual(writes, []);
+  assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "receive-disabled");
+});
+
+test("Receive Off during bundle decryption blocks writes even after immediate re-enable", async () => {
+  for (const reenableBeforeDecrypt of [false, true]) {
+    let beginDecryption!: () => void;
+    const decryptionStarted = new Promise<void>((resolve) => { beginDecryption = resolve; });
+    let releaseDecryption!: () => void;
+    const decryptionGate = new Promise<void>((resolve) => { releaseDecryption = resolve; });
+    const processedItemStore = new RecordingProcessedItemStore();
+    const writes: string[] = [];
+    let decryptions = 0;
+    const setup = await startReady({
+      processedItemStore,
+      clipboardAdapter: {
+        readText: async () => "",
+        writeText: async (text) => { writes.push(text); },
+      },
+      decrypt: async () => {
+        decryptions += 1;
+        beginDecryption();
+        await decryptionGate;
+        return { plaintextBytes: richClipboardBundle().bytes };
+      },
+    });
+    const envelope = { ...inboundEnvelope(`in-flight-bundle-${reenableBeforeDecrypt}`), contentType: CLIPBOARD_BUNDLE_V1_MIME };
+    const receive = setup.runtime.receiveClipboardItem(envelope);
+    await decryptionStarted;
+    assert.equal((await setup.runtime.handleMessage(runtimeMessage({
+      type: "runtime:set-sync-preferences", sendEnabled: true, receiveEnabled: false,
+    }))).ok, true);
+    if (reenableBeforeDecrypt) {
+      await setup.runtime.handleMessage(runtimeMessage({
+        type: "runtime:set-sync-preferences", sendEnabled: true, receiveEnabled: true,
+      }));
+    }
+    releaseDecryption();
+    await receive;
+    await setup.runtime.handleMessage(runtimeMessage({
+      type: "runtime:set-sync-preferences", sendEnabled: true, receiveEnabled: true,
+    }));
+    await setup.runtime.receiveClipboardItem(envelope);
+    assert.deepEqual(writes, []);
+    assert.equal(decryptions, 1);
+    assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "receive-disabled");
+  }
+});
+
+test("Receive policy is rechecked after bundle decoding immediately before OS write", async () => {
+  const bytes = richClipboardBundle().bytes;
+  const processedItemStore = new RecordingProcessedItemStore();
+  const writes: string[] = [];
+  let disableResult: ReturnType<CopyytServiceWorkerRuntime["handleMessage"]> | undefined;
+  const setup = await startReady({
+    processedItemStore,
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text) => { writes.push(text); },
+    },
+    decrypt: async () => ({
+      // Force a policy change as decoding reads the decrypted bytes, after the
+      // post-decrypt guard, to exercise the final guard independently.
+      get plaintextBytes() {
+        disableReceive();
+        return bytes;
+      },
+    }),
+  });
+  const disableReceive = () => {
+    disableResult = setup.runtime.handleMessage(runtimeMessage({
+      type: "runtime:set-sync-preferences", sendEnabled: true, receiveEnabled: false,
+    }));
+  };
+  const envelope = { ...inboundEnvelope("bundle-decode-policy-boundary"), contentType: CLIPBOARD_BUNDLE_V1_MIME };
+  await setup.runtime.receiveClipboardItem(envelope);
+  assert.ok(disableResult);
+  assert.equal((await disableResult).ok, true);
+  assert.deepEqual(writes, []);
+  assert.equal(processedItemStore.records.get(`${user.id}:${envelope.itemId}`)?.disposition, "receive-disabled");
+});
 
 const flushRuntimeWork = (): Promise<void> =>
   new Promise((resolve) => setImmediate(resolve));
@@ -1433,7 +2584,7 @@ test("receive disabled consumes an item without decrypting and never replays it"
     },
     decrypt: async () => {
       decryptions += 1;
-      return { plaintext: "secret", plaintextBytes: new Uint8Array() };
+      return { plaintext: "secret", plaintextBytes: new TextEncoder().encode("secret") };
     },
   });
   const envelope = inboundEnvelope("receive-disabled-item");
@@ -1479,7 +2630,7 @@ test("an in-flight receive is consumed when receive is disabled before clipboard
     decrypt: async () => {
       markDecryptionStarted();
       await decryptionGate;
-      return { plaintext: "old inbound value", plaintextBytes: new Uint8Array() };
+      return { plaintext: "old inbound value", plaintextBytes: new TextEncoder().encode("old inbound value") };
     },
   });
 
@@ -1526,7 +2677,7 @@ test("Receive disable becomes a barrier before its storage write completes", asy
     decrypt: async () => {
       markDecryptionStarted();
       await decryptionGate;
-      return { plaintext: "old inbound value", plaintextBytes: new Uint8Array() };
+      return { plaintext: "old inbound value", plaintextBytes: new TextEncoder().encode("old inbound value") };
     },
   });
 
@@ -1573,7 +2724,7 @@ test("an in-flight receive is not revived by Both after receive briefly turns Of
     decrypt: async () => {
       markDecryptionStarted();
       await decryptionGate;
-      return { plaintext: "pre-Off inbound value", plaintextBytes: new Uint8Array() };
+      return { plaintext: "pre-Off inbound value", plaintextBytes: new TextEncoder().encode("pre-Off inbound value") };
     },
   });
 
@@ -2084,6 +3235,612 @@ async function startReady(overrides: Parameters<typeof makeRuntime>[0] = {}) {
   return setup;
 }
 
+const directSourceDevice: RegisteredDeviceResponse = {
+  ...registeredDevice,
+  deviceId: "00000000-0000-4000-8000-000000000002",
+  name: "Direct Source",
+  encryptionPublicKey: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+  signingPublicKey: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+  capabilities: [CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY],
+};
+
+async function makeDirectTestIdentity(deviceId: string): Promise<DeviceIdentity> {
+  const signing = (await crypto.subtle.generateKey(
+    { name: "Ed25519" },
+    false,
+    ["sign", "verify"],
+  )) as CryptoKeyPair;
+  const encryption = (await crypto.subtle.generateKey(
+    { name: "X25519" },
+    false,
+    ["deriveBits"],
+  )) as CryptoKeyPair;
+  return createDeviceIdentityForTesting({
+    userId: user.id,
+    deviceId,
+    keyVersion: 1,
+    signingPrivateKey: signing.privateKey,
+    signingPublicKey: await crypto.subtle.importKey(
+      "raw",
+      await crypto.subtle.exportKey("raw", signing.publicKey),
+      { name: "Ed25519" },
+      true,
+      ["verify"],
+    ),
+    encryptionPrivateKey: encryption.privateKey,
+    encryptionPublicKey: await crypto.subtle.importKey(
+      "raw",
+      await crypto.subtle.exportKey("raw", encryption.publicKey),
+      { name: "X25519" },
+      true,
+      [],
+    ),
+  });
+}
+
+function registeredDirectDevice(
+  device: DeviceIdentity,
+  capabilities: string[],
+  name: string,
+): RegisteredDeviceResponse {
+  return {
+    deviceId: device.deviceId,
+    name,
+    platform: "chrome",
+    encryptionPublicKey: device.encryptionPublicKeyBase64,
+    signingPublicKey: device.signingPublicKeyBase64,
+    trustState: "trusted",
+    keyVersion: device.keyVersion!,
+    capabilities,
+  };
+}
+
+function directSignal(
+  overrides: Partial<DirectSignalDelivery> = {},
+): DirectSignalDelivery {
+  return {
+    transferId: "44444444-4444-4444-8444-444444444444",
+    sourceDeviceId: directSourceDevice.deviceId,
+    sourceKeyVersion: directSourceDevice.keyVersion,
+    kind: "cancel",
+    reason: "test signal",
+    ...overrides,
+  };
+}
+
+async function startDirectSignalRuntime(): Promise<{
+  setup: Awaited<ReturnType<typeof startReady>>;
+  handled: DirectSignalDelivery[];
+  pairing: ReturnType<typeof makePairingTrustStore>;
+  setServerSource: (device: RegisteredDeviceResponse | null) => void;
+  getSnapshotCalls: () => number;
+}> {
+  const pairing = makePairingTrustStore();
+  const handled: DirectSignalDelivery[] = [];
+  let snapshotCalls = 0;
+  const directTransport: DirectTransport = {
+    startTestTransfer: async () => undefined,
+    handleSignal: async (signal) => {
+      handled.push(signal);
+    },
+    cancelTransfer: async () => undefined,
+    cancelAll: async () => undefined,
+  };
+  let serverSource: RegisteredDeviceResponse | null = directSourceDevice;
+  const setup = await startReady({
+    trustStore: pairing.trustStore,
+    directTransport,
+    listDevices: async () => {
+      snapshotCalls += 1;
+      return response([registeredDevice, ...(serverSource ? [serverSource] : [])]);
+    },
+    listPendingDevices: async () => {
+      snapshotCalls += 1;
+      return response([]);
+    },
+  });
+  await waitForRuntimeCondition(
+    () => setup.runtime.getStatus().socket.deviceAuthenticated,
+    "direct signal test socket did not become authenticated",
+  );
+  return {
+    setup,
+    handled,
+    pairing,
+    setServerSource: (device) => {
+      serverSource = device;
+    },
+    getSnapshotCalls: () => snapshotCalls,
+  };
+}
+
+test("a valid locally pinned direct signal is forwarded to offscreen", async () => {
+  const direct = await startDirectSignalRuntime();
+  putLocalRecord(direct.pairing.records, directSourceDevice, "verified");
+  const signal = directSignal();
+
+  direct.setup.socket.trigger("direct:signal", signal);
+  await waitForRuntimeCondition(
+    () => direct.handled.length === 1,
+    "valid direct signal was not forwarded",
+  );
+  assert.deepEqual(direct.handled, [signal]);
+});
+
+test("ordinary direct ICE reuses transfer-scoped source validation", async () => {
+  const direct = await startDirectSignalRuntime();
+  putLocalRecord(direct.pairing.records, directSourceDevice, "verified");
+  const baselineSnapshotCalls = direct.getSnapshotCalls();
+
+  direct.setup.socket.trigger(
+    "direct:signal",
+    directSignal({ kind: "offer", reason: undefined, sdp: "offer-sdp" }),
+  );
+  await waitForRuntimeCondition(
+    () => direct.handled.length === 1,
+    "direct offer was not forwarded",
+  );
+  const afterOfferSnapshotCalls = direct.getSnapshotCalls();
+  assert.ok(afterOfferSnapshotCalls > baselineSnapshotCalls);
+
+  direct.setup.socket.trigger(
+    "direct:signal",
+    directSignal({
+      kind: "ice-candidate",
+      reason: undefined,
+      candidate: {
+        candidate: "candidate:1 1 UDP 1 192.0.2.1 9 typ host",
+        sdpMid: "0",
+        sdpMLineIndex: 0,
+      },
+    }),
+  );
+  await waitForRuntimeCondition(
+    () => direct.handled.length === 2,
+    "direct ICE candidate was not forwarded",
+  );
+  assert.equal(direct.getSnapshotCalls(), afterOfferSnapshotCalls);
+});
+
+test("concurrent initial direct signals share one authoritative source snapshot", async () => {
+  const pairing = makePairingTrustStore();
+  putLocalRecord(pairing.records, directSourceDevice, "verified");
+  let snapshotCalls = 0;
+  let releaseSnapshot!: () => void;
+  const snapshotGate = new Promise<void>((resolve) => {
+    releaseSnapshot = resolve;
+  });
+  let delaySnapshots = false;
+  const handled: DirectSignalDelivery[] = [];
+  const directTransport: DirectTransport = {
+    startTestTransfer: async () => undefined,
+    handleSignal: async (signal) => {
+      handled.push(signal);
+    },
+    cancelTransfer: async () => undefined,
+    cancelAll: async () => undefined,
+  };
+  const setup = await startReady({
+    trustStore: pairing.trustStore,
+    directTransport,
+    listDevices: async () => {
+      snapshotCalls += 1;
+      if (delaySnapshots) await snapshotGate;
+      return response([registeredDevice, directSourceDevice]);
+    },
+    listPendingDevices: async () => {
+      snapshotCalls += 1;
+      if (delaySnapshots) await snapshotGate;
+      return response([]);
+    },
+  });
+  const baselineSnapshotCalls = snapshotCalls;
+  delaySnapshots = true;
+  const signals = [
+    directSignal({ kind: "offer", reason: undefined, sdp: "offer-sdp" }),
+    directSignal({
+      kind: "ice-candidate",
+      reason: undefined,
+      candidate: { candidate: "candidate:1", sdpMLineIndex: 0 },
+    }),
+    directSignal({
+      kind: "ice-candidate",
+      reason: undefined,
+      candidate: { candidate: "candidate:2", sdpMLineIndex: 0 },
+    }),
+  ];
+  for (const signal of signals) setup.socket.trigger("direct:signal", signal);
+
+  await waitForRuntimeCondition(
+    () => snapshotCalls >= baselineSnapshotCalls + 2,
+    "the first direct signal did not start authoritative validation",
+  );
+  await flushRuntimeWork();
+  assert.equal(snapshotCalls, baselineSnapshotCalls + 2);
+
+  releaseSnapshot();
+  await waitForRuntimeCondition(
+    () => handled.length === signals.length,
+    "all concurrent direct signals were not forwarded",
+  );
+});
+
+test("PNG-only direct completion persists assisted image state without another text write", async () => {
+  const recipientIdentity = await makeDirectTestIdentity(identity.deviceId);
+  const sourceIdentity = await makeDirectTestIdentity(directSourceDevice.deviceId);
+  const recipientServer = registeredDirectDevice(
+    recipientIdentity,
+    [
+      "clipboard",
+      "clipboard-bundle-v1",
+      "clipboard-html-v1",
+      "clipboard-image-png-assisted-write-v1",
+      CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY,
+    ],
+    "Direct Recipient",
+  );
+  const sourceServer = registeredDirectDevice(
+    sourceIdentity,
+    [CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY],
+    "Direct Source",
+  );
+  const pairing = makePairingTrustStore(
+    recipientIdentity,
+    recipientServer,
+    { identity: sourceIdentity, device: sourceServer },
+  );
+  putLocalRecord(pairing.records, recipientServer, "verified", {
+    capabilities: recipientServer.capabilities,
+  });
+  putLocalRecord(pairing.records, sourceServer, "verified", {
+    capabilities: sourceServer.capabilities,
+  });
+  const pngPayload = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9]),
+  );
+  const transferId = "88888888-8888-4888-8888-888888888888";
+  const prepared = await prepareDirectClipboardTransfer({
+    userId: user.id,
+    identity: sourceIdentity,
+    recipient: {
+      userId: user.id,
+      deviceId: recipientIdentity.deviceId,
+      keyVersion: recipientIdentity.keyVersion!,
+      signingPublicKey: recipientIdentity.signingPublicKeyBase64,
+      encryptionPublicKey: recipientIdentity.encryptionPublicKeyBase64,
+      trustState: "verified",
+    },
+    payload: pngPayload,
+    transferId,
+    expiresAt: new Date(Date.now() + 60_000),
+  });
+  const writes: string[] = [];
+  let verifiedCalls = 0;
+  const pendingAssistedImageStore = new InMemoryPendingAssistedImageStore();
+  const setup = await startReady({
+    identity: recipientIdentity,
+    registeredDevice: recipientServer,
+    trustStore: pairing.trustStore,
+    pendingAssistedImageStore,
+    listDevices: async () => response([recipientServer, sourceServer]),
+    clipboardAdapter: {
+      readText: async () => "newer clipboard text",
+      writeText: async (text) => { writes.push(text); },
+    },
+    decryptDirect: async () => ({
+      payload: pngPayload,
+      plaintextBytes: encodeClipboardBundleV1(pngPayload),
+    }),
+    directTransport: {
+      startTestTransfer: async () => undefined,
+      handleSignal: async () => undefined,
+      cancelTransfer: async () => undefined,
+      cancelAll: async () => undefined,
+      sendClipboardVerified: async () => { verifiedCalls += 1; },
+    },
+  });
+  const frame = (value: {
+    type: "clipboard-secure-start" | "clipboard-secure-chunk";
+    manifest?: string;
+    data?: string;
+  }) => ({
+    source: OFFSCREEN_SOURCE,
+    target: RUNTIME_SOURCE,
+    type: "DIRECT_EVENT" as const,
+    event: {
+      kind: "application-frame" as const,
+      transferId,
+      remoteDeviceId: sourceIdentity.deviceId,
+      frame:
+        value.type === "clipboard-secure-start"
+          ? { type: value.type, manifest: value.manifest! }
+          : { type: value.type, data: value.data! },
+    },
+  });
+  await setup.runtime.handleDirectTransportEvent(
+    frame({ type: "clipboard-secure-start", manifest: JSON.stringify(prepared.manifest) }),
+  );
+  for (const chunk of prepared.encryptedChunks) {
+    await setup.runtime.handleDirectTransportEvent(
+      frame({ type: "clipboard-secure-chunk", data: chunk }),
+    );
+  }
+
+  assert.equal(verifiedCalls, 1);
+  assert.deepEqual(writes, []);
+  const pending = await pendingAssistedImageStore.list(user.id);
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0]?.itemId, transferId);
+});
+
+test("a direct signal from a locally unverified source is not forwarded", async () => {
+  const direct = await startDirectSignalRuntime();
+  putLocalRecord(direct.pairing.records, directSourceDevice, "unverified");
+
+  direct.setup.socket.trigger("direct:signal", directSignal());
+  await flushRuntimeWork();
+  await flushRuntimeWork();
+  assert.equal(direct.handled.length, 0);
+});
+
+test("a direct signal with a different source key version is not forwarded", async () => {
+  const direct = await startDirectSignalRuntime();
+  putLocalRecord(direct.pairing.records, directSourceDevice, "verified");
+
+  direct.setup.socket.trigger(
+    "direct:signal",
+    directSignal({ sourceKeyVersion: directSourceDevice.keyVersion + 1 }),
+  );
+  await flushRuntimeWork();
+  await flushRuntimeWork();
+  assert.equal(direct.handled.length, 0);
+});
+
+test("a direct signal with a different pinned signing key is not forwarded", async () => {
+  const direct = await startDirectSignalRuntime();
+  putLocalRecord(direct.pairing.records, directSourceDevice, "verified");
+  direct.setServerSource({
+    ...directSourceDevice,
+    signingPublicKey: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw=",
+  });
+
+  direct.setup.socket.trigger("direct:signal", directSignal());
+  await flushRuntimeWork();
+  await flushRuntimeWork();
+  assert.equal(direct.handled.length, 0);
+});
+
+test("a direct signal with a different pinned encryption key is not forwarded", async () => {
+  const direct = await startDirectSignalRuntime();
+  putLocalRecord(direct.pairing.records, directSourceDevice, "verified");
+  direct.setServerSource({
+    ...directSourceDevice,
+    encryptionPublicKey: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+  });
+
+  direct.setup.socket.trigger("direct:signal", directSignal());
+  await flushRuntimeWork();
+  await flushRuntimeWork();
+  assert.equal(direct.handled.length, 0);
+});
+
+test("a direct signal from a source no longer trusted by the server is not forwarded", async () => {
+  const direct = await startDirectSignalRuntime();
+  putLocalRecord(direct.pairing.records, directSourceDevice, "verified");
+  direct.setServerSource({
+    ...directSourceDevice,
+    trustState: "revoked",
+    revokedAt: new Date().toISOString(),
+  });
+
+  direct.setup.socket.trigger("direct:signal", directSignal());
+  await flushRuntimeWork();
+  await flushRuntimeWork();
+  assert.equal(direct.handled.length, 0);
+});
+
+async function assertDirectReceiveAccumulatorCleanup(
+  state: "failed" | "cancelled",
+): Promise<void> {
+  const pendingAssistedImageStore = new InMemoryPendingAssistedImageStore();
+  const directTransport: DirectTransport = {
+    startTestTransfer: async () => undefined,
+    handleSignal: async () => undefined,
+    cancelTransfer: async () => undefined,
+    cancelAll: async () => undefined,
+  };
+  const setup = await startReady({
+    directTransport,
+    pendingAssistedImageStore,
+  });
+  const transferId = "55555555-5555-4555-8555-555555555555";
+  const receives = (
+    setup.runtime as unknown as {
+      directClipboardReceives: Map<string, unknown>;
+    }
+  ).directClipboardReceives;
+  receives.set(transferId, {
+    manifest: { plaintextByteLength: 123 },
+    encryptedChunks: ["encrypted-chunk-1", "encrypted-chunk-2"],
+    sourceDeviceId: directSourceDevice.deviceId,
+  });
+
+  await setup.runtime.handleDirectTransportEvent({
+    source: OFFSCREEN_SOURCE,
+    target: RUNTIME_SOURCE,
+    type: "DIRECT_EVENT",
+    event: {
+      kind: "status",
+      transferId,
+      remoteDeviceId: directSourceDevice.deviceId,
+      state,
+    },
+  });
+
+  assert.equal(receives.has(transferId), false);
+  assert.deepEqual(await pendingAssistedImageStore.list(user.id), []);
+}
+
+test("failed partial direct receives release encrypted chunk accumulators", async () => {
+  await assertDirectReceiveAccumulatorCleanup("failed");
+});
+
+test("cancelled partial direct receives release encrypted chunk accumulators", async () => {
+  await assertDirectReceiveAccumulatorCleanup("cancelled");
+});
+
+test("late direct clipboard frames are ignored only for terminal transfers", async () => {
+  for (const terminalState of ["failed", "cancelled"] as const) {
+    let nowMs = Date.now();
+    let cancelCalls = 0;
+    const pendingAssistedImageStore = new InMemoryPendingAssistedImageStore();
+    const directTransport: DirectTransport = {
+      startTestTransfer: async () => undefined,
+      handleSignal: async () => undefined,
+      cancelTransfer: async () => {
+        cancelCalls += 1;
+      },
+      cancelAll: async () => undefined,
+    };
+    const setup = await startReady({
+      directTransport,
+      now: () => new Date(nowMs),
+      pendingAssistedImageStore,
+    });
+    const transferId = terminalState === "failed"
+      ? "66666666-6666-4666-8666-666666666666"
+      : "77777777-7777-4777-8777-777777777777";
+    const receives = (
+      setup.runtime as unknown as {
+        directClipboardReceives: Map<string, unknown>;
+      }
+    ).directClipboardReceives;
+    receives.set(transferId, {
+      manifest: { plaintextByteLength: 123 },
+      encryptedChunks: ["encrypted-chunk-1"],
+      sourceDeviceId: directSourceDevice.deviceId,
+    });
+
+    await setup.runtime.handleDirectTransportEvent({
+      source: OFFSCREEN_SOURCE,
+      target: RUNTIME_SOURCE,
+      type: "DIRECT_EVENT",
+      event: {
+        kind: "status",
+        transferId,
+        remoteDeviceId: directSourceDevice.deviceId,
+        state: terminalState,
+      },
+    });
+    await setup.runtime.handleDirectTransportEvent({
+      source: OFFSCREEN_SOURCE,
+      target: RUNTIME_SOURCE,
+      type: "DIRECT_EVENT",
+      event: {
+        kind: "application-frame",
+        transferId,
+        remoteDeviceId: directSourceDevice.deviceId,
+        frame: { type: "clipboard-secure-chunk", data: "late-frame" },
+      },
+    });
+    assert.equal(cancelCalls, 0);
+    assert.equal(setup.runtime.getStatus().lastSyncError, undefined);
+    assert.deepEqual(await pendingAssistedImageStore.list(user.id), []);
+
+    nowMs += 6_000;
+    await setup.runtime.handleDirectTransportEvent({
+      source: OFFSCREEN_SOURCE,
+      target: RUNTIME_SOURCE,
+      type: "DIRECT_EVENT",
+      event: {
+        kind: "application-frame",
+        transferId,
+        remoteDeviceId: directSourceDevice.deviceId,
+        frame: { type: "clipboard-secure-chunk", data: "late-after-tombstone" },
+      },
+    });
+    assert.equal(cancelCalls, 1);
+    assert.match(
+      setup.runtime.getStatus().lastSyncError?.message ?? "",
+      /chunk has no manifest/i,
+    );
+  }
+});
+
+test("ordinary direct clipboard chunks avoid repeated control-plane validation", async () => {
+  let identityCalls = 0;
+  let trustCalls = 0;
+  let snapshotCalls = 0;
+  const pairing = makePairingTrustStore();
+  const directTransport: DirectTransport = {
+    startTestTransfer: async () => undefined,
+    handleSignal: async () => undefined,
+    cancelTransfer: async () => undefined,
+    cancelAll: async () => undefined,
+  };
+  const setup = await startReady({
+    directTransport,
+    trustStore: {
+      ...pairing.trustStore,
+      getDevice: async (userId, deviceId) => {
+        trustCalls += 1;
+        return pairing.trustStore.getDevice(userId, deviceId);
+      },
+    },
+    identityLoader: async () => {
+      identityCalls += 1;
+      return identity;
+    },
+    apiFactory: (_accessToken, api) => ({
+      ...api,
+      devices: {
+        ...api.devices,
+        listDevices: async () => {
+          snapshotCalls += 1;
+          return api.devices.listDevices();
+        },
+        listPendingDevices: async () => {
+          snapshotCalls += 1;
+          return api.devices.listPendingDevices();
+        },
+      },
+    }),
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const baseline = { identityCalls, trustCalls, snapshotCalls };
+  const transferId = "88888888-8888-4888-8888-888888888888";
+  const receives = (
+    setup.runtime as unknown as {
+      directClipboardReceives: Map<string, unknown>;
+    }
+  ).directClipboardReceives;
+  receives.set(transferId, {
+    manifest: { chunkCount: 101, plaintextByteLength: 123 },
+    encryptedChunks: [],
+    sourceDeviceId: directSourceDevice.deviceId,
+    receivePolicyRevision: 0,
+  });
+
+  for (let index = 0; index < 100; index += 1) {
+    await setup.runtime.handleDirectTransportEvent({
+      source: OFFSCREEN_SOURCE,
+      target: RUNTIME_SOURCE,
+      type: "DIRECT_EVENT",
+      event: {
+        kind: "application-frame",
+        transferId,
+        remoteDeviceId: directSourceDevice.deviceId,
+        frame: { type: "clipboard-secure-chunk", data: `chunk-${index}` },
+      },
+    });
+  }
+
+  assert.equal(identityCalls, baseline.identityCalls);
+  assert.equal(trustCalls, baseline.trustCalls);
+  assert.equal(snapshotCalls, baseline.snapshotCalls);
+  assert.equal(receives.get(transferId) !== undefined, true);
+});
+
 test("sync failures preserve a ready authenticated socket and a later publish succeeds", async () => {
   const setup = await startReady({
     clipboardAdapter: {
@@ -2337,6 +4094,9 @@ function makePairingTrustStore(
     encryptionPublicKey: rootDevice.encryptionPublicKey,
     signingPublicKey: rootDevice.signingPublicKey,
     trustState: "root",
+    capabilities: Array.isArray(rootDevice.capabilities)
+      ? [...rootDevice.capabilities]
+      : undefined,
     trustOrigin: "initial-tofu",
   };
   if (initialDevice) {
@@ -2357,7 +4117,29 @@ function makePairingTrustStore(
     getDevice: async (_userId, deviceId) => records.get(key(deviceId)) ?? null,
     upsertServerReportedDevice: async (device) => {
       const current = records.get(key(device.deviceId));
-      if (current?.trustState === "root" || current?.trustState === "verified") return current;
+      if (current?.trustState === "revoked") return current;
+      if (current?.trustState === "root" || current?.trustState === "verified") {
+        if (
+          current.userId !== device.userId ||
+          current.deviceId !== device.deviceId ||
+          current.keyVersion !== device.keyVersion ||
+          current.encryptionPublicKey !== device.encryptionPublicKey ||
+          current.signingPublicKey !== device.signingPublicKey
+        ) {
+          throw new Error("trusted device identity changed");
+        }
+        const refreshed = {
+          ...current,
+          name: device.name,
+          platform: device.platform,
+          capabilities: Array.isArray(device.capabilities)
+            ? [...device.capabilities]
+            : undefined,
+          appVersion: device.appVersion,
+        };
+        records.set(key(device.deviceId), refreshed);
+        return refreshed;
+      }
       const next: LocalDeviceRecord = {
         ...device,
         trustState: device.trustState === "revoked" ? "revoked" : "unverified",
@@ -2366,6 +4148,7 @@ function makePairingTrustStore(
       return next;
     },
     bootstrapInitialTrustAnchor: async () => records.get(key(rootIdentity.deviceId))! as ClientVerifiedDevice,
+    recoverTrustAnchor: async () => records.get(key(rootIdentity.deviceId))! as ClientVerifiedDevice,
     pinPairedApprover: async (_userId, localIdentity, approverDeviceId, confirmedFingerprint) => {
       const approver = records.get(key(approverDeviceId));
       if (!approver || approver.trustState !== "unverified") throw new Error("approver missing");
@@ -3089,6 +4872,50 @@ test("publishing intersects local recipients with active server-trusted devices"
   assert.deepEqual(recipientIds, [pendingDevice.deviceId]);
 });
 
+test("recipient bundle capabilities never select outgoing bundles or establish local trust", async () => {
+  for (const capabilities of [[], ["clipboard"], ["clipboard", "clipboard-bundle-v1"]]) {
+    const currentDevice = { ...registeredDevice, capabilities };
+    const recipient = {
+      ...pendingDevice,
+      trustState: "trusted",
+      approvedByDeviceId: identity.deviceId,
+      capabilities,
+    };
+    const unverifiedDevice = {
+      ...recipient,
+      deviceId: "00000000-0000-4000-8000-000000000003",
+      capabilities: ["clipboard", "clipboard-bundle-v1"],
+    };
+    const pairing = makePairingTrustStore(identity, currentDevice);
+    putLocalRecord(pairing.records, recipient, "verified");
+    putLocalRecord(pairing.records, unverifiedDevice, "unverified");
+    const plaintext = "  raw recipient-independent e\u0301 🦊\n";
+    const encryptInputs: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0][] = [];
+    const setup = await startReady({
+      registeredDevice: currentDevice,
+      trustStore: pairing.trustStore,
+      listDevices: async () => response([currentDevice, recipient, unverifiedDevice]),
+      encrypt: async (input) => {
+        encryptInputs.push(input);
+        return {
+          ...inboundEnvelope("capability-independent-publish"),
+          contentType: input.contentType,
+          expiresAt: input.expiresAt,
+        };
+      },
+    });
+    await setup.runtime.publishClipboardText(plaintext);
+    assert.equal(encryptInputs.length, 1);
+    assert.equal(encryptInputs[0].contentType, "text/plain");
+    assert.equal(encryptInputs[0].plaintext, plaintext);
+    assert.deepEqual(
+      encryptInputs[0].recipients.map((device) => device.deviceId).sort(),
+      [identity.deviceId, recipient.deviceId].sort(),
+    );
+    assert.equal(pairing.records.get(`${user.id}:${unverifiedDevice.deviceId}`)?.trustState, "unverified");
+  }
+});
+
 function clipboardObservation(text: string) {
   return {
     source: "offscreen" as const,
@@ -3098,11 +4925,15 @@ function clipboardObservation(text: string) {
   };
 }
 
-test("automatic observations use the same publish path as manual Send", async () => {
+test("automatic observations and manual Send use typed payloads but encrypt exact legacy raw text", async () => {
+  const now = new Date("2030-01-01T00:00:00.000Z");
+  const manualText = "\uFEFF  manual café e\u0301 🦊\r\n\t ";
+  const automaticText = "\n automatic 日本語 🚀\t  ";
   const watchCalls: Array<{ type: "start" | "stop"; resetBaseline?: boolean }> = [];
-  const encryptedTexts: string[] = [];
+  const encryptInputs: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0][] = [];
+  const typedPayloads: ClipboardPayloadV1[] = [];
   const clipboardAdapter: ClipboardAdapter = {
-    readText: async () => "manual text",
+    readText: async () => manualText,
     writeText: async () => undefined,
     startWatching: async (options) => {
       watchCalls.push({ type: "start", resetBaseline: options?.resetBaseline });
@@ -3114,22 +4945,28 @@ test("automatic observations use the same publish path as manual Send", async ()
   const setup = await startReady({
     localTrustState: "verified",
     clipboardAdapter,
+    now: () => now,
     encrypt: async (input) => {
-      encryptedTexts.push(input.plaintext as string);
+      encryptInputs.push(input);
       return {
-        itemId: `${encryptedTexts.length}`,
+        itemId: `${encryptInputs.length}`,
         sourceDeviceId: input.identity.deviceId,
         sourceKeyVersion: 1,
         sourceSignature: "signature",
         protocolVersion: 1 as const,
-        contentType: "text/plain",
+        contentType: input.contentType,
         ciphertext: "ciphertext",
         nonce: "nonce",
         recipients: [],
-        expiresAt: new Date().toISOString(),
+        expiresAt: input.expiresAt,
       };
     },
   });
+  const publishPayload = setup.runtime.publishClipboardPayload.bind(setup.runtime);
+  setup.runtime.publishClipboardPayload = async (payload) => {
+    typedPayloads.push(payload);
+    return publishPayload(payload);
+  };
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(setup.runtime.getStatus().clipboardWatch, "watching");
   assert.deepEqual(watchCalls, [
@@ -3141,9 +4978,192 @@ test("automatic observations use the same publish path as manual Send", async ()
     runtimeMessage({ type: "runtime:send-current-clipboard" }),
   );
   assert.equal(manual.ok, true);
-  await setup.runtime.handleClipboardObservation(clipboardObservation("automatic text"));
-  assert.deepEqual(encryptedTexts, ["manual text", "automatic text"]);
+  await setup.runtime.handleClipboardObservation(clipboardObservation(automaticText));
+  assert.deepEqual(typedPayloads, [manualText, automaticText].map((text) => ({
+    version: 1,
+    representations: [{ mime: "text/plain", encoding: "utf-8", data: text }],
+  })));
+  assert.deepEqual(encryptInputs.map((input) => input.plaintext), [manualText, automaticText]);
+  assert.deepEqual(encryptInputs.map((input) => input.contentType), ["text/plain", "text/plain"]);
+  assert.deepEqual(
+    encryptInputs.map((input) => new Date(input.expiresAt).getTime()),
+    [now.getTime() + 60_000, now.getTime() + 60_000],
+  );
+  const publishedEnvelopes = setup.socket.emissions
+    .filter((emission) => emission.event === "clipboard:publish")
+    .map((emission) => emission.args[0] as { contentType: string });
+  assert.deepEqual(publishedEnvelopes.map((envelope) => envelope.contentType), ["text/plain", "text/plain"]);
   assert.equal(typeof setup.runtime.getStatus().lastAutoSyncAt, "string");
+});
+
+test("rich automatic and manual observations stay legacy on the network", async () => {
+  const rich = richClipboardBundle("  exact plain fallback\r\n");
+  const encryptInputs: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0][] = [];
+  const applied: ClipboardPayloadV1[] = [];
+  const setup = await startReady({
+    clipboardAdapter: {
+      readText: async () => rich.plainText,
+      readPayload: async () => rich.payload,
+      writeText: async () => undefined,
+      writePayload: async (payload) => { applied.push(payload); },
+    },
+    encrypt: async (input) => {
+      encryptInputs.push(input);
+      return {
+        ...inboundEnvelope(`rich-${encryptInputs.length}`),
+        contentType: input.contentType,
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+
+  const manual = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:send-current-clipboard" }),
+  );
+  assert.equal(manual.ok, true);
+  await setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: rich.payload,
+  });
+  assert.deepEqual(encryptInputs.map((input) => input.plaintext), [
+    rich.plainText,
+    rich.plainText,
+  ]);
+  assert.deepEqual(encryptInputs.map((input) => input.contentType), [
+    "text/plain",
+    "text/plain",
+  ]);
+  assert.equal(
+    setup.socket.emissions
+      .filter((emission) => emission.event === "clipboard:publish")
+      .every((emission) =>
+        (emission.args[0] as { contentType: string }).contentType ===
+        "text/plain",
+      ),
+    true,
+  );
+
+  const inbound = {
+    ...inboundEnvelope("rich-inbound"),
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+  };
+  const receive = await startReady({
+    clipboardAdapter: {
+      readText: async () => "unused",
+      writeText: async () => undefined,
+      writePayload: async (payload) => { applied.push(payload); },
+    },
+    decrypt: async () => ({ plaintextBytes: rich.bytes }),
+  });
+  await receive.runtime.receiveClipboardItem(inbound);
+  assert.deepEqual(applied[applied.length - 1], rich.payload);
+});
+
+test("rich publish encrypts one exact bundle for the full rich-capable recipient set", async () => {
+  const rich = richClipboardBundle("rich network fallback");
+  const richCurrent = {
+    ...registeredDevice,
+    capabilities: ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
+  };
+  const staleCurrent = { ...richCurrent, capabilities: ["clipboard"] };
+  const richRecipient = {
+    ...pendingDevice,
+    trustState: "trusted",
+    capabilities: ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
+  };
+  const pairing = makePairingTrustStore(identity, staleCurrent);
+  putLocalRecord(pairing.records, richRecipient, "verified", {
+    capabilities: ["clipboard"],
+  });
+  const encryptInputs: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0][] = [];
+  const setup = await startReady({
+    registeredDevice: richCurrent,
+    trustStore: pairing.trustStore,
+    listDevices: async () => response([richCurrent, richRecipient]),
+    encrypt: async (input) => {
+      encryptInputs.push(input);
+      return {
+        ...inboundEnvelope("rich-network-publish"),
+        contentType: input.contentType,
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+
+  assert.deepEqual(
+    pairing.records.get(`${user.id}:${identity.deviceId}`)?.capabilities,
+    ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
+  );
+  assert.deepEqual(
+    pairing.records.get(`${user.id}:${richRecipient.deviceId}`)?.capabilities,
+    ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
+  );
+
+  await setup.runtime.publishClipboardPayload(rich.payload);
+
+  assert.equal(encryptInputs.length, 1);
+  assert.equal(encryptInputs[0]?.contentType, CLIPBOARD_BUNDLE_V1_MIME);
+  assert.ok(encryptInputs[0]?.plaintext instanceof Uint8Array);
+  assert.deepEqual(encryptInputs[0]?.plaintext, rich.bytes);
+  assert.deepEqual(
+    decodeClipboardBundleV1(encryptInputs[0]!.plaintext as Uint8Array),
+    rich.payload,
+  );
+  assert.deepEqual(
+    encryptInputs[0]?.recipients.map((recipient) => recipient.deviceId).sort(),
+    [identity.deviceId, richRecipient.deviceId].sort(),
+  );
+  assert.equal(
+    setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
+    1,
+  );
+});
+
+test("mixed recipients receive capability-specific encrypted projections", async () => {
+  const rich = richClipboardBundle("Copyyt");
+  const richCurrent = {
+    ...registeredDevice,
+    capabilities: ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"],
+  };
+  const legacyRecipient = {
+    ...pendingDevice,
+    trustState: "trusted",
+    capabilities: ["clipboard"],
+  };
+  const pairing = makePairingTrustStore(identity, richCurrent);
+  putLocalRecord(pairing.records, legacyRecipient, "verified", {
+    capabilities: ["clipboard"],
+  });
+  const encryptInputs: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0][] = [];
+  const setup = await startReady({
+    registeredDevice: richCurrent,
+    trustStore: pairing.trustStore,
+    listDevices: async () => response([richCurrent, legacyRecipient]),
+    encrypt: async (input) => {
+      encryptInputs.push(input);
+      return {
+        ...inboundEnvelope("mixed-legacy-publish"),
+        contentType: input.contentType,
+        expiresAt: input.expiresAt,
+      };
+    },
+  });
+
+  await setup.runtime.publishClipboardPayload(rich.payload);
+
+  assert.equal(encryptInputs.length, 2);
+  const bundleInput = encryptInputs.find((input) => input.contentType === CLIPBOARD_BUNDLE_V1_MIME)!;
+  const plainInput = encryptInputs.find((input) => input.contentType === "text/plain")!;
+  assert.deepEqual(decodeClipboardBundleV1(bundleInput.plaintext as Uint8Array), rich.payload);
+  assert.equal(plainInput.plaintext, "Copyyt");
+  assert.deepEqual(bundleInput.recipients.map((recipient) => recipient.deviceId), [identity.deviceId]);
+  assert.deepEqual(plainInput.recipients.map((recipient) => recipient.deviceId), [legacyRecipient.deviceId]);
+  assert.equal(
+    setup.socket.emissions.filter((emission) => emission.event === "clipboard:publish").length,
+    2,
+  );
 });
 
 test("an offscreen clipboard change routes to automatic publish without popup involvement", async () => {
@@ -3590,12 +5610,12 @@ test("repeated recovery calls use one socket and one listener set per live socke
   await Promise.all([firstRecovery, secondRecovery]);
 
   assert.equal(sockets.length, 2);
-  assert.equal(sockets[1].events.size, 7);
+  assert.equal(sockets[1].events.size, 8);
   await setup.runtime.reconcileConnectivity("third", {
     forceSocketRecycle: true,
   });
   assert.equal(sockets.length, 3);
-  assert.equal(sockets[2].events.size, 7);
+  assert.equal(sockets[2].events.size, 8);
 });
 
 test("a concurrent forced socket recycle is escalated into one follow-up", async () => {
@@ -3641,7 +5661,7 @@ test("a concurrent forced socket recycle is escalated into one follow-up", async
 
   assert.equal(sockets.length, 2);
   assert.equal(sockets[0].events.size, 0);
-  assert.equal(sockets[1].events.size, 7);
+  assert.equal(sockets[1].events.size, 8);
 
   sockets[1].trigger("auth:challenge", {
     socketId: "replacement-socket",
@@ -3714,7 +5734,7 @@ test("a concurrent forced token refresh is escalated into one follow-up", async 
   assert.equal(sockets.length, 3);
   assert.equal(sockets[0].events.size, 0);
   assert.equal(sockets[1].events.size, 0);
-  assert.equal(sockets[2].events.size, 7);
+  assert.equal(sockets[2].events.size, 8);
 
   sockets[2].trigger("auth:challenge", {
     socketId: "refreshed-socket",
@@ -3753,7 +5773,7 @@ test("a connected but not-ready socket is replaced exactly once", async () => {
   assert.equal(sockets[0].connected, false);
   assert.equal(sockets[0].events.size, 0);
   assert.equal(sockets[1].connected, true);
-  assert.equal(sockets[1].events.size, 7);
+  assert.equal(sockets[1].events.size, 8);
 
   sockets[1].trigger("auth:challenge", {
     socketId: "replacement-socket",
@@ -4228,6 +6248,44 @@ test("automatic auth recovery keeps only the latest rapid observation", async ()
   assert.equal(fixture.getRefreshCalls(), 1);
 });
 
+test("image-only observation cancels an automatic auth-recovery retry", async () => {
+  const fixture = automaticAuthRecoveryFixture(true, false);
+  await startAutomaticAuthRecoveryFixture(fixture);
+  fixture.rejectNextMembership();
+
+  const observation = fixture.setup.runtime.handleClipboardObservation(
+    clipboardObservation("A"),
+  );
+  await fixture.refreshStarted;
+
+  const imageOnly = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 3]),
+  );
+  await fixture.setup.runtime.handleClipboardObservation({
+    source: "offscreen",
+    target: "service-worker",
+    type: "CLIPBOARD_CHANGED",
+    payload: imageOnly,
+  });
+  assert.deepEqual(fixture.encryptedTexts, []);
+
+  fixture.releaseRefresh();
+  await readyReplacementSocket(fixture);
+  await observation;
+
+  assert.deepEqual(fixture.encryptedTexts, []);
+  assert.equal(
+    fixture.sockets.every(
+      (socket) =>
+        socket.emissions.filter(
+          (emission) => emission.event === "clipboard:publish",
+        ).length === 0,
+    ),
+    true,
+  );
+  assert.equal(fixture.getRefreshCalls(), 1);
+});
+
 test("automatic publish does not refresh for HTTP 500 or network failure", async () => {
   for (const failure of [500, "network"] as const) {
     let activeFailure: number | "network" | null = null;
@@ -4337,4 +6395,511 @@ test("Send Off during automatic auth recovery prevents publish and replay after 
       { type: "start", resetBaseline: true },
     ],
   );
+});
+
+test("exporting the recovery credential does not seal it until the user confirms", async () => {
+  let exports = 0;
+  const sealed: DeviceIdentity[] = [];
+  const sealedIdentity = { ...identity, recoveryExportedAt: "2026-09-23T12:00:00.000Z" } as DeviceIdentity;
+  const { runtime } = makeRuntime({
+    localTrustState: "root",
+    registeredDevice: { ...registeredDevice, recoveryKeyActive: true },
+    exportRecoveryKey: async () => {
+      exports += 1;
+      return "UEtDUzg=";
+    },
+    sealRecoveryKey: async (target) => {
+      sealed.push(target);
+      return sealedIdentity;
+    },
+  });
+  await runtime.start();
+
+  // A popup that closes before the user copies the text can simply export again.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const exported = await runtime.handleMessage(runtimeMessage({ type: "runtime:export-recovery-credential" }));
+    assert.equal(exported.ok, true);
+    assert.deepEqual(exported.data, {
+      format: "copyyt-recovery-v1",
+      rootDeviceId: identity.deviceId,
+      privateKeyPkcs8Base64: "UEtDUzg=",
+    });
+  }
+  assert.equal(exports, 2);
+  assert.equal(sealed.length, 0);
+
+  const confirmed = await runtime.handleMessage(runtimeMessage({ type: "runtime:confirm-recovery-credential-saved" }));
+  assert.equal(confirmed.ok, true);
+  assert.equal(sealed.length, 1);
+  assert.equal(sealed[0]?.deviceId, identity.deviceId);
+});
+
+test("only an unsealed root device can export or seal the recovery credential", async () => {
+  const neverCalled = async (): Promise<never> => {
+    throw new Error("must not be called");
+  };
+  const nonRoot = makeRuntime({
+    localTrustState: "verified",
+    exportRecoveryKey: neverCalled,
+    sealRecoveryKey: neverCalled,
+  });
+  await nonRoot.runtime.start();
+  for (const type of ["runtime:export-recovery-credential", "runtime:confirm-recovery-credential-saved"] as const) {
+    const result = await nonRoot.runtime.handleMessage(runtimeMessage({ type }));
+    assert.equal(result.ok, false);
+    assert.equal(result.error?.code, "DEVICE_NOT_LOCALLY_TRUSTED");
+  }
+
+  const sealedIdentity = { ...identity, recoveryExportedAt: "2026-09-23T12:00:00.000Z" } as DeviceIdentity;
+  const alreadySealed = makeRuntime({
+    identity: sealedIdentity,
+    registeredDevice: { ...registeredDevice, recoveryKeyActive: true },
+    localTrustState: "root",
+    exportRecoveryKey: neverCalled,
+    sealRecoveryKey: neverCalled,
+  });
+  await alreadySealed.runtime.start();
+  const exported = await alreadySealed.runtime.handleMessage(runtimeMessage({ type: "runtime:export-recovery-credential" }));
+  assert.equal(exported.ok, false);
+});
+
+test("a root device cannot export a recovery key the server has not confirmed", async () => {
+  const { runtime } = makeRuntime({
+    localTrustState: "root",
+    registeredDevice: { ...registeredDevice, recoveryKeyActive: false },
+    exportRecoveryKey: async () => {
+      throw new Error("must not be called");
+    },
+  });
+  await runtime.start();
+
+  const status = runtime.getStatus();
+  assert.equal(status.device.recoveryAvailable, false);
+  assert.equal(status.device.recoveryRotationPending, true);
+  const exported = await runtime.handleMessage(runtimeMessage({ type: "runtime:export-recovery-credential" }));
+  assert.equal(exported.ok, false);
+});
+
+test("a recovery whose rotation failed is retried by re-registration and clears once confirmed", async () => {
+  let registrations = 0;
+  let serverConfirms = false;
+  const recoverableIdentity = {
+    ...identity,
+    recoveryPublicKeyBase64: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+  } as DeviceIdentity;
+  const { runtime } = makeRuntime({
+    identity: recoverableIdentity,
+    localTrustState: "root",
+    registerDevice: async () => {
+      registrations += 1;
+      return {
+        identity: recoverableIdentity,
+        device: { ...registeredDevice, recoveryKeyActive: serverConfirms },
+      };
+    },
+    recoverDevice: async () => ({
+      identity: recoverableIdentity,
+      device: registeredDevice,
+      recoveryKeyRotated: false,
+    }),
+  });
+  await runtime.start();
+  const registrationsBeforeRecovery = registrations;
+
+  // The retry registration right after recovery still fails to rotate.
+  await runtime.handleMessage(runtimeMessage({
+    type: "runtime:recover-device",
+    credential: "copyyt-recovery-v1\nrootDeviceId=x\nprivateKeyPkcs8Base64=y",
+  }));
+  assert.ok(registrations > registrationsBeforeRecovery, "recovery must re-register to retry rotation");
+  assert.equal(runtime.getStatus().device.recoveryRotationPending, true);
+  assert.equal(runtime.getStatus().device.recoveryAvailable, false);
+
+  // A later registration (e.g. the next reconnect) succeeds in rotating the key.
+  serverConfirms = true;
+  await runtime.reconcileConnectivity("network-restored");
+  assert.equal(runtime.getStatus().device.recoveryRotationPending, undefined);
+  assert.equal(runtime.getStatus().device.recoveryAvailable, true);
+});
+
+test("recovering a device reports a pending key rotation and marks onboarding complete", async () => {
+  const recoveryCalls: string[] = [];
+  const { runtime } = makeRuntime({
+    localTrustState: "root",
+    recoverDevice: async (_api, options) => {
+      recoveryCalls.push(String(options.credential));
+      return { identity, device: registeredDevice, recoveryKeyRotated: false };
+    },
+  });
+  await runtime.start();
+
+  const result = await runtime.handleMessage(runtimeMessage({
+    type: "runtime:recover-device",
+    credential: "copyyt-recovery-v1\nrootDeviceId=x\nprivateKeyPkcs8Base64=y",
+  }));
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(recoveryCalls, ["copyyt-recovery-v1\nrootDeviceId=x\nprivateKeyPkcs8Base64=y"]);
+  const status = runtime.getStatus();
+  assert.equal(status.device.recoveryRotationPending, true);
+  assert.equal(status.onboarding.state, "complete");
+});
+
+test("a failed recovery surfaces an error and leaves the device untrusted", async () => {
+  const { runtime } = makeRuntime({
+    recoverDevice: async () => {
+      throw new Error("invalid_recovery_signature");
+    },
+  });
+  await runtime.start();
+
+  const result = await runtime.handleMessage(runtimeMessage({
+    type: "runtime:recover-device",
+    credential: "copyyt-recovery-v1\nrootDeviceId=x\nprivateKeyPkcs8Base64=y",
+  }));
+
+  assert.equal(result.ok, false);
+  assert.notEqual(runtime.getStatus().onboarding.state, "complete");
+});
+
+const phoneDevice: RegisteredDeviceResponse = {
+  ...registeredDevice,
+  deviceId: "00000000-0000-4000-8000-0000000000a1",
+  name: "Android · Pixel",
+  platform: "android",
+  encryptionPublicKey: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+  signingPublicKey: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+  capabilities: ["clipboard"],
+};
+
+/** Trust store where the phone becomes verified only once a refresh sees its approval. */
+function lateApprovalTrustStore(state: { approvedOnServer: boolean; verified: boolean }): ClientTrustStore {
+  const self: LocalDeviceRecord = {
+    userId: user.id,
+    deviceId: identity.deviceId,
+    keyVersion: 1,
+    encryptionPublicKey: registeredDevice.encryptionPublicKey,
+    signingPublicKey: registeredDevice.signingPublicKey,
+    trustState: "verified",
+  };
+  const phone = (): LocalDeviceRecord => ({
+    userId: user.id,
+    deviceId: phoneDevice.deviceId,
+    keyVersion: 1,
+    encryptionPublicKey: phoneDevice.encryptionPublicKey,
+    signingPublicKey: phoneDevice.signingPublicKey,
+    trustState: state.verified ? "verified" : "unverified",
+  });
+  return {
+    getDevice: async (_userId, deviceId) =>
+      deviceId === phoneDevice.deviceId ? phone() : self,
+    upsertServerReportedDevice: async (device) => {
+      if (device.deviceId === phoneDevice.deviceId && state.approvedOnServer) state.verified = true;
+      return device.deviceId === phoneDevice.deviceId ? phone() : self;
+    },
+    bootstrapInitialTrustAnchor: async () => { throw new Error("not used"); },
+    recoverTrustAnchor: async () => { throw new Error("not used"); },
+    pinPairedApprover: async () => { throw new Error("not used"); },
+    pinInitialDevice: async () => { throw new Error("not used"); },
+    applyApproval: async () => { throw new Error("not used"); },
+    revokeDevice: async () => undefined,
+    listEncryptionRecipients: async () => [],
+  } satisfies ClientTrustStore;
+}
+
+test("an item from a device approved after the last trust refresh is accepted after one refresh", async () => {
+  const state = { approvedOnServer: false, verified: false };
+  const written: string[] = [];
+  let snapshots = 0;
+  const setup = await startReady({
+    trustStore: lateApprovalTrustStore(state),
+    listDevices: async () => {
+      snapshots += 1;
+      return response([registeredDevice, ...(state.approvedOnServer ? [phoneDevice] : [])]);
+    },
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text: string) => { written.push(text); },
+    },
+  });
+  // The root approves the phone while this device is already running.
+  state.approvedOnServer = true;
+  const before = snapshots;
+
+  await setup.runtime.receiveClipboardItem({
+    ...inboundEnvelope("from-late-approved-phone"),
+    sourceDeviceId: phoneDevice.deviceId,
+  });
+
+  assert.ok(snapshots > before, "an unknown source must trigger a trust refresh");
+  assert.deepEqual(written, ["decrypted plaintext"]);
+});
+
+test("an unknown source that stays unverified is rejected and refreshes are rate limited", async () => {
+  const state = { approvedOnServer: false, verified: false };
+  let snapshots = 0;
+  const written: string[] = [];
+  const setup = await startReady({
+    trustStore: lateApprovalTrustStore(state),
+    listDevices: async () => {
+      snapshots += 1;
+      return response([registeredDevice]);
+    },
+    clipboardAdapter: {
+      readText: async () => "",
+      writeText: async (text: string) => { written.push(text); },
+    },
+  });
+  const before = snapshots;
+  for (const itemId of ["unknown-1", "unknown-2", "unknown-3"]) {
+    await setup.runtime
+      .receiveClipboardItem({ ...inboundEnvelope(itemId), sourceDeviceId: phoneDevice.deviceId })
+      .catch(() => undefined);
+  }
+  assert.deepEqual(written, []);
+  assert.equal(snapshots - before, 1, "relay-supplied source IDs must not force a refresh per item");
+});
+
+test("a trusted device removes another device with a signed revoke and revokes it locally", async () => {
+  const approver = await makeDirectTestIdentity(identity.deviceId);
+  const self: RegisteredDeviceResponse = {
+    ...registeredDevice,
+    encryptionPublicKey: approver.encryptionPublicKeyBase64,
+    signingPublicKey: approver.signingPublicKeyBase64,
+  };
+  const revokeCalls: Array<{ deviceId: string; request: DeviceManagementRequest }> = [];
+  const setup = await startReady({
+    identity: approver,
+    registeredDevice: self,
+    listDevices: async () => response([self, phoneDevice]),
+    apiFactory: (_token, api) => ({
+      ...api,
+      devices: {
+        ...api.devices,
+        revokeDevice: async (deviceId: string, request: DeviceManagementRequest) => {
+          revokeCalls.push({ deviceId, request });
+          return response({ ...phoneDevice, trustState: "revoked" });
+        },
+      },
+    }),
+  });
+  const locallyRevoked: string[] = [];
+  setup.trustStore.revokeDevice = async (_userId, deviceId) => {
+    locallyRevoked.push(deviceId);
+  };
+
+  const result = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:revoke-device", deviceId: phoneDevice.deviceId }),
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(revokeCalls.length, 1);
+  const call = revokeCalls[0]!;
+  assert.equal(call.deviceId, phoneDevice.deviceId);
+  assert.equal(call.request.requestingDeviceId, approver.deviceId);
+  const signed = buildDeviceManagementMessage({
+    action: "revoke",
+    userId: user.id,
+    requestingDeviceId: approver.deviceId,
+    requestingKeyVersion: 1,
+    targetDeviceId: phoneDevice.deviceId,
+    targetKeyVersion: phoneDevice.keyVersion,
+    timestamp: call.request.timestamp,
+    nonce: call.request.nonce,
+  });
+  const publicKey = await crypto.subtle.importKey(
+    "raw", approver.signingPublicKey, "Ed25519", true, ["verify"],
+  );
+  assert.equal(
+    await crypto.subtle.verify("Ed25519", publicKey, base64ToBytes(call.request.signature), signed),
+    true,
+  );
+  assert.deepEqual(locallyRevoked, [phoneDevice.deviceId]);
+
+  const selfRevoke = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:revoke-device", deviceId: approver.deviceId }),
+  );
+  assert.equal(selfRevoke.ok, false);
+  assert.equal(revokeCalls.length, 1);
+});
+
+test("a removed device is flagged and can be set up again as a new pending device", async () => {
+  const state = { removed: true, cleared: false, trustCleared: false };
+  const freshIdentity = {
+    ...identity,
+    deviceId: "00000000-0000-4000-8000-0000000000b2",
+    keyVersion: 1,
+  } as DeviceIdentity;
+  const freshPending: RegisteredDeviceResponse = {
+    ...pendingDevice,
+    deviceId: freshIdentity.deviceId,
+    encryptionPublicKey: registeredDevice.encryptionPublicKey,
+    signingPublicKey: registeredDevice.signingPublicKey,
+  };
+  const setup = makeRuntime({
+    localTrustState: "verified",
+    identityLoader: async () => (state.cleared ? null : identity),
+    identityCreator: async () => freshIdentity,
+    registerDevice: async () => {
+      if (!state.cleared) throw new Error("device_revoked");
+      return { identity: freshIdentity, device: freshPending };
+    },
+    clearIdentity: async () => { state.cleared = true; },
+    // The removed device no longer appears on the server at all.
+    listDevices: async () => response([{ ...registeredDevice, deviceId: "00000000-0000-4000-8000-0000000000c3" }]),
+    listPendingDevices: async () => response(state.cleared ? [freshPending] : []),
+  });
+  setup.trustStore.clearAccount = async () => { state.trustCleared = true; };
+  await setup.runtime.start();
+  assert.equal(setup.runtime.getStatus().device.removed, true);
+
+  const reset = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:reset-device" }));
+
+  assert.equal(reset.ok, true);
+  assert.equal(state.cleared, true);
+  assert.equal(state.trustCleared, true);
+  const status = setup.runtime.getStatus();
+  assert.equal(status.device.removed, undefined);
+  assert.equal(status.device.deviceId, freshIdentity.deviceId);
+});
+
+test("an active device cannot be reset", async () => {
+  let cleared = false;
+  const setup = await startReady({ clearIdentity: async () => { cleared = true; } });
+  const reset = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:reset-device" }));
+  assert.equal(reset.ok, false);
+  assert.equal(cleared, false);
+});
+
+function localRootStore(trustOrigin: LocalDeviceRecord["trustOrigin"]): ClientTrustStore {
+  const self: LocalDeviceRecord = {
+    userId: user.id,
+    deviceId: identity.deviceId,
+    keyVersion: 1,
+    encryptionPublicKey: registeredDevice.encryptionPublicKey,
+    signingPublicKey: registeredDevice.signingPublicKey,
+    trustState: "root",
+    trustOrigin,
+  };
+  return {
+    getDevice: async (_userId, deviceId) =>
+      deviceId === identity.deviceId ? self : null,
+    upsertServerReportedDevice: async (device) => ({ ...device, trustState: "unverified" }) as LocalDeviceRecord,
+    bootstrapInitialTrustAnchor: async () => { throw new Error("not used"); },
+    recoverTrustAnchor: async () => { throw new Error("not used"); },
+    pinPairedApprover: async () => { throw new Error("not used"); },
+    pinInitialDevice: async () => { throw new Error("not used"); },
+    applyApproval: async () => { throw new Error("not used"); },
+    revokeDevice: async () => undefined,
+    listEncryptionRecipients: async () => [],
+  } satisfies ClientTrustStore;
+}
+
+test("a root restored with the recovery credential can approve new devices", async () => {
+  const setup = makeRuntime({
+    trustStore: localRootStore("recovery"),
+    listDevices: async () => response([registeredDevice]),
+    listPendingDevices: async () => response([pendingDevice]),
+  });
+  await setup.runtime.start();
+  const onboarding = setup.runtime.getStatus().onboarding;
+  assert.equal(onboarding.state, "pairing-ready");
+  assert.equal(onboarding.pairing?.role, "approver");
+  assert.equal(onboarding.pairing?.pendingDeviceId, pendingDevice.deviceId);
+});
+
+test("a verified device is told the root is missing so it can take over", async () => {
+  const approvedSelf: RegisteredDeviceResponse = {
+    ...registeredDevice,
+    approvedByDeviceId: "00000000-0000-4000-8000-0000000000d4",
+    approvalSignature: "c2lnbmF0dXJl",
+  };
+  const setup = makeRuntime({
+    localTrustState: "verified",
+    registeredDevice: approvedSelf,
+    listDevices: async () => response([approvedSelf]),
+  });
+  await setup.runtime.start();
+  const onboarding = setup.runtime.getStatus().onboarding;
+  assert.equal(onboarding.rootMissing, true);
+  assert.equal(setup.runtime.getStatus().device.trustState, "verified");
+});
+
+test("a backend rejection reaches the popup with the server's reason", async () => {
+  const approver = await makeDirectTestIdentity(identity.deviceId);
+  const self: RegisteredDeviceResponse = {
+    ...registeredDevice,
+    encryptionPublicKey: approver.encryptionPublicKeyBase64,
+    signingPublicKey: approver.signingPublicKeyBase64,
+  };
+  const setup = await startReady({
+    identity: approver,
+    registeredDevice: self,
+    listDevices: async () => response([self, phoneDevice]),
+    apiFactory: (_token, api) => ({
+      ...api,
+      devices: {
+        ...api.devices,
+        revokeDevice: async () => {
+          throw Object.assign(new Error("Request failed with status code 409"), {
+            isAxiosError: true,
+            response: { status: 409, data: { code: "x", description: "Configure an offline recovery credential first" } },
+          });
+        },
+      },
+    }),
+  });
+  const result = await setup.runtime.handleMessage(
+    runtimeMessage({ type: "runtime:revoke-device", deviceId: phoneDevice.deviceId }),
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.error?.message, "Configure an offline recovery credential first");
+});
+
+test("an account reset confirms the emailed code, then starts over with a fresh identity", async () => {
+  const calls: string[] = [];
+  let cleared = false;
+  const freshIdentity = { ...identity, deviceId: "00000000-0000-4000-8000-0000000000e5" } as DeviceIdentity;
+  const setup = await startReady({
+    identityLoader: async () => (cleared ? null : identity),
+    identityCreator: async () => freshIdentity,
+    registerDevice: async () => ({
+      identity: cleared ? freshIdentity : identity,
+      device: cleared ? { ...registeredDevice, deviceId: freshIdentity.deviceId } : registeredDevice,
+    }),
+    clearIdentity: async () => { cleared = true; calls.push("clear-identity"); },
+    apiFactory: (_token, api) => ({
+      ...api,
+      auth: {
+        ...api.auth,
+        requestAccountResetCode: async () => { calls.push("request-code"); return response({ message: "Email Sent" }); },
+        resetAccount: async (code: number) => { calls.push(`reset:${code}`); return response({ removedDevices: 3 }); },
+      },
+    }),
+  });
+  setup.trustStore.clearAccount = async () => { calls.push("clear-trust"); };
+
+  const requested = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:request-account-reset-code" }));
+  assert.equal(requested.ok, true);
+  const reset = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:reset-account", code: 123456 }));
+
+  assert.equal(reset.ok, true);
+  assert.deepEqual(calls, ["request-code", "reset:123456", "clear-trust", "clear-identity"]);
+  assert.equal(setup.runtime.getStatus().device.deviceId, freshIdentity.deviceId);
+});
+
+test("an account reset with a malformed code never reaches the server or local state", async () => {
+  let serverCalls = 0;
+  let cleared = false;
+  const setup = await startReady({
+    clearIdentity: async () => { cleared = true; },
+    apiFactory: (_token, api) => ({
+      ...api,
+      auth: { ...api.auth, resetAccount: async () => { serverCalls += 1; return response({}); } },
+    }),
+  });
+  const reset = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:reset-account", code: 12 }));
+  assert.equal(reset.ok, false);
+  assert.equal(serverCalls, 0);
+  assert.equal(cleared, false);
 });

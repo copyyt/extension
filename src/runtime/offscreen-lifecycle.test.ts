@@ -5,6 +5,7 @@ import { ensureOffscreenDocument } from "./offscreen-lifecycle.ts";
 test("offscreen document creation is concurrency-safe", async () => {
   let exists = false;
   let creates = 0;
+  let reasons: unknown[] = [];
   const api = {
     runtime: {
       getURL: (path: string) => `chrome-extension://test/${path}`,
@@ -13,8 +14,9 @@ test("offscreen document creation is concurrency-safe", async () => {
     },
     offscreen: {
       hasDocument: async () => exists,
-      createDocument: async () => {
+      createDocument: async (details: { reasons: unknown[] }) => {
         creates += 1;
+        reasons = details.reasons;
         await Promise.resolve();
         exists = true;
       },
@@ -23,6 +25,7 @@ test("offscreen document creation is concurrency-safe", async () => {
 
   await Promise.all([ensureOffscreenDocument(api), ensureOffscreenDocument(api)]);
   assert.equal(creates, 1);
+  assert.deepEqual(reasons, ["CLIPBOARD", "WEB_RTC"]);
   await ensureOffscreenDocument(api);
   assert.equal(creates, 1);
 });

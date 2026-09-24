@@ -1,9 +1,11 @@
 import {
   isOffscreenClipboardObservation,
+  isOffscreenDirectTransportEvent,
   isRuntimeRequest,
   POPUP_SOURCE,
   RUNTIME_SOURCE,
   type OffscreenClipboardObservation,
+  type OffscreenDirectTransportEvent,
   type RuntimeRequest,
   type RuntimeResponse,
 } from "./messages.ts";
@@ -20,6 +22,9 @@ export interface RuntimeMessageListenerDependencies {
     handleMessage(message: unknown): Promise<RuntimeResponse>;
     handleClipboardObservation?: (
       message: OffscreenClipboardObservation,
+    ) => Promise<void> | void;
+    handleDirectTransportEvent?: (
+      message: OffscreenDirectTransportEvent,
     ) => Promise<void> | void;
   };
   runtimeReady: Promise<void>;
@@ -92,6 +97,23 @@ export function createRuntimeMessageListener(
   sendResponse: (response?: RuntimeResponse) => void,
 ) => boolean {
   return (message, sender, sendResponse) => {
+    if (isOffscreenDirectTransportEvent(message)) {
+      if (
+        !isPackagedOffscreenSender(sender, dependencies) ||
+        !dependencies.runtime.handleDirectTransportEvent
+      ) {
+        return false;
+      }
+      void dependencies.runtimeReady
+        .then(() => {
+          if (dependencies.getStartupError() !== null) return;
+          return dependencies.runtime.handleDirectTransportEvent!(message);
+        })
+        .catch(() => undefined)
+        .then(() => sendResponse());
+      return true;
+    }
+
     if (isOffscreenClipboardObservation(message)) {
       if (
         !isPackagedOffscreenSender(sender, dependencies) ||

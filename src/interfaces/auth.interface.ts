@@ -13,7 +13,8 @@ export interface IVerifyEmail {
 export interface SignInResponse {
   message: string;
   accessToken: string;
-  refreshToken: string;
+  /** Web cookie sessions may omit the token; extension sessions must validate it before storage. */
+  refreshToken?: string;
   user: IUser;
 }
 

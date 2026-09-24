@@ -1,6 +1,6 @@
 const CHROME_WEB_STORE_URL =
   "https://chromewebstore.google.com/detail/copyyt/ophadgignfjigkbdcmicnklokjeknnbd";
-const PRIVACY_POLICY_URL = "https://copyyt.psami.com/privacy-policy";
+const PRIVACY_POLICY_URL = "https://copyyt.com/privacy-policy";
 
 function PausedWebApp() {
   return (
@@ -16,7 +16,7 @@ function PausedWebApp() {
           Copyyt Web is currently paused
         </h1>
         <p className="font-work mt-5 text-base leading-7 text-[#4B5563]">
-          Copyyt 2.0 is focused on the Chrome extension for secure automatic
+          Copyyt 3.0 is focused on the Chrome extension for secure automatic
           cross-device clipboard sync.
         </p>
         <div className="mt-8 flex flex-col items-center gap-3">

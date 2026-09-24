@@ -51,9 +51,7 @@ const useGoogleAuthWeb = () => {
 
   const revokeToken = async (token: string) => {
     if (!token) return;
-    window.google.accounts.oauth2.revoke(token, () =>
-      console.log("Access token revoked"),
-    );
+    window.google.accounts.oauth2.revoke(token, () => undefined);
   };
 
   return { getToken, revokeToken };

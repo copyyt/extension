@@ -1,19 +1,58 @@
 import { isAxiosError, type AxiosResponse } from "axios";
 import { jwtDecode } from "jwt-decode";
 import {
+  clearDeviceIdentity,
   computePairingFingerprint,
-  decryptClipboardItem,
+  decryptClipboardItemBytes,
+  decryptDirectClipboardTransfer,
   encryptClipboardItem,
   getDeviceIdentity,
   getOrCreateDeviceIdentity,
+  exportRecoveryPrivateKey,
+  sealRecoveryCredential,
   signDeviceApproval,
+  signDeviceManagement,
   signSocketChallenge,
   type ClipboardItemEnvelope,
   type DeviceIdentity,
+  type DirectClipboardStartV1,
+  prepareDirectClipboardTransfer,
+  verifyDirectClipboardManifestSignature,
 } from "../crypto/index.ts";
+import { bytesToBase64 } from "../crypto/bytes.ts";
+import {
+  CLIPBOARD_BUNDLE_V1_MIME,
+  clipboardPayloadFromPlainText,
+  decodeClipboardBundleV1,
+  decodeClipboardPlainText,
+  findPlainTextRepresentation,
+  getPngBytes,
+  getPngRepresentation,
+  projectClipboardPayloadToText,
+  validateClipboardPayloadV1,
+  type ClipboardBundleV1Bytes,
+  type ClipboardPayloadV1,
+} from "../clipboard/payload.ts";
+import {
+  CLIPBOARD_RECEIVE_CAPABILITIES,
+  CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY,
+  CLIPBOARD_IMAGE_PNG_ASSISTED_WRITE_V1_CAPABILITY,
+  validClipboardCapabilities,
+} from "../clipboard/capabilities.ts";
+import {
+  ClipboardWirePayloadTooLargeError,
+  selectClipboardDeliveryRoutes,
+  type ClipboardWireRecipient,
+} from "../clipboard/wire-payload.ts";
+import {
+  isDirectClipboardStartV1,
+  type PreparedDirectClipboardTransfer,
+} from "../crypto/direct-clipboard.ts";
 import {
   registerCurrentDevice,
+  recoverCurrentDevice,
   type ApproveDeviceRequest,
+  type DeviceManagementRequest,
   type DeviceRegistrationApi,
   type RegisteredDeviceListResponse,
   type RegisteredDeviceResponse,
@@ -26,6 +65,12 @@ import type {
   LocalDeviceRecord,
 } from "../crypto/trust-store.ts";
 import { TrustStoreError } from "../crypto/trust-store.ts";
+import {
+  isDirectSignalDelivery,
+  type DirectManagerEvent,
+  type DirectSignalRequest,
+  type DirectTransportStatus,
+} from "../direct/protocol.ts";
 import type {
   SignInResponse,
   ILoginResponse,
@@ -41,18 +86,31 @@ import {
   envelopeFromSocketPayload,
   isClipboardText,
   isOffscreenClipboardObservation,
+  isOffscreenDirectTransportEvent,
   isSyncPreferencesCommand,
   isRuntimeRequest,
   POPUP_SOURCE,
   RUNTIME_SOURCE,
   type AuthenticatedRuntimeResult,
+  type ManagedDevice,
+  type RecoveryCredentialResult,
   type RuntimeCommand,
   type RuntimeResponse,
   type RuntimeStatus,
   type RuntimeStatusBroadcast,
+  type PendingAssistedImageCopyResult,
+  type PendingAssistedImageSummary,
 } from "./messages.ts";
 import type { ClipboardAdapter } from "./clipboard-adapter.ts";
-import type { OutboundItemStore, ProcessedItemStore } from "./runtime-db.ts";
+import type { DirectTransport } from "./direct-transport.ts";
+import {
+  InMemoryAssistedPngSuppressionStore,
+  InMemoryPendingAssistedImageStore,
+  type AssistedPngSuppressionStore,
+  type OutboundItemStore,
+  type PendingAssistedImageStore,
+  type ProcessedItemStore,
+} from "./runtime-db.ts";
 import {
   DEFAULT_SYNC_PREFERENCES,
   OFF_SYNC_PREFERENCES,
@@ -77,9 +135,15 @@ export interface RuntimeApi {
     refreshTokens(refreshToken?: string): Promise<AxiosResponse<SignInResponse>>;
     logout(refreshToken?: string): Promise<AxiosResponse<unknown>>;
     resendEmailOtp(email: string): Promise<AxiosResponse<unknown>>;
+    requestAccountResetCode(): Promise<AxiosResponse<unknown>>;
+    resetAccount(code: number): Promise<AxiosResponse<unknown>>;
   };
   devices: DeviceRegistrationApi & {
     listDevices(): Promise<AxiosResponse<RegisteredDeviceListResponse>>;
+    revokeDevice(
+      deviceId: string,
+      request: DeviceManagementRequest,
+    ): Promise<AxiosResponse<RegisteredDeviceResponse>>;
   };
 }
 
@@ -125,16 +189,25 @@ export interface RuntimeDependencies {
   statusStore: StatusStore<RuntimeStatus>;
   trustStore: ClientTrustStore;
   clipboardAdapter: ClipboardAdapter;
+  directTransport?: DirectTransport;
   processedItemStore: ProcessedItemStore;
   outboundItemStore: OutboundItemStore;
+  pendingAssistedImageStore?: PendingAssistedImageStore;
+  assistedPngSuppressionStore?: AssistedPngSuppressionStore;
   syncPreferencesStore: SyncPreferencesStore;
   apiFactory: (accessToken: string) => RuntimeApi;
   socketFactory: (url: string, options: SocketOptions) => SocketLike;
   identityLoader?: (userId: string) => Promise<DeviceIdentity | null>;
   identityCreator?: (userId: string) => Promise<DeviceIdentity>;
   registerDevice?: typeof registerCurrentDevice;
+  recoverDevice?: typeof recoverCurrentDevice;
+  clearIdentity?: typeof clearDeviceIdentity;
+  exportRecoveryKey?: typeof exportRecoveryPrivateKey;
+  sealRecoveryKey?: typeof sealRecoveryCredential;
   encrypt?: typeof encryptClipboardItem;
-  decrypt?: typeof decryptClipboardItem;
+  decrypt?: typeof decryptClipboardItemBytes;
+  prepareDirect?: typeof prepareDirectClipboardTransfer;
+  decryptDirect?: typeof decryptDirectClipboardTransfer;
   signChallenge?: typeof signSocketChallenge;
   signApproval?: typeof signDeviceApproval;
   now?: () => Date;
@@ -144,6 +217,12 @@ export interface RuntimeDependencies {
     clear: () => Promise<void> | void;
   };
 }
+
+export {
+  selectClipboardWirePayload,
+  selectClipboardWirePayloads,
+  selectClipboardDeliveryRoutes,
+} from "../clipboard/wire-payload.ts";
 
 const DEFAULT_STATUS: RuntimeStatus = {
   connectionState: "signed-out",
@@ -157,6 +236,9 @@ const DEFAULT_STATUS: RuntimeStatus = {
     deviceAuthenticated: false,
   },
   syncReady: false,
+  pendingAssistedImages: [],
+  directTargets: [],
+  directTransfers: [],
   syncPreferences: { ...DEFAULT_SYNC_PREFERENCES },
   clipboardWatch: "stopped",
   onboarding: {
@@ -170,9 +252,15 @@ const STARTUP_CONNECTIVITY_KICK_TIMEOUT_MS = 250;
 const CONNECTIVITY_RECONCILIATION_TIMEOUT_MS = 15_000;
 const MAX_CONNECTIVITY_RECONCILIATION_FOLLOW_UPS = 2;
 const LOGOUT_REQUEST_TIMEOUT_MS = 5_000;
+const DIRECT_CLIPBOARD_TERMINAL_TOMBSTONE_TTL_MS = 5_000;
+const DIRECT_SIGNAL_VALIDATION_TTL_MS = 15_000;
+const DIRECT_SIGNAL_VALIDATION_MAX = 8;
 
 export const LIVE_CLIPBOARD_TTL_MS = 60_000;
+/** Minimum spacing of trust refreshes triggered by an unknown item source. */
+export const UNKNOWN_SOURCE_REFRESH_MS = 10_000;
 export const MAX_CLOCK_SKEW_MS = 5 * 60_000;
+const ASSISTED_PNG_SUPPRESSION_TTL_MS = 15_000;
 
 function parseStrictExpiry(value: string): number | null {
   const parsed = Date.parse(value);
@@ -297,6 +385,55 @@ function resolveAccountRoot(
   if (candidates.length === 1)
     return { state: "available", device: candidates[0] };
   return { state: candidates.length === 0 ? "missing" : "ambiguous" };
+}
+
+/**
+ * This device is the account root and may approve new devices: either the
+ * first device (trust on first use) or one restored with the offline
+ * recovery credential after the previous root was removed.
+ */
+function isApprovingRoot(device: LocalDeviceRecord | null | undefined): boolean {
+  return Boolean(
+    device &&
+      device.trustState === "root" &&
+      (device.trustOrigin === "initial-tofu" || device.trustOrigin === "recovery"),
+  );
+}
+
+/**
+ * A user-facing reason for an unexpected failure: the backend's error
+ * description, or the message of a local validation/trust error. Never the
+ * raw text of arbitrary exceptions, which may be opaque or leak internals.
+ */
+function describeFailure(error: unknown): string | undefined {
+  if (isAxiosError(error)) {
+    const data = error.response?.data as
+      | { description?: unknown; message?: unknown }
+      | undefined;
+    // Nest validation failures report `message` as an array of problems.
+    const detail =
+      typeof data?.description === "string"
+        ? data.description
+        : typeof data?.message === "string"
+          ? data.message
+          : Array.isArray(data?.message) &&
+              data.message.every((item) => typeof item === "string")
+            ? `The Copyyt server rejected the request: ${data.message.join("; ")}`
+            : undefined;
+    if (detail) return detail;
+    return error.response
+      ? `The Copyyt server rejected the request (HTTP ${error.response.status})`
+      : "The Copyyt server could not be reached";
+  }
+  if (
+    error instanceof Error &&
+    (error.name === "TrustStoreError" ||
+      error.name === "CryptoProtocolError" ||
+      (error instanceof TypeError && /recovery credential|recovery private key/i.test(error.message)))
+  ) {
+    return error.message;
+  }
+  return undefined;
 }
 
 function accountRootError(root: AccountRootResolution): RuntimeError {
@@ -531,6 +668,20 @@ function isAcknowledgement(value: unknown, itemId: string): boolean {
   return candidate.itemId === undefined || candidate.itemId === itemId;
 }
 
+function isDirectAcknowledgement(value: unknown, transferId: string): boolean {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as {
+    accepted?: unknown;
+    transferId?: unknown;
+    error?: unknown;
+  };
+  return (
+    candidate.accepted === true &&
+    candidate.transferId === transferId &&
+    !candidate.error
+  );
+}
+
 function challengeParts(
   payload: unknown,
   fallbackSocketId: string,
@@ -566,7 +717,18 @@ function commandFallbackErrorCode(command: RuntimeCommand): RuntimeErrorCode {
       return "SOCKET_PUBLISH_FAILED";
     case "runtime:test-clipboard":
       return "CLIPBOARD_WRITE_FAILED";
+    case "runtime:start-direct-test":
+    case "runtime:cancel-direct-test":
+      return "DIRECT_TRANSPORT_FAILED";
     case "runtime:bootstrap-trust-anchor":
+    case "runtime:export-recovery-credential":
+    case "runtime:confirm-recovery-credential-saved":
+    case "runtime:recover-device":
+    case "runtime:list-devices":
+    case "runtime:reset-device":
+    case "runtime:request-account-reset-code":
+    case "runtime:reset-account":
+    case "runtime:revoke-device":
     case "runtime:refresh-onboarding":
     case "runtime:approve-pending-device":
     case "runtime:confirm-paired-approver":
@@ -583,10 +745,18 @@ export class CopyytServiceWorkerRuntime {
   ) => Promise<DeviceIdentity | null>;
   private readonly identityCreator: (userId: string) => Promise<DeviceIdentity>;
   private readonly registerDevice: typeof registerCurrentDevice;
+  private readonly recoverDeviceWithCredential: typeof recoverCurrentDevice;
+  private readonly clearIdentity: typeof clearDeviceIdentity;
+  private readonly exportRecoveryKey: typeof exportRecoveryPrivateKey;
+  private readonly sealRecoveryKey: typeof sealRecoveryCredential;
   private readonly encrypt: typeof encryptClipboardItem;
-  private readonly decrypt: typeof decryptClipboardItem;
+  private readonly decrypt: typeof decryptClipboardItemBytes;
+  private readonly prepareDirect: typeof prepareDirectClipboardTransfer;
+  private readonly decryptDirect: typeof decryptDirectClipboardTransfer;
   private readonly signChallenge: typeof signSocketChallenge;
   private readonly signApproval: typeof signDeviceApproval;
+  private readonly pendingAssistedImageStore: PendingAssistedImageStore;
+  private readonly assistedPngSuppressionStore: AssistedPngSuppressionStore;
   private readonly now: () => Date;
   private status: RuntimeStatus = DEFAULT_STATUS;
   private lastPersistedSyncPreferences: SyncPreferences = {
@@ -602,6 +772,13 @@ export class CopyytServiceWorkerRuntime {
   private challengeInFlight = false;
   private challengeReceived = false;
   private serverDeviceState: ServerDeviceState = "unknown";
+  /**
+   * Whether the server confirmed, on the latest registration, that this
+   * device's recovery public key is the account's active recovery key. Only
+   * then is the local recovery private key worth exporting. Fails closed.
+   */
+  private recoveryKeyActive = false;
+  private lastUnknownSourceRefreshAt = Number.NEGATIVE_INFINITY;
   private startup: Promise<void> | null = null;
   private initialization: Promise<void> | null = null;
   private refreshInFlight: Promise<RuntimeSession> | null = null;
@@ -631,9 +808,33 @@ export class CopyytServiceWorkerRuntime {
   private autoPublishInFlight: Promise<void> | null = null;
   private automaticPublishAuthRecoveryInFlight = false;
   private pendingAutoObservation: {
-    text: string;
+    payload: ClipboardPayloadV1;
     sequence: number;
   } | null = null;
+  private readonly directClipboardReceives = new Map<
+    string,
+    {
+      manifest: DirectClipboardStartV1;
+      encryptedChunks: string[];
+      sourceDeviceId: string;
+      receivePolicyRevision: number;
+    }
+  >();
+  private readonly terminalDirectClipboardTransfers = new Map<string, number>();
+  private readonly terminalDirectClipboardTransferTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
+  private readonly directSignalValidations = new Map<
+    string,
+    {
+      sourceDeviceId: string;
+      sourceKeyVersion: number;
+      expiresAt?: number;
+      timer?: ReturnType<typeof setTimeout>;
+      validation?: Promise<ClientVerifiedDevice>;
+    }
+  >();
 
   constructor(dependencies: RuntimeDependencies) {
     this.dependencies = dependencies;
@@ -641,10 +842,22 @@ export class CopyytServiceWorkerRuntime {
     this.identityCreator =
       dependencies.identityCreator ?? getOrCreateDeviceIdentity;
     this.registerDevice = dependencies.registerDevice ?? registerCurrentDevice;
+    this.recoverDeviceWithCredential =
+      dependencies.recoverDevice ?? recoverCurrentDevice;
+    this.clearIdentity = dependencies.clearIdentity ?? clearDeviceIdentity;
+    this.exportRecoveryKey =
+      dependencies.exportRecoveryKey ?? exportRecoveryPrivateKey;
+    this.sealRecoveryKey = dependencies.sealRecoveryKey ?? sealRecoveryCredential;
     this.encrypt = dependencies.encrypt ?? encryptClipboardItem;
-    this.decrypt = dependencies.decrypt ?? decryptClipboardItem;
+    this.decrypt = dependencies.decrypt ?? decryptClipboardItemBytes;
+    this.prepareDirect = dependencies.prepareDirect ?? prepareDirectClipboardTransfer;
+    this.decryptDirect = dependencies.decryptDirect ?? decryptDirectClipboardTransfer;
     this.signChallenge = dependencies.signChallenge ?? signSocketChallenge;
     this.signApproval = dependencies.signApproval ?? signDeviceApproval;
+    this.pendingAssistedImageStore =
+      dependencies.pendingAssistedImageStore ?? new InMemoryPendingAssistedImageStore();
+    this.assistedPngSuppressionStore =
+      dependencies.assistedPngSuppressionStore ?? new InMemoryAssistedPngSuppressionStore();
     this.now = dependencies.now ?? (() => new Date());
   }
 
@@ -939,6 +1152,7 @@ export class CopyytServiceWorkerRuntime {
       // Network, Socket.IO, and temporary backend availability errors are
       // connection state—not runtime startup death. Do not poison the worker.
       this.serverDeviceState = "unknown";
+      this.recoveryKeyActive = false;
       this.setConnectionRecovering(
         error instanceof RuntimeError ? error.code : "SOCKET_NOT_READY",
         error instanceof Error
@@ -1037,6 +1251,12 @@ export class CopyytServiceWorkerRuntime {
             ...(persistedStatus.lastAutoSyncAt
               ? { lastAutoSyncAt: persistedStatus.lastAutoSyncAt }
               : {}),
+            ...(persistedStatus.lastAutoPublishAcceptedAt
+              ? { lastAutoPublishAcceptedAt: persistedStatus.lastAutoPublishAcceptedAt }
+              : {}),
+            ...(persistedStatus.lastDirectDeliveryAt
+              ? { lastDirectDeliveryAt: persistedStatus.lastDirectDeliveryAt }
+              : {}),
             ...(persistedStatus.lastAutoSyncError
               ? { lastAutoSyncError: persistedStatus.lastAutoSyncError }
               : {}),
@@ -1050,7 +1270,9 @@ export class CopyytServiceWorkerRuntime {
       syncPreferences: { ...syncPreferences },
       clipboardWatch: "stopped",
     };
+    await this.refreshPendingAssistedImageStatus();
     this.serverDeviceState = "unknown";
+    this.recoveryKeyActive = false;
     this.socketReady = false;
     this.challengeInFlight = false;
     this.challengeReceived = false;
@@ -1117,12 +1339,57 @@ export class CopyytServiceWorkerRuntime {
     return structuredClone(this.status);
   }
 
+  private async refreshPendingAssistedImageStatus(): Promise<void> {
+    const records = this.session
+      ? await this.pendingAssistedImageStore.list(this.session.user.id)
+      : [];
+    const summaries: PendingAssistedImageSummary[] = records.map((record) => ({
+      itemId: record.itemId,
+      sourceDeviceId: record.sourceDeviceId,
+      ...(record.sourceDeviceName ? { sourceDeviceName: record.sourceDeviceName } : {}),
+      receivedAt: record.receivedAt,
+      expiresAt: record.expiresAt,
+      hasPng: true,
+    }));
+    this.setStatus({ ...this.status, pendingAssistedImages: summaries });
+  }
+
   /** Handles a validated, fire-and-forget observation from the offscreen document. */
   async handleClipboardObservation(message: unknown): Promise<void> {
-    if (!isOffscreenClipboardObservation(message) || message.text.length === 0) {
+    if (!isOffscreenClipboardObservation(message)) return;
+    let payload: ClipboardPayloadV1;
+    try {
+      payload = message.payload ?? clipboardPayloadFromPlainText(message.text);
+      validateClipboardPayloadV1(payload);
+    } catch {
       return;
     }
-    if (!isClipboardText(message.text)) return;
+    const png = getPngRepresentation(payload);
+    if (png && this.session) {
+      try {
+        if (await this.assistedPngSuppressionStore.consumeNext(this.session.user.id)) {
+          // The focused-page assisted write is an intentional local clipboard
+          // change. Consume its durable one-shot guard before the observation
+          // can enter the live publish path, even if the worker was reconstructed.
+          this.autoObservationSequence += 1;
+          this.pendingAutoObservation = null;
+          return;
+        }
+      } catch {
+        // A suppression-store failure must not make a valid clipboard item
+        // unreadable. The normal publish path remains authoritative.
+      }
+    }
+    const plain = findPlainTextRepresentation(payload);
+    if (!plain) {
+      // Image-only observations are now eligible for capability-aware
+      // encrypted delivery. The publish path decides whether any compatible
+      // recipient exists and whether the serialized bundle fits the relay.
+    }
+    if (plain?.data.length === 0 && payload.representations.length === 1) {
+      this.pendingAutoObservation = null;
+      return;
+    }
     if (!this.status.syncPreferences.sendEnabled) {
       // Do not retain an observation while sending is disabled. The next
       // enable operation starts a fresh baseline instead of publishing the
@@ -1140,7 +1407,7 @@ export class CopyytServiceWorkerRuntime {
         // this bounded publish retry; ordinary socket recovery still drops
         // observations and establishes a fresh clipboard baseline.
         const observation = {
-          text: message.text,
+          payload,
           sequence: ++this.autoObservationSequence,
         };
         this.pendingAutoObservation = observation;
@@ -1159,7 +1426,7 @@ export class CopyytServiceWorkerRuntime {
     }
 
     const observation = {
-      text: message.text,
+      payload,
       sequence: ++this.autoObservationSequence,
     };
     if (this.autoPublishInFlight) {
@@ -1177,6 +1444,749 @@ export class CopyytServiceWorkerRuntime {
     });
     this.autoPublishInFlight = trackedOperation;
     await trackedOperation;
+  }
+
+  async handleDirectTransportEvent(message: unknown): Promise<void> {
+    if (!isOffscreenDirectTransportEvent(message)) return;
+    const event = message.event;
+    if (event.kind === "application-frame") {
+      if (
+        !this.directClipboardReceives.has(event.transferId) &&
+        this.isTerminalDirectClipboardTransfer(event.transferId)
+      ) {
+        // A frame can already be crossing offscreen -> worker when the
+        // transport reaches a terminal state. Preserve the terminal result.
+        return;
+      }
+      try {
+        await this.handleDirectClipboardFrame(event);
+      } catch (error) {
+        this.markTerminalDirectClipboardTransfer(event.transferId);
+        this.directClipboardReceives.delete(event.transferId);
+        await this.dependencies.directTransport
+          ?.cancelTransfer(
+            event.transferId,
+            error instanceof Error ? error.message : "Direct clipboard validation failed",
+          )
+          .catch(() => undefined);
+        this.recordSyncError(
+          "DIRECT_TRANSPORT_FAILED",
+          error instanceof Error ? error.message : "Direct clipboard validation failed",
+        );
+      }
+      return;
+    }
+    if (event.kind === "status") {
+      const previous = this.status.directTransfers ?? [];
+      const next: DirectTransportStatus = {
+        transferId: event.transferId,
+        remoteDeviceId: event.remoteDeviceId,
+        state: event.state,
+        ...(event.bytesSent !== undefined ? { bytesSent: event.bytesSent } : {}),
+        ...(event.bytesReceived !== undefined
+          ? { bytesReceived: event.bytesReceived }
+          : {}),
+        ...(event.byteLength !== undefined ? { byteLength: event.byteLength } : {}),
+        ...(event.startedAt ? { startedAt: event.startedAt } : {}),
+        ...(event.finishedAt ? { finishedAt: event.finishedAt } : {}),
+        ...(event.error ? { error: event.error } : {}),
+      };
+      const withoutTransfer = previous.filter(
+        (transfer) => transfer.transferId !== event.transferId,
+      );
+      this.setStatus({
+        ...this.status,
+        directTransfers: [next, ...withoutTransfer].slice(0, 4),
+      });
+      if (event.state === "failed" || event.state === "cancelled") {
+        this.markTerminalDirectClipboardTransfer(event.transferId);
+        this.directClipboardReceives.delete(event.transferId);
+        this.clearDirectSignalValidation(event.transferId);
+      }
+      if (event.state === "succeeded") {
+        this.markTerminalDirectClipboardTransfer(event.transferId);
+        this.clearDirectSignalValidation(event.transferId);
+        this.setStatus({
+          ...this.status,
+          lastDirectDeliveryAt: this.now().toISOString(),
+        });
+      }
+      if (
+        event.state === "failed" &&
+        event.error &&
+        this.status.connectionState === "ready"
+      ) {
+        // Direct transport health is diagnostic only. Do not change socket or
+        // clipboard readiness when a peer experiment fails.
+        return;
+      }
+      return;
+    }
+
+    const transport = this.dependencies.directTransport;
+    if (!transport) {
+      return;
+    }
+    if (!this.isSocketTransportReady()) {
+      void transport
+        .cancelTransfer(event.transferId, "Copyyt socket is unavailable")
+        .catch(() => undefined);
+      return;
+    }
+    const request: DirectSignalRequest = {
+      transferId: event.transferId,
+      recipientDeviceId: event.remoteDeviceId,
+      ...event.signal,
+    };
+    try {
+      await this.emitDirectSignal(request);
+    } catch (error) {
+      if (event.signal.kind === "cancel") return;
+      await transport
+        .cancelTransfer(
+          event.transferId,
+          error instanceof Error ? error.message : "Direct signalling failed",
+        )
+        .catch(() => undefined);
+    }
+  }
+
+  private async handleDirectClipboardFrame(
+    event: Extract<DirectManagerEvent, { kind: "application-frame" }>,
+  ): Promise<void> {
+    if (event.frame.type === "clipboard-secure-chunk") {
+      const pending = this.directClipboardReceives.get(event.transferId);
+      if (!pending) {
+        throw new RuntimeError(
+          "DIRECT_TRANSPORT_FAILED",
+          "The direct clipboard chunk has no manifest",
+        );
+      }
+      if (!this.isReceivePolicyCurrent(pending.receivePolicyRevision)) {
+        throw new RuntimeError(
+          "CLIPBOARD_WRITE_FAILED",
+          "Clipboard receiving is disabled for this device",
+        );
+      }
+      if (event.remoteDeviceId !== pending.sourceDeviceId) {
+        throw new RuntimeError(
+          "DIRECT_TRANSPORT_FAILED",
+          "The direct clipboard chunk source changed",
+        );
+      }
+      if (pending.encryptedChunks.length >= pending.manifest.chunkCount) {
+        throw new RuntimeError(
+          "DIRECT_TRANSPORT_FAILED",
+          "The direct clipboard transfer has an extra chunk",
+        );
+      }
+      pending.encryptedChunks.push(event.frame.data);
+      if (pending.encryptedChunks.length !== pending.manifest.chunkCount) return;
+      await this.finishDirectClipboardReceive(event, pending);
+      return;
+    }
+
+    const session = this.requireSession();
+    const transport = this.dependencies.directTransport;
+    if (!transport?.sendClipboardVerified) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_UNAVAILABLE",
+        "The direct clipboard transport is not available in this build",
+      );
+    }
+    if (!this.isReceivePolicyCurrent(this.receivePolicyRevision)) {
+      throw new RuntimeError(
+        "CLIPBOARD_WRITE_FAILED",
+        "Clipboard receiving is disabled for this device",
+      );
+    }
+    if (this.directClipboardReceives.has(event.transferId)) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct clipboard manifest was repeated",
+      );
+    }
+    const identity = await this.identityLoader(session.user.id);
+    if (!identity || identity.keyVersion === null) {
+      throw new RuntimeError("DEVICE_NOT_REGISTERED", "The device is not registered");
+    }
+    const localRecipient = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      identity.deviceId,
+    );
+    if (
+      !isLocallyVerified(localRecipient) ||
+      !identityMatchesLocalDevice(identity, localRecipient) ||
+      !localRecipient.capabilities?.includes(CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY) ||
+      !localRecipient.capabilities?.includes(CLIPBOARD_IMAGE_PNG_ASSISTED_WRITE_V1_CAPABILITY)
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "This device has not advertised direct assisted PNG receive",
+      );
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(event.frame.manifest) as unknown;
+    } catch {
+      throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard manifest is invalid");
+    }
+    if (!isDirectClipboardStartV1(parsed)) {
+      throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard manifest is invalid");
+    }
+    const manifest = parsed;
+    if (
+      manifest.transferId !== event.transferId ||
+      manifest.sourceDeviceId !== event.remoteDeviceId ||
+      manifest.userId !== session.user.id ||
+      manifest.recipientDeviceId !== identity.deviceId ||
+      manifest.recipientKeyVersion !== identity.keyVersion
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct clipboard manifest peer binding is invalid",
+      );
+    }
+    const source = await this.requireActiveTrustedDirectSource(
+      session,
+      manifest.sourceDeviceId,
+      manifest.sourceKeyVersion,
+    );
+    const now = this.now().getTime();
+    const expiresAt = parseStrictExpiry(manifest.expiresAt);
+    if (expiresAt === null || now >= expiresAt || !isLiveExpiryWithinPolicy(expiresAt, now)) {
+      throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard transfer has expired");
+    }
+    if (
+      Math.ceil(manifest.plaintextByteLength / manifest.chunkPlaintextSize) !==
+      manifest.chunkCount
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct clipboard chunk count is invalid",
+      );
+    }
+    if (
+      !(await verifyDirectClipboardManifestSignature({
+        manifest,
+        sourceSignature: manifest.sourceSignature,
+        sourceSigningPublicKey: source.signingPublicKey,
+      }))
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct clipboard manifest signature is invalid",
+      );
+    }
+    if (!source.capabilities?.includes(CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY)) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct source does not advertise clipboard direct transfer",
+      );
+    }
+    this.directClipboardReceives.set(event.transferId, {
+      manifest,
+      encryptedChunks: [],
+      sourceDeviceId: source.deviceId,
+      receivePolicyRevision: this.receivePolicyRevision,
+    });
+  }
+
+  private async finishDirectClipboardReceive(
+    event: Extract<DirectManagerEvent, { kind: "application-frame" }>,
+    pending: {
+      manifest: DirectClipboardStartV1;
+      encryptedChunks: string[];
+      sourceDeviceId: string;
+      receivePolicyRevision: number;
+    },
+  ): Promise<void> {
+    const session = this.requireSession();
+    const transport = this.dependencies.directTransport;
+    if (!transport?.sendClipboardVerified) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_UNAVAILABLE",
+        "The direct clipboard transport is not available in this build",
+      );
+    }
+    if (!this.isReceivePolicyCurrent(pending.receivePolicyRevision)) {
+      throw new RuntimeError(
+        "CLIPBOARD_WRITE_FAILED",
+        "Clipboard receiving is disabled for this device",
+      );
+    }
+    const identity = await this.identityLoader(session.user.id);
+    if (
+      !identity ||
+      identity.keyVersion === null ||
+      identity.deviceId !== pending.manifest.recipientDeviceId ||
+      identity.keyVersion !== pending.manifest.recipientKeyVersion
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct clipboard recipient identity changed",
+      );
+    }
+    const localRecipient = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      identity.deviceId,
+    );
+    if (
+      !isLocallyVerified(localRecipient) ||
+      !identityMatchesLocalDevice(identity, localRecipient) ||
+      !localRecipient.capabilities?.includes(CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY) ||
+      !localRecipient.capabilities?.includes(CLIPBOARD_IMAGE_PNG_ASSISTED_WRITE_V1_CAPABILITY)
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "This device is no longer trusted for direct assisted PNG receive",
+      );
+    }
+    const source = await this.requireActiveTrustedDirectSource(
+      session,
+      pending.manifest.sourceDeviceId,
+      pending.manifest.sourceKeyVersion,
+    );
+    const expiresAt = parseStrictExpiry(pending.manifest.expiresAt);
+    if (expiresAt === null || this.now().getTime() >= expiresAt) {
+      throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard transfer has expired");
+    }
+    if (
+      !(await verifyDirectClipboardManifestSignature({
+        manifest: pending.manifest,
+        sourceSignature: pending.manifest.sourceSignature,
+        sourceSigningPublicKey: source.signingPublicKey,
+      }))
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct clipboard manifest signature is invalid",
+      );
+    }
+    if (!source.capabilities?.includes(CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY)) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The direct source no longer advertises clipboard direct transfer",
+      );
+    }
+    const decrypted = await this.decryptDirect({
+      userId: session.user.id,
+      identity,
+      sourceDevice: source,
+      manifest: pending.manifest,
+      encryptedChunks: pending.encryptedChunks,
+      now: this.now,
+    });
+    if (!this.isReceivePolicyCurrent(pending.receivePolicyRevision)) {
+      throw new RuntimeError(
+        "CLIPBOARD_WRITE_FAILED",
+        "Clipboard receiving is disabled for this device",
+      );
+    }
+    if (this.now().getTime() >= expiresAt) {
+      throw new RuntimeError("DIRECT_TRANSPORT_FAILED", "The direct clipboard transfer has expired");
+    }
+    const png = getPngRepresentation(decrypted.payload);
+    if (!png) throw new RuntimeError("INVALID_CLIPBOARD_CONTENT", "The direct clipboard bundle does not contain PNG data");
+    getPngBytes(decrypted.payload);
+    const text = findPlainTextRepresentation(decrypted.payload);
+    if (text) {
+      const textPayload = projectClipboardPayloadToText(decrypted.payload);
+      if (this.dependencies.clipboardAdapter.writePayload) {
+        await this.dependencies.clipboardAdapter.writePayload(textPayload);
+      } else {
+        await this.dependencies.clipboardAdapter.writeText(text.data);
+      }
+    }
+    const pendingRecord = {
+      userId: session.user.id,
+      itemId: pending.manifest.transferId,
+      sourceDeviceId: pending.manifest.sourceDeviceId,
+      ...(source.name ? { sourceDeviceName: source.name } : {}),
+      receivedAt: this.now().toISOString(),
+      expiresAt: pending.manifest.expiresAt,
+      hasPng: true as const,
+      directPackage: {
+        manifest: pending.manifest,
+        encryptedChunks: [...pending.encryptedChunks],
+      },
+    };
+    await this.pendingAssistedImageStore.put(pendingRecord);
+    await this.dependencies.processedItemStore.mark({
+      userId: session.user.id,
+      itemId: pending.manifest.transferId,
+      processedAt: this.now().toISOString(),
+      sourceDeviceId: pending.manifest.sourceDeviceId,
+      disposition: "pending-image",
+    });
+    this.markTerminalDirectClipboardTransfer(event.transferId);
+    this.directClipboardReceives.delete(event.transferId);
+    await transport.sendClipboardVerified({
+      transferId: event.transferId,
+      plaintextByteLength: pending.manifest.plaintextByteLength,
+    });
+    await this.refreshPendingAssistedImageStatus();
+  }
+
+  private pruneTerminalDirectClipboardTransfers(now = this.now().getTime()): void {
+    for (const [transferId, expiresAt] of this.terminalDirectClipboardTransfers) {
+      if (expiresAt <= now) {
+        this.terminalDirectClipboardTransfers.delete(transferId);
+        const timer = this.terminalDirectClipboardTransferTimers.get(transferId);
+        if (timer !== undefined) clearTimeout(timer);
+        this.terminalDirectClipboardTransferTimers.delete(transferId);
+      }
+    }
+  }
+
+  private isTerminalDirectClipboardTransfer(transferId: string): boolean {
+    const now = this.now().getTime();
+    this.pruneTerminalDirectClipboardTransfers(now);
+    const expiresAt = this.terminalDirectClipboardTransfers.get(transferId);
+    return expiresAt !== undefined && expiresAt > now;
+  }
+
+  private markTerminalDirectClipboardTransfer(transferId: string): void {
+    const now = this.now().getTime();
+    this.pruneTerminalDirectClipboardTransfers(now);
+    const manifestExpiry = this.directClipboardReceives.get(transferId)?.manifest.expiresAt;
+    const parsedManifestExpiry = manifestExpiry === undefined
+      ? null
+      : parseStrictExpiry(manifestExpiry);
+    const boundedExpiry = now + LIVE_CLIPBOARD_TTL_MS;
+    const drainExpiry = now + DIRECT_CLIPBOARD_TERMINAL_TOMBSTONE_TTL_MS;
+    const expiresAt = parsedManifestExpiry === null
+      ? drainExpiry
+      : Math.min(boundedExpiry, Math.max(drainExpiry, parsedManifestExpiry));
+    const previousTimer = this.terminalDirectClipboardTransferTimers.get(transferId);
+    if (previousTimer !== undefined) clearTimeout(previousTimer);
+    this.terminalDirectClipboardTransfers.set(transferId, expiresAt);
+    const timer = setTimeout(() => {
+      if (this.terminalDirectClipboardTransfers.get(transferId) !== expiresAt) return;
+      this.terminalDirectClipboardTransfers.delete(transferId);
+      this.terminalDirectClipboardTransferTimers.delete(transferId);
+    }, Math.max(0, expiresAt - now));
+    (
+      timer as unknown as { unref?: () => void }
+    ).unref?.();
+    this.terminalDirectClipboardTransferTimers.set(transferId, timer);
+  }
+
+  private clearDirectSignalValidation(transferId: string): void {
+    const validation = this.directSignalValidations.get(transferId);
+    if (!validation) return;
+    if (validation.timer !== undefined) clearTimeout(validation.timer);
+    this.directSignalValidations.delete(transferId);
+  }
+
+  private clearAllDirectSignalValidations(): void {
+    for (const transferId of this.directSignalValidations.keys()) {
+      this.clearDirectSignalValidation(transferId);
+    }
+  }
+
+  private reserveDirectSignalValidation(
+    transferId: string,
+    sourceDeviceId: string,
+    sourceKeyVersion: number,
+  ): {
+    sourceDeviceId: string;
+    sourceKeyVersion: number;
+    validation?: Promise<ClientVerifiedDevice>;
+    expiresAt?: number;
+    timer?: ReturnType<typeof setTimeout>;
+  } {
+    while (this.directSignalValidations.size >= DIRECT_SIGNAL_VALIDATION_MAX) {
+      const oldestTransferId = this.directSignalValidations.keys().next().value;
+      if (typeof oldestTransferId !== "string") break;
+      this.clearDirectSignalValidation(oldestTransferId);
+    }
+    const reservation = { sourceDeviceId, sourceKeyVersion };
+    this.directSignalValidations.set(transferId, reservation);
+    return reservation;
+  }
+
+  private promoteDirectSignalValidation(
+    transferId: string,
+    reservation: {
+      sourceDeviceId: string;
+      sourceKeyVersion: number;
+    },
+  ): void {
+    if (this.directSignalValidations.get(transferId) !== reservation) return;
+    const expiresAt = this.now().getTime() + DIRECT_SIGNAL_VALIDATION_TTL_MS;
+    const timer = setTimeout(() => {
+      const current = this.directSignalValidations.get(transferId);
+      if (current?.expiresAt === expiresAt) {
+        this.directSignalValidations.delete(transferId);
+      }
+    }, DIRECT_SIGNAL_VALIDATION_TTL_MS);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.directSignalValidations.set(transferId, {
+      sourceDeviceId: reservation.sourceDeviceId,
+      sourceKeyVersion: reservation.sourceKeyVersion,
+      expiresAt,
+      timer,
+    });
+  }
+
+  private async requireActiveTrustedDirectSource(
+    session: RuntimeSession,
+    sourceDeviceId: string,
+    sourceKeyVersion: number,
+  ): Promise<ClientVerifiedDevice> {
+    const localSource = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      sourceDeviceId,
+    );
+    if (!isLocallyVerified(localSource) || localSource.keyVersion !== sourceKeyVersion) {
+      throw new RuntimeError("SOURCE_UNTRUSTED", "The direct clipboard source is not locally trusted");
+    }
+    const snapshot = await this.fetchDeviceSnapshot(session);
+    const serverSource = snapshot.trustedDevices.find(
+      (device) =>
+        device.deviceId === sourceDeviceId &&
+        device.keyVersion === sourceKeyVersion &&
+        device.signingPublicKey === localSource.signingPublicKey &&
+        device.encryptionPublicKey === localSource.encryptionPublicKey &&
+        device.revokedAt == null,
+    );
+    if (
+      !serverSource ||
+      !serverSource.capabilities?.includes(CLIPBOARD_DIRECT_WEBRTC_V1_CAPABILITY)
+    ) {
+      throw new RuntimeError("SOURCE_UNTRUSTED", "The direct clipboard source is no longer active and trusted");
+    }
+    return localSource;
+  }
+
+  async startDirectTestTransfer(
+    recipientDeviceId: string,
+  ): Promise<DirectTransportStatus> {
+    const session = this.requireSession();
+    const transport = this.dependencies.directTransport;
+    if (!transport) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_UNAVAILABLE",
+        "The direct transport is not available in this build",
+      );
+    }
+    this.requireSocketReady();
+    const identity = await this.identityLoader(session.user.id);
+    if (!identity || identity.keyVersion === null) {
+      throw new RuntimeError(
+        "DEVICE_NOT_REGISTERED",
+        "The device must be registered before starting a direct transfer",
+      );
+    }
+    const localDevice = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      identity.deviceId,
+    );
+    if (!isLocallyVerified(localDevice)) {
+      throw new RuntimeError(
+        "DEVICE_NOT_LOCALLY_TRUSTED",
+        "Trust this device before starting a direct transfer",
+      );
+    }
+    if (recipientDeviceId === identity.deviceId) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "A direct transfer cannot target this device",
+      );
+    }
+    const snapshot = await this.fetchDeviceSnapshot(session);
+    const recipient = snapshot.trustedDevices.find(
+      (device) => device.deviceId === recipientDeviceId,
+    );
+    const localRecipient = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      recipientDeviceId,
+    );
+    if (
+      !recipient ||
+      !localRecipient ||
+      !isLocallyVerified(localRecipient) ||
+      localRecipient.keyVersion !== recipient.keyVersion ||
+      localRecipient.signingPublicKey !== recipient.signingPublicKey ||
+      localRecipient.encryptionPublicKey !== recipient.encryptionPublicKey
+    ) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "The selected device is not an active locally trusted device",
+      );
+    }
+    const transferId = globalThis.crypto.randomUUID();
+    try {
+      await transport.startTestTransfer({ transferId, recipientDeviceId });
+    } catch (error) {
+      throw error instanceof RuntimeError
+        ? error
+        : new RuntimeError(
+            "DIRECT_TRANSPORT_FAILED",
+            "The direct transport could not start",
+          );
+    }
+    const status: DirectTransportStatus = {
+      transferId,
+      remoteDeviceId: recipientDeviceId,
+      state: "connecting",
+      startedAt: this.now().toISOString(),
+    };
+    this.setStatus({
+      ...this.status,
+      directTransfers: [
+        status,
+        ...(this.status.directTransfers ?? []).filter(
+          (transfer) => transfer.transferId !== transferId,
+        ),
+      ].slice(0, 4),
+    });
+    return status;
+  }
+
+  async cancelDirectTestTransfer(transferId: string): Promise<void> {
+    this.clearDirectSignalValidation(transferId);
+    if (!this.dependencies.directTransport) return;
+    await this.dependencies.directTransport.cancelTransfer(
+      transferId,
+      "Cancelled by the local device",
+    );
+  }
+
+  private async receiveDirectSignal(payload: unknown): Promise<void> {
+    if (!isDirectSignalDelivery(payload) || !this.session) return;
+    if (!this.status.socket.deviceAuthenticated || !this.dependencies.directTransport) {
+      return;
+    }
+    const existing = this.directSignalValidations.get(payload.transferId);
+    if (existing) {
+      if (
+        existing.sourceDeviceId !== payload.sourceDeviceId ||
+        existing.sourceKeyVersion !== payload.sourceKeyVersion
+      ) {
+        // A transfer binding is immutable, including while its first
+        // authoritative validation is still in flight.
+        return;
+      }
+      if (existing.validation) {
+        try {
+          await existing.validation;
+        } catch {
+          return;
+        }
+        const promoted = this.directSignalValidations.get(payload.transferId);
+        if (
+          !promoted ||
+          promoted.sourceDeviceId !== payload.sourceDeviceId ||
+          promoted.sourceKeyVersion !== payload.sourceKeyVersion ||
+          promoted.validation
+        ) {
+          return;
+        }
+        await this.dependencies.directTransport.handleSignal(payload).catch(() => undefined);
+        if (payload.kind === "cancel") {
+          this.clearDirectSignalValidation(payload.transferId);
+        }
+        return;
+      } else if (
+        existing.expiresAt === undefined ||
+        existing.expiresAt <= this.now().getTime()
+      ) {
+        this.clearDirectSignalValidation(payload.transferId);
+      } else {
+        await this.dependencies.directTransport.handleSignal(payload).catch(() => undefined);
+        if (payload.kind === "cancel") {
+          this.clearDirectSignalValidation(payload.transferId);
+        }
+        return;
+      }
+    }
+
+    const localSource = await this.dependencies.trustStore.getDevice(
+      this.session.user.id,
+      payload.sourceDeviceId,
+    );
+    if (
+      !isLocallyVerified(localSource) ||
+      localSource.keyVersion !== payload.sourceKeyVersion
+    ) {
+      return;
+    }
+
+    const boundAfterLocalTrust = this.directSignalValidations.get(payload.transferId);
+    if (boundAfterLocalTrust) {
+      if (
+        boundAfterLocalTrust.sourceDeviceId !== payload.sourceDeviceId ||
+        boundAfterLocalTrust.sourceKeyVersion !== payload.sourceKeyVersion
+      ) {
+        return;
+      }
+      if (boundAfterLocalTrust.validation) {
+        try {
+          await boundAfterLocalTrust.validation;
+        } catch {
+          return;
+        }
+        const promoted = this.directSignalValidations.get(payload.transferId);
+        if (
+          !promoted ||
+          promoted.sourceDeviceId !== payload.sourceDeviceId ||
+          promoted.sourceKeyVersion !== payload.sourceKeyVersion ||
+          promoted.validation
+        ) {
+          return;
+        }
+        await this.dependencies.directTransport.handleSignal(payload).catch(() => undefined);
+        if (payload.kind === "cancel") {
+          this.clearDirectSignalValidation(payload.transferId);
+        }
+        return;
+      }
+      if (
+        boundAfterLocalTrust.expiresAt === undefined ||
+        boundAfterLocalTrust.expiresAt <= this.now().getTime()
+      ) {
+        this.clearDirectSignalValidation(payload.transferId);
+      } else {
+        await this.dependencies.directTransport.handleSignal(payload).catch(() => undefined);
+        if (payload.kind === "cancel") {
+          this.clearDirectSignalValidation(payload.transferId);
+        }
+        return;
+      }
+    }
+
+    // The first signal for a transfer (offer, answer, or pre-offer ICE) is
+    // authoritative. Ordinary subsequent ICE candidates reuse only this
+    // transfer-scoped, short-lived source binding.
+    const reservation = this.reserveDirectSignalValidation(
+      payload.transferId,
+      payload.sourceDeviceId,
+      payload.sourceKeyVersion,
+    );
+    const validation = this.requireActiveTrustedDirectSource(
+      this.session,
+      payload.sourceDeviceId,
+      payload.sourceKeyVersion,
+    );
+    reservation.validation = validation;
+    try {
+      await validation;
+    } catch {
+      if (this.directSignalValidations.get(payload.transferId) === reservation) {
+        this.clearDirectSignalValidation(payload.transferId);
+      }
+      return;
+    }
+    if (this.directSignalValidations.get(payload.transferId) !== reservation) {
+      return;
+    }
+    this.promoteDirectSignalValidation(payload.transferId, reservation);
+    await this.dependencies.directTransport.handleSignal(payload).catch(() => undefined);
+    if (payload.kind === "cancel") {
+      this.clearDirectSignalValidation(payload.transferId);
+    }
   }
 
   async handleMessage(message: unknown): Promise<RuntimeResponse> {
@@ -1201,7 +2211,7 @@ export class CopyytServiceWorkerRuntime {
             : asRuntimeError(
                 error,
                 commandFallbackErrorCode(message.command),
-                "The runtime operation failed",
+                describeFailure(error) ?? "The runtime operation failed",
               );
       this.recordOperationError(runtimeError.code, runtimeError.message);
       return {
@@ -1236,7 +2246,7 @@ export class CopyytServiceWorkerRuntime {
   }
 
   private async drainAutoObservations(first: {
-    text: string;
+    payload: ClipboardPayloadV1;
     sequence: number;
   }): Promise<void> {
     let current = first;
@@ -1250,10 +2260,11 @@ export class CopyytServiceWorkerRuntime {
       if (!this.isAutomaticSyncEligible(!authRecoveryAttempted)) return;
       try {
         this.requireSendPolicy(sendPolicyRevision);
-        await this.publishClipboardText(current.text);
+        await this.publishClipboardPayload(current.payload, current.sequence);
         this.setStatus({
           ...this.status,
           lastAutoSyncAt: this.now().toISOString(),
+          lastAutoPublishAcceptedAt: this.now().toISOString(),
           lastAutoSyncError: undefined,
         });
       } catch (error) {
@@ -1314,6 +2325,11 @@ export class CopyytServiceWorkerRuntime {
           this.pendingAutoObservation = null;
           if (pending && pending.sequence > current.sequence) {
             current = pending;
+          } else if (this.autoObservationSequence > current.sequence) {
+            // A newer observation may be image-only and therefore have no
+            // transportable payload to retain. Its sequence still cancels
+            // this older retry.
+            return;
           }
           continue;
         }
@@ -1324,6 +2340,7 @@ export class CopyytServiceWorkerRuntime {
           runtimeError.code === "SOCKET_NOT_READY" ||
           runtimeError.code === "AUTH_REQUIRED" ||
           runtimeError.code === "CLIPBOARD_SEND_DISABLED"
+          || runtimeError.code === "CLIPBOARD_CONTENT_TOO_LARGE"
         ) {
           // These are eligibility failures, not transient publish failures.
           // Never carry a newer plaintext value across them.
@@ -1339,13 +2356,106 @@ export class CopyytServiceWorkerRuntime {
     }
   }
 
-  async publishClipboardText(text: string): Promise<{ itemId: string }> {
-    const sendPolicyRevision = this.sendPolicyRevision;
-    this.requireSendPolicy(sendPolicyRevision);
+  async publishClipboardText(text: string): Promise<{ itemId: string; itemIds: string[]; projectionCount: number }> {
+    this.requireSendPolicy(this.sendPolicyRevision);
     if (!isClipboardText(text)) {
       throw new RuntimeError(
         "CLIPBOARD_READ_FAILED",
         "The clipboard adapter returned invalid text data",
+      );
+    }
+    return this.publishClipboardPayload(clipboardPayloadFromPlainText(text));
+  }
+
+  private async startDirectClipboardTransfer(input: {
+    session: RuntimeSession;
+    identity: DeviceIdentity;
+    recipient: ClientVerifiedDevice;
+    payload: ClipboardPayloadV1;
+    canonicalPlaintext: ClipboardBundleV1Bytes;
+    sendPolicyRevision: number;
+    observationSequence?: number;
+  }): Promise<string | null> {
+    const transport = this.dependencies.directTransport;
+    const transferId = globalThis.crypto.randomUUID();
+    const startStatus = (state: DirectTransportStatus, error?: string): void => {
+      this.setStatus({
+        ...this.status,
+        directTransfers: [
+          { ...state, ...(error ? { error } : {}) },
+          ...(this.status.directTransfers ?? []).filter(
+            (transfer) => transfer.transferId !== transferId,
+          ),
+        ].slice(0, 4),
+      });
+    };
+    if (!transport?.startClipboardTransfer) {
+      startStatus({
+        transferId,
+        remoteDeviceId: input.recipient.deviceId,
+        state: "failed",
+        startedAt: this.now().toISOString(),
+      }, "The direct clipboard transport is unavailable");
+      return null;
+    }
+    try {
+      const prepared: PreparedDirectClipboardTransfer = await this.prepareDirect({
+        userId: input.session.user.id,
+        identity: input.identity,
+        recipient: input.recipient,
+        payload: input.payload,
+        canonicalPlaintext: input.canonicalPlaintext,
+        transferId,
+        expiresAt: new Date(this.now().getTime() + LIVE_CLIPBOARD_TTL_MS),
+      });
+      if (
+        input.observationSequence !== undefined &&
+        this.autoObservationSequence > input.observationSequence
+      ) {
+        return null;
+      }
+      this.requireSendPolicy(input.sendPolicyRevision);
+      await transport.startClipboardTransfer({
+        transferId,
+        recipientDeviceId: input.recipient.deviceId,
+        manifest: JSON.stringify(prepared.manifest),
+        encryptedChunks: prepared.encryptedChunks,
+      });
+      startStatus({
+        transferId,
+        remoteDeviceId: input.recipient.deviceId,
+        state: "connecting",
+        byteLength: prepared.manifest.plaintextByteLength,
+        startedAt: this.now().toISOString(),
+      });
+      return transferId;
+    } catch (error) {
+      startStatus(
+        {
+          transferId,
+          remoteDeviceId: input.recipient.deviceId,
+          state: "failed",
+          startedAt: this.now().toISOString(),
+          finishedAt: this.now().toISOString(),
+        },
+        error instanceof Error ? error.message : "The direct clipboard transfer failed",
+      );
+      return null;
+    }
+  }
+
+  async publishClipboardPayload(
+    payload: ClipboardPayloadV1,
+    observationSequence?: number,
+  ): Promise<{ itemId: string; itemIds: string[]; projectionCount: number }> {
+    const sendPolicyRevision = this.sendPolicyRevision;
+    this.requireSendPolicy(sendPolicyRevision);
+    try {
+      validateClipboardPayloadV1(payload);
+    } catch {
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The clipboard payload is invalid",
       );
     }
     const session = this.requireSession();
@@ -1358,7 +2468,9 @@ export class CopyytServiceWorkerRuntime {
         "The device must be registered before publishing",
       );
     }
-    const activeServerDevices = await this.refreshServerDevices(session);
+    const activeServerDevices = (await this.refreshServerDevices(session)).filter(
+      (device) => device.trustState === "trusted",
+    );
     const localRecipients =
       await this.dependencies.trustStore.listEncryptionRecipients(
         session.user.id,
@@ -1411,36 +2523,129 @@ export class CopyytServiceWorkerRuntime {
         "No locally verified devices are available for encrypted delivery",
       );
     }
-    let envelope: ClipboardItemEnvelope;
+    const serverDeviceById = new Map(
+      activeServerDevices.map((device) => [device.deviceId, device]),
+    );
+    const wireRecipients: ClipboardWireRecipient[] = recipients.map(
+      (recipient) => ({
+        local: recipient,
+        server: serverDeviceById.get(recipient.deviceId) ?? {},
+      }),
+    );
+    let routes;
     try {
-      envelope = await this.encrypt({
-        userId: session.user.id,
-        identity,
-        plaintext: text,
-        contentType: "text/plain",
-        expiresAt: new Date(
-          this.now().getTime() + LIVE_CLIPBOARD_TTL_MS,
-        ),
-        recipients,
+      routes = selectClipboardDeliveryRoutes({
+        payload,
+        recipients: wireRecipients,
       });
-    } catch {
+      routes.direct = routes.direct.filter((direct) => {
+        const recipientIndex = wireRecipients.indexOf(direct.recipient);
+        return recipients[recipientIndex]?.deviceId !== identity.deviceId;
+      });
+    } catch (error) {
+      if (error instanceof ClipboardWirePayloadTooLargeError) {
+        throw new RuntimeError(
+          "CLIPBOARD_CONTENT_TOO_LARGE",
+          "The clipboard image is too large for the encrypted relay limit",
+        );
+      }
       throw new RuntimeError(
-        "ENCRYPTION_FAILED",
-        "Clipboard encryption failed",
+        "UNSUPPORTED_CLIPBOARD_CONTENT",
+        "This clipboard content has no compatible recipient representation",
       );
     }
-    this.requireSendPolicy(sendPolicyRevision);
-    // Record before emitting so a synchronous self-echo cannot rewrite the
-    // clipboard, and so the decision survives a worker restart.
-    await this.dependencies.outboundItemStore.mark({
-      userId: session.user.id,
-      itemId: envelope.itemId,
-      publishedAt: this.now().toISOString(),
-      sourceDeviceId: envelope.sourceDeviceId,
+    if (routes.relay.length === 0 && routes.direct.length === 0) {
+      throw new RuntimeError(
+        "UNSUPPORTED_CLIPBOARD_CONTENT",
+        routes.unsupported.length > 0 && getPngRepresentation(payload)
+          ? "No selected device can receive this oversized clipboard image"
+          : "No selected device can receive this clipboard image",
+      );
+    }
+
+    const recipientByWire = new Map<
+      ClipboardWireRecipient,
+      ClientVerifiedDevice
+    >();
+    wireRecipients.forEach((wireRecipient, index) => {
+      recipientByWire.set(wireRecipient, recipients[index]!);
     });
+    const envelopes: ClipboardItemEnvelope[] = [];
+    for (const projection of routes.relay) {
+      const projectionRecipients = projection.recipients.map((recipient) =>
+        recipientByWire.get(recipient),
+      );
+      if (projectionRecipients.some((recipient) => !recipient)) {
+        throw new RuntimeError(
+          "UNSUPPORTED_CLIPBOARD_CONTENT",
+          "Clipboard recipient projection could not be resolved",
+        );
+      }
+      try {
+        envelopes.push(
+          await this.encrypt({
+            userId: session.user.id,
+            identity,
+            plaintext: projection.wirePayload.plaintext,
+            contentType: projection.wirePayload.contentType,
+            expiresAt: new Date(
+              this.now().getTime() + LIVE_CLIPBOARD_TTL_MS,
+            ),
+            recipients: projectionRecipients as ClientVerifiedDevice[],
+          }),
+        );
+      } catch (error) {
+        if (error instanceof Error && /size limit/i.test(error.message)) {
+          throw new RuntimeError(
+            "CLIPBOARD_CONTENT_TOO_LARGE",
+            "The clipboard image is too large for the encrypted relay limit",
+          );
+        }
+        throw new RuntimeError(
+          "ENCRYPTION_FAILED",
+          "Clipboard encryption failed",
+        );
+      }
+    }
     this.requireSendPolicy(sendPolicyRevision);
-    await this.emitPublish(envelope);
-    return { itemId: envelope.itemId };
+    // Record every envelope before emitting so synchronous self-echoes cannot
+    // rewrite the clipboard and the projection decision survives a restart.
+    for (const envelope of envelopes) {
+      await this.dependencies.outboundItemStore.mark({
+        userId: session.user.id,
+        itemId: envelope.itemId,
+        publishedAt: this.now().toISOString(),
+        sourceDeviceId: envelope.sourceDeviceId,
+      });
+    }
+    this.requireSendPolicy(sendPolicyRevision);
+    for (const envelope of envelopes) await this.emitPublish(envelope);
+    const directIds: string[] = [];
+    for (const direct of routes.direct) {
+      const recipient = recipientByWire.get(direct.recipient);
+      if (!recipient || recipient.deviceId === identity.deviceId) continue;
+      const transferId = await this.startDirectClipboardTransfer({
+        session,
+        identity,
+        recipient,
+        payload: direct.payload,
+        canonicalPlaintext: direct.plaintext,
+        sendPolicyRevision,
+        observationSequence,
+      });
+      if (transferId) directIds.push(transferId);
+    }
+    if (envelopes.length === 0 && directIds.length === 0) {
+      throw new RuntimeError(
+        "DIRECT_TRANSPORT_FAILED",
+        "No direct clipboard recipient was available",
+      );
+    }
+    return {
+      itemId: envelopes[0]?.itemId ?? directIds[0]!,
+      itemIds: [...envelopes.map((envelope) => envelope.itemId), ...directIds],
+      projectionCount: envelopes.length + directIds.length,
+    };
   }
 
   async receiveClipboardItem(payload: unknown): Promise<void> {
@@ -1512,11 +2717,11 @@ export class CopyytServiceWorkerRuntime {
           "The device is not registered",
         );
       }
-      const source = await this.dependencies.trustStore.getDevice(
-        session.user.id,
+      const source = await this.locallyVerifiedSource(
+        session,
         envelope.sourceDeviceId,
       );
-      if (!isLocallyVerified(source)) {
+      if (!source) {
         throw new RuntimeError(
           "SOURCE_UNTRUSTED",
           "The clipboard source is not locally trusted",
@@ -1534,7 +2739,7 @@ export class CopyytServiceWorkerRuntime {
         });
         return;
       }
-      let decrypted: { plaintext: string; plaintextBytes: Uint8Array };
+      let decrypted: { plaintextBytes: Uint8Array };
       try {
         decrypted = await this.decrypt({
           userId: session.user.id,
@@ -1581,6 +2786,64 @@ export class CopyytServiceWorkerRuntime {
         });
         return;
       }
+      if (
+        envelope.contentType !== "text/plain" &&
+        envelope.contentType !== CLIPBOARD_BUNDLE_V1_MIME
+      ) {
+        await this.dependencies.processedItemStore.mark({
+          userId: session.user.id,
+          itemId: envelope.itemId,
+          processedAt: this.now().toISOString(),
+          sourceDeviceId: envelope.sourceDeviceId,
+          disposition: "unsupported-content",
+        });
+        return;
+      }
+      let clipboardPayload: ClipboardPayloadV1;
+      try {
+        clipboardPayload = envelope.contentType === "text/plain"
+          ? decodeClipboardPlainText(decrypted.plaintextBytes)
+          : decodeClipboardBundleV1(decrypted.plaintextBytes);
+      } catch {
+        const receiveEnabled = this.isReceivePolicyCurrent(receivePolicyRevision);
+        await this.dependencies.processedItemStore.mark({
+          userId: session.user.id,
+          itemId: envelope.itemId,
+          processedAt: this.now().toISOString(),
+          sourceDeviceId: envelope.sourceDeviceId,
+          disposition: receiveEnabled ? "invalid-content" : "receive-disabled",
+        });
+        if (receiveEnabled) {
+          this.recordSyncError(
+            "INVALID_CLIPBOARD_CONTENT",
+            "The incoming clipboard content is invalid",
+          );
+        }
+        return;
+      }
+      // HTML and PNG stay inert data until all envelope and payload checks have
+      // completed. PNG validation here is the last barrier before it can be
+      // persisted as an encrypted-envelope reference or exposed to the popup.
+      const plain = findPlainTextRepresentation(clipboardPayload);
+      const receivedPng = getPngRepresentation(clipboardPayload);
+      if (receivedPng) {
+        try {
+          getPngBytes(clipboardPayload);
+        } catch {
+          await this.dependencies.processedItemStore.mark({
+            userId: session.user.id,
+            itemId: envelope.itemId,
+            processedAt: this.now().toISOString(),
+            sourceDeviceId: envelope.sourceDeviceId,
+            disposition: "invalid-content",
+          });
+          this.recordSyncError(
+            "INVALID_CLIPBOARD_CONTENT",
+            "The incoming clipboard image is invalid",
+          );
+          return;
+        }
+      }
       if (!this.isReceivePolicyCurrent(receivePolicyRevision)) {
         await this.dependencies.processedItemStore.mark({
           userId: session.user.id,
@@ -1591,21 +2854,58 @@ export class CopyytServiceWorkerRuntime {
         });
         return;
       }
-      await this.dependencies.clipboardAdapter
-        .writeText(decrypted.plaintext)
-        .catch(() => {
-          throw new RuntimeError(
-            "CLIPBOARD_WRITE_FAILED",
-            "The operating-system clipboard could not be written",
-          );
+      if (!this.dependencies.clipboardAdapter.writePayload && !plain && !receivedPng) {
+        await this.dependencies.processedItemStore.mark({
+          userId: session.user.id,
+          itemId: envelope.itemId,
+          processedAt: this.now().toISOString(),
+          sourceDeviceId: envelope.sourceDeviceId,
+          disposition: "unsupported-content",
         });
+        this.recordSyncError(
+          "UNSUPPORTED_CLIPBOARD_CONTENT",
+          "This clipboard content cannot be applied by the current adapter",
+        );
+        return;
+      }
+      if (receivedPng) {
+        await this.pendingAssistedImageStore.put({
+          userId: session.user.id,
+          itemId: envelope.itemId,
+          sourceDeviceId: envelope.sourceDeviceId,
+          ...(source.name ? { sourceDeviceName: source.name } : {}),
+          receivedAt: this.now().toISOString(),
+          expiresAt: String(envelope.expiresAt),
+          hasPng: true,
+          envelope,
+        });
+      }
+
+      // The offscreen writer is intentionally given only the compatible text
+      // projection. An image-only item never reaches WRITE_PAYLOAD.
+      const textPayload = plain
+        ? projectClipboardPayloadToText(clipboardPayload)
+        : undefined;
+      try {
+        if (textPayload && this.dependencies.clipboardAdapter.writePayload) {
+          await this.dependencies.clipboardAdapter.writePayload(textPayload);
+        } else if (plain) {
+          await this.dependencies.clipboardAdapter.writeText(plain!.data);
+        }
+      } catch {
+        throw new RuntimeError(
+          "CLIPBOARD_WRITE_FAILED",
+          "The operating-system clipboard could not be written",
+        );
+      }
       await this.dependencies.processedItemStore.mark({
         userId: session.user.id,
         itemId: envelope.itemId,
         processedAt: this.now().toISOString(),
         sourceDeviceId: envelope.sourceDeviceId,
-        disposition: "applied",
+        disposition: receivedPng ? "pending-image" : "applied",
       });
+      if (receivedPng) await this.refreshPendingAssistedImageStatus();
     } catch (error) {
       const runtimeError = asRuntimeError(
         error,
@@ -1618,9 +2918,175 @@ export class CopyytServiceWorkerRuntime {
     }
   }
 
+  private async copyPendingImage(
+    itemId: string,
+  ): Promise<PendingAssistedImageCopyResult> {
+    if (typeof itemId !== "string" || itemId.length === 0) {
+      throw new RuntimeError(
+        "UNSUPPORTED_CLIPBOARD_CONTENT",
+        "The pending clipboard image reference is invalid",
+      );
+    }
+    const session = this.requireSession();
+    const record = await this.pendingAssistedImageStore.get(
+      session.user.id,
+      itemId,
+    );
+    if (!record) {
+      await this.refreshPendingAssistedImageStatus();
+      throw new RuntimeError(
+        "UNSUPPORTED_CLIPBOARD_CONTENT",
+        "The pending clipboard image has expired",
+      );
+    }
+    const now = this.now().getTime();
+    const expiresAt = parseStrictExpiry(record.expiresAt);
+    if (
+      expiresAt === null ||
+      now >= expiresAt ||
+      !isLiveExpiryWithinPolicy(expiresAt, now)
+    ) {
+      await this.pendingAssistedImageStore.remove(session.user.id, itemId);
+      await this.refreshPendingAssistedImageStatus();
+      throw new RuntimeError(
+        "UNSUPPORTED_CLIPBOARD_CONTENT",
+        "The pending clipboard image has expired",
+      );
+    }
+    if (!this.status.syncPreferences.receiveEnabled) {
+      throw new RuntimeError(
+        "CLIPBOARD_WRITE_FAILED",
+        "Clipboard receiving is disabled for this device",
+      );
+    }
+
+    const identity = await this.identityLoader(session.user.id);
+    if (!identity || identity.keyVersion === null) {
+      throw new RuntimeError(
+        "DEVICE_NOT_REGISTERED",
+        "The device is not registered",
+      );
+    }
+    const source = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      record.sourceDeviceId,
+    );
+    if (!isLocallyVerified(source)) {
+      await this.discardPendingImage(session.user.id, itemId);
+      throw new RuntimeError(
+        "SOURCE_UNTRUSTED",
+        "The clipboard source is not locally trusted",
+      );
+    }
+    let decrypted: { plaintextBytes: Uint8Array };
+    let decryptedPayload: ClipboardPayloadV1 | undefined;
+    try {
+      if (record.directPackage) {
+        const sourceForDirect = await this.requireActiveTrustedDirectSource(
+          session,
+          record.directPackage.manifest.sourceDeviceId,
+          record.directPackage.manifest.sourceKeyVersion,
+        );
+        const direct = await this.decryptDirect({
+          userId: session.user.id,
+          identity,
+          sourceDevice: sourceForDirect,
+          manifest: record.directPackage.manifest,
+          encryptedChunks: record.directPackage.encryptedChunks,
+          now: this.now,
+        });
+        decrypted = { plaintextBytes: direct.plaintextBytes };
+        decryptedPayload = direct.payload;
+      } else {
+        decrypted = await this.decrypt({
+          userId: session.user.id,
+          identity,
+          envelope: record.envelope,
+          trustStore: this.dependencies.trustStore,
+        });
+      }
+    } catch {
+      await this.discardPendingImage(session.user.id, itemId);
+      throw new RuntimeError(
+        "DECRYPTION_FAILED",
+        "Clipboard decryption or verification failed",
+      );
+    }
+    if (!record.directPackage && record.envelope.contentType !== CLIPBOARD_BUNDLE_V1_MIME) {
+      await this.discardPendingImage(session.user.id, itemId);
+      throw new RuntimeError(
+        "INVALID_CLIPBOARD_CONTENT",
+        "The pending clipboard image bundle is invalid",
+      );
+    }
+    let pngBytes: Uint8Array;
+    try {
+      const payload = decryptedPayload ?? decodeClipboardBundleV1(decrypted.plaintextBytes);
+      pngBytes = getPngBytes(payload);
+    } catch {
+      await this.discardPendingImage(session.user.id, itemId);
+      throw new RuntimeError(
+        "INVALID_CLIPBOARD_CONTENT",
+        "The pending clipboard image is invalid",
+      );
+    }
+
+    // Persist only a short-lived one-shot guard before returning the transient
+    // bytes. This survives a worker restart between ClipboardItem.write() and
+    // the next offscreen poll without persisting any image plaintext or
+    // assuming the OS preserves the PNG byte representation.
+    const suppressionExpiry = new Date(
+      now + ASSISTED_PNG_SUPPRESSION_TTL_MS,
+    ).toISOString();
+    await this.assistedPngSuppressionStore.put({
+      userId: session.user.id,
+      itemId,
+      expiresAt: suppressionExpiry,
+    });
+    // This is an immediate response to the explicit popup action only. Keep
+    // the runtime message JSON-safe without persisting or exposing the image
+    // through status, errors, or logs.
+    return { itemId, pngBase64: bytesToBase64(pngBytes) };
+  }
+
+  private async completePendingImage(itemId: string): Promise<void> {
+    const session = this.requireSession();
+    let rebaselineSucceeded = false;
+    try {
+      if (!this.dependencies.clipboardAdapter.rebaselineFromClipboard) {
+        throw new Error("The clipboard adapter cannot re-baseline the watcher");
+      }
+      await this.dependencies.clipboardAdapter.rebaselineFromClipboard();
+      rebaselineSucceeded = true;
+    } catch {
+      // The focused-page write already succeeded. Keep the short-lived guard
+      // so a watcher race or a failed offscreen read still consumes the next
+      // PNG observation without turning the successful copy into a failure.
+    }
+    if (rebaselineSucceeded) {
+      await this.assistedPngSuppressionStore
+        .remove(session.user.id, itemId)
+        .catch(() => undefined);
+    }
+    await this.pendingAssistedImageStore.remove(session.user.id, itemId);
+    await this.refreshPendingAssistedImageStatus();
+  }
+
+  private async discardPendingImage(userId: string, itemId: string): Promise<void> {
+    await this.pendingAssistedImageStore.remove(userId, itemId).catch(() => undefined);
+    await this.assistedPngSuppressionStore.remove(userId, itemId).catch(() => undefined);
+    await this.refreshPendingAssistedImageStatus().catch(() => undefined);
+  }
+
+  private async releasePendingImage(itemId: string): Promise<void> {
+    const session = this.requireSession();
+    await this.assistedPngSuppressionStore.remove(session.user.id, itemId);
+  }
+
   private async handleCommand(command: RuntimeCommand): Promise<unknown> {
     switch (command.type) {
       case "runtime:get-status":
+        await this.refreshPendingAssistedImageStatus().catch(() => undefined);
         if (this.session && !this.isSocketTransportReady()) {
           // Status is intentionally non-blocking. The recovery operation is
           // single-flight and continues after this response is delivered.
@@ -1658,9 +3124,13 @@ export class CopyytServiceWorkerRuntime {
             "Copyyt is still reconnecting; the device connection is not ready",
           );
         }
-        let text: string;
+        let payload: ClipboardPayloadV1;
         try {
-          text = await this.dependencies.clipboardAdapter.readText();
+          payload = this.dependencies.clipboardAdapter.readPayload
+            ? await this.dependencies.clipboardAdapter.readPayload()
+            : clipboardPayloadFromPlainText(
+                await this.dependencies.clipboardAdapter.readText(),
+              );
         } catch {
           throw new RuntimeError(
             "CLIPBOARD_READ_FAILED",
@@ -1668,7 +3138,7 @@ export class CopyytServiceWorkerRuntime {
           );
         }
         try {
-          return await this.publishClipboardText(text);
+          return await this.publishClipboardPayload(payload);
         } catch (error) {
           const runtimeError =
             error instanceof RuntimeError
@@ -1692,11 +3162,38 @@ export class CopyytServiceWorkerRuntime {
             forceSocketRecycle: true,
             waitForReady: true,
           });
-          return this.publishClipboardText(text);
+          return this.publishClipboardPayload(payload);
         }
       }
+      case "runtime:copy-pending-image":
+        return this.copyPendingImage(command.itemId);
+      case "runtime:complete-pending-image":
+        await this.completePendingImage(command.itemId);
+        return this.getStatus();
+      case "runtime:release-pending-image":
+        await this.releasePendingImage(command.itemId);
+        return this.getStatus();
       case "runtime:bootstrap-trust-anchor":
         return this.bootstrapTrustAnchor();
+      case "runtime:export-recovery-credential":
+        return this.exportRecoveryCredential();
+      case "runtime:confirm-recovery-credential-saved":
+        return this.confirmRecoveryCredentialSaved();
+      case "runtime:recover-device":
+        return this.recoverDevice(command.credential);
+      case "runtime:list-devices":
+        return this.listManagedDevices();
+      case "runtime:reset-device":
+        return this.resetRemovedDevice();
+      case "runtime:request-account-reset-code":
+        await this.dependencies
+          .apiFactory(this.requireSession().accessToken)
+          .auth.requestAccountResetCode();
+        return this.getStatus();
+      case "runtime:reset-account":
+        return this.resetAccount(command.code);
+      case "runtime:revoke-device":
+        return this.revokeAccountDevice(command.deviceId);
       case "runtime:refresh-onboarding":
         await this.refreshOnboarding();
         this.maybeConnectSocket();
@@ -1741,6 +3238,11 @@ export class CopyytServiceWorkerRuntime {
         return this.logout();
       case "runtime:test-clipboard":
         return this.testClipboard(command.marker);
+      case "runtime:start-direct-test":
+        return this.startDirectTestTransfer(command.recipientDeviceId);
+      case "runtime:cancel-direct-test":
+        await this.cancelDirectTestTransfer(command.transferId);
+        return this.getStatus();
     }
   }
 
@@ -1859,6 +3361,7 @@ export class CopyytServiceWorkerRuntime {
       this.maybeConnectSocket();
     } catch (error) {
       this.serverDeviceState = "unknown";
+      this.recoveryKeyActive = false;
       this.report(
         error,
         "DEVICE_NOT_REGISTERED",
@@ -1878,11 +3381,13 @@ export class CopyytServiceWorkerRuntime {
       await this.ensureAccountInitialized();
       await this.refreshOnboarding().catch(() => {
         this.serverDeviceState = "unknown";
+        this.recoveryKeyActive = false;
         this.setOnboarding({ state: "unknown", bootstrapEligible: false });
       });
       this.maybeConnectSocket();
     } catch (error) {
       this.serverDeviceState = "unknown";
+      this.recoveryKeyActive = false;
       this.report(
         error,
         "DEVICE_NOT_REGISTERED",
@@ -1943,6 +3448,12 @@ export class CopyytServiceWorkerRuntime {
     response: SignInResponse,
     expected?: { session: RuntimeSession; generation: number },
   ): Promise<void> {
+    if (typeof response.refreshToken !== "string" || !response.refreshToken.trim()) {
+      throw new RuntimeError(
+        "AUTH_REQUIRED",
+        "The extension sign-in response did not include a refresh credential",
+      );
+    }
     const session: RuntimeSession = {
       schemaVersion: 2,
       accessToken: response.accessToken,
@@ -1963,6 +3474,7 @@ export class CopyytServiceWorkerRuntime {
 
     if (!expected) this.sessionGeneration += 1;
     await this.enqueueSessionMutation(async () => {
+      const previousUserId = this.session?.user.id;
       if (
         expected &&
         (this.session !== expected.session ||
@@ -1980,6 +3492,10 @@ export class CopyytServiceWorkerRuntime {
       ) {
         this.destroySocket(this.socket);
       }
+      if (previousUserId && previousUserId !== session.user.id) {
+        await this.pendingAssistedImageStore.clearUser(previousUserId);
+        await this.assistedPngSuppressionStore.clearUser(previousUserId);
+      }
       await this.dependencies.sessionStore.set(session);
       // A clearSession() can invalidate a refresh while the storage write is
       // pending. The queued clear then runs after this write, leaving local
@@ -1996,6 +3512,7 @@ export class CopyytServiceWorkerRuntime {
       }
       this.session = session;
       this.serverDeviceState = "unknown";
+      this.recoveryKeyActive = false;
       this.setStatus({
         ...DEFAULT_STATUS,
         connectionState: "account-authenticated",
@@ -2060,19 +3577,28 @@ export class CopyytServiceWorkerRuntime {
   }
 
   private async clearSession(): Promise<void> {
+    const previousUserId = this.session?.user.id;
     this.sessionGeneration += 1;
     this.session = null;
     this.destroySocket(this.socket);
     this.pendingConnectivityIntent = null;
     this.serverDeviceState = "unknown";
+    this.recoveryKeyActive = false;
     this.setStatus({
       ...DEFAULT_STATUS,
       connectionState: "signed-out",
       syncPreferences: { ...this.status.syncPreferences },
     });
+    const pendingImageCleanup = previousUserId
+      ? Promise.all([
+          this.pendingAssistedImageStore.clearUser(previousUserId),
+          this.assistedPngSuppressionStore.clearUser(previousUserId),
+        ]).catch(() => undefined)
+      : Promise.resolve();
     await this.enqueueSessionMutation(() =>
       this.dependencies.sessionStore.clear(),
     );
+    await pendingImageCleanup;
     await this.ensureRecoveryAlarm();
   }
 
@@ -2118,6 +3644,253 @@ export class CopyytServiceWorkerRuntime {
     await this.updateDeviceStatus(identity);
     this.setOnboarding({ state: "complete", bootstrapEligible: false });
     return this.getStatus();
+  }
+
+  private async requireExportableRootIdentity(): Promise<DeviceIdentity> {
+    const session = this.requireSession();
+    const identity = await this.identityLoader(session.user.id);
+    if (!identity || identity.keyVersion === null) {
+      throw new RuntimeError(
+        "DEVICE_NOT_REGISTERED",
+        "Register this device before exporting its recovery credential",
+      );
+    }
+    const trust = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      identity.deviceId,
+    );
+    if (trust?.trustState !== "root") {
+      throw new RuntimeError(
+        "DEVICE_NOT_LOCALLY_TRUSTED",
+        "Only the account root device can export its recovery credential",
+      );
+    }
+    if (identity.recoveryExportedAt) {
+      throw new RuntimeError(
+        "PAIRING_FAILED",
+        "This recovery credential has already been exported",
+      );
+    }
+    if (!this.recoveryKeyActive) {
+      throw new RuntimeError(
+        "PAIRING_FAILED",
+        "The server has not confirmed this device's recovery key yet; reconnect and try again",
+      );
+    }
+    return identity;
+  }
+
+  /**
+   * Returns the credential without sealing it. A popup can close before the
+   * user copies it, so the private key is only deleted once the user confirms
+   * the offline copy via runtime:confirm-recovery-credential-saved.
+   */
+  private async exportRecoveryCredential(): Promise<RecoveryCredentialResult> {
+    const identity = await this.requireExportableRootIdentity();
+    const privateKeyPkcs8Base64 = await this.exportRecoveryKey(identity);
+    return {
+      format: "copyyt-recovery-v1",
+      rootDeviceId: identity.deviceId,
+      privateKeyPkcs8Base64,
+    };
+  }
+
+  private async confirmRecoveryCredentialSaved(): Promise<RuntimeStatus> {
+    const identity = await this.requireExportableRootIdentity();
+    await this.updateDeviceStatus(await this.sealRecoveryKey(identity));
+    return this.getStatus();
+  }
+
+  private async recoverDevice(credential: string): Promise<RuntimeStatus> {
+    const session = this.requireSession();
+    const registered = await this.recoverDeviceWithCredential(
+      this.dependencies.apiFactory(session.accessToken).devices,
+      {
+        userId: session.user.id,
+        name: "Copyyt Chrome",
+        capabilities: [...CLIPBOARD_RECEIVE_CAPABILITIES],
+        appVersion: this.dependencies.appVersion,
+        credential,
+        trustStore: this.dependencies.trustStore,
+      },
+    );
+    // The recovery endpoint has already authorized this identity. Keep the
+    // success state visible even if a follow-up device snapshot is
+    // temporarily unavailable (the durable trust transition above is atomic).
+    this.serverDeviceState = "trusted";
+    this.recoveryKeyActive = registered.recoveryKeyRotated;
+    await this.updateDeviceStatus(registered.identity);
+    // Re-register now so the server reports the active recovery key; for a
+    // recovery whose rotation failed, this signed registration retries it.
+    // A failure leaves recoveryRotationPending set; startup retries again.
+    await this.ensureAccountInitialized().catch(() => undefined);
+    this.setOnboarding({ state: "complete", bootstrapEligible: false });
+    this.maybeConnectSocket();
+    void this.refreshOnboarding().catch(() => undefined);
+    return this.getStatus();
+  }
+
+  /**
+   * Returns the locally verified source device. A device approved by the
+   * root after this device last refreshed is unknown here until its approval
+   * certificate is checked, so an unknown source triggers one trust refresh
+   * (at most every UNKNOWN_SOURCE_REFRESH_MS, since the source ID is
+   * relay-supplied) before the item is rejected.
+   */
+  private async locallyVerifiedSource(
+    session: RuntimeSession,
+    sourceDeviceId: string,
+  ): Promise<LocalDeviceRecord | null> {
+    const known = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      sourceDeviceId,
+    );
+    if (isLocallyVerified(known)) return known;
+    const now = this.now().getTime();
+    if (now - this.lastUnknownSourceRefreshAt < UNKNOWN_SOURCE_REFRESH_MS) {
+      return null;
+    }
+    this.lastUnknownSourceRefreshAt = now;
+    await this.refreshOnboarding().catch(() => undefined);
+    const refreshed = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      sourceDeviceId,
+    );
+    return isLocallyVerified(refreshed) ? refreshed : null;
+  }
+
+  /**
+   * A revoked identity can never be reactivated. Setting the device up again
+   * discards it and all local trust for the account, then registers a brand
+   * new identity, which must be paired and approved by the root like any new
+   * device.
+   */
+  private async resetRemovedDevice(): Promise<RuntimeStatus> {
+    const session = this.requireSession();
+    if (this.serverDeviceState !== "revoked") {
+      throw new RuntimeError(
+        "PAIRING_FAILED",
+        "Only a device removed from the account can be set up again",
+      );
+    }
+    return this.startWithFreshIdentity(session);
+  }
+
+  /**
+   * Account reset, confirmed with an emailed code. The server revokes every
+   * device and clears the recovery anchor; this device then starts over with
+   * a new identity and is offered first-time setup as the new root.
+   */
+  private async resetAccount(code: number): Promise<RuntimeStatus> {
+    const session = this.requireSession();
+    if (!Number.isSafeInteger(code) || code < 100000 || code > 999999) {
+      throw new RuntimeError("PAIRING_FAILED", "Enter the 6-digit code from the email");
+    }
+    await this.dependencies.apiFactory(session.accessToken).auth.resetAccount(code);
+    return this.startWithFreshIdentity(session);
+  }
+
+  /** Discards the local identity and trust for the account and registers anew. */
+  private async startWithFreshIdentity(session: RuntimeSession): Promise<RuntimeStatus> {
+    this.destroySocket(this.socket);
+    await this.dependencies.trustStore.clearAccount?.(session.user.id);
+    await this.clearIdentity(session.user.id);
+    this.serverDeviceState = "unknown";
+    this.recoveryKeyActive = false;
+    await this.ensureAccountInitialized();
+    await this.refreshOnboarding();
+    this.maybeConnectSocket();
+    return this.getStatus();
+  }
+
+  private async listManagedDevices(): Promise<ManagedDevice[]> {
+    const session = this.requireSession();
+    const identity = await this.identityLoader(session.user.id);
+    const snapshot = await this.fetchDeviceSnapshot(session);
+    const toManaged = (
+      device: RegisteredDeviceResponse,
+      state: ManagedDevice["state"],
+    ): ManagedDevice => ({
+      deviceId: device.deviceId,
+      name: device.name,
+      platform: device.platform,
+      state,
+      current: device.deviceId === identity?.deviceId,
+      root:
+        state === "trusted" &&
+        snapshot.accountRoot.state === "available" &&
+        snapshot.accountRoot.device.deviceId === device.deviceId,
+      ...(device.lastSeenAt ? { lastSeenAt: device.lastSeenAt } : {}),
+    });
+    return [
+      ...snapshot.trustedDevices.map((device) => toManaged(device, "trusted")),
+      ...snapshot.pendingDevices.map((device) => toManaged(device, "pending")),
+    ];
+  }
+
+  /**
+   * Revokes another device on the account. The backend only accepts the
+   * request with a fresh signature from a currently trusted device, so this
+   * device must be registered and locally verified.
+   */
+  private async revokeAccountDevice(deviceId: string): Promise<ManagedDevice[]> {
+    const session = this.requireSession();
+    const identity = await this.identityLoader(session.user.id);
+    if (!identity || identity.keyVersion === null) {
+      throw new RuntimeError(
+        "DEVICE_NOT_REGISTERED",
+        "Register this device before managing other devices",
+      );
+    }
+    if (deviceId === identity.deviceId) {
+      throw new RuntimeError(
+        "PAIRING_FAILED",
+        "Remove this device from another trusted device",
+      );
+    }
+    const self = await this.dependencies.trustStore.getDevice(
+      session.user.id,
+      identity.deviceId,
+    );
+    if (!isLocallyVerified(self) || this.serverDeviceState !== "trusted") {
+      throw new RuntimeError(
+        "DEVICE_NOT_LOCALLY_TRUSTED",
+        "Only a trusted device can remove other devices",
+      );
+    }
+    const snapshot = await this.fetchDeviceSnapshot(session);
+    const target = [...snapshot.trustedDevices, ...snapshot.pendingDevices].find(
+      (device) => device.deviceId === deviceId,
+    );
+    if (!target) {
+      throw new RuntimeError("PAIRING_FAILED", "That device is not on this account");
+    }
+    const timestamp = this.now().getTime();
+    const nonce = globalThis.crypto.randomUUID();
+    const signature = await signDeviceManagement({
+      userId: session.user.id,
+      identity,
+      action: "revoke",
+      targetDeviceId: target.deviceId,
+      targetKeyVersion: target.keyVersion,
+      timestamp,
+      nonce,
+    });
+    await this.dependencies.apiFactory(session.accessToken).devices.revokeDevice(
+      target.deviceId,
+      {
+        requestingDeviceId: identity.deviceId,
+        requestingKeyVersion: identity.keyVersion,
+        timestamp,
+        nonce,
+        signature,
+      },
+    );
+    // Revocation is sticky locally: the device never receives keys again,
+    // even if a stale server snapshot still lists it.
+    await this.dependencies.trustStore.revokeDevice(session.user.id, target.deviceId);
+    await this.refreshOnboarding().catch(() => undefined);
+    return this.listManagedDevices();
   }
 
   private async getBootstrapEligibility(
@@ -2185,13 +3958,12 @@ export class CopyytServiceWorkerRuntime {
       );
     }
     if (
-      localApprover.trustState !== "root" ||
-      localApprover.trustOrigin !== "initial-tofu" ||
+      !isApprovingRoot(localApprover) ||
       !identityMatchesLocalDevice(identity, localApprover)
     ) {
       throw new RuntimeError(
         "DEVICE_NOT_LOCALLY_TRUSTED",
-        "Only the initial account root can approve pairing",
+        "Only the account root can approve pairing",
       );
     }
     const snapshot = await this.fetchDeviceSnapshot(session);
@@ -2231,7 +4003,7 @@ export class CopyytServiceWorkerRuntime {
       await this.dependencies.trustStore.upsertServerReportedDevice({
         userId: session.user.id,
         ...pending,
-        capabilities: [...pending.capabilities],
+        capabilities: validClipboardCapabilities(pending.capabilities),
         trustState: pending.trustState,
       });
     if (localPending.trustState !== "unverified") {
@@ -2345,7 +4117,7 @@ export class CopyytServiceWorkerRuntime {
       await this.dependencies.trustStore.upsertServerReportedDevice({
         userId: session.user.id,
         ...current,
-        capabilities: [...current.capabilities],
+        capabilities: validClipboardCapabilities(current.capabilities),
         trustState: current.trustState,
       });
     if (
@@ -2361,7 +4133,7 @@ export class CopyytServiceWorkerRuntime {
       await this.dependencies.trustStore.upsertServerReportedDevice({
         userId: session.user.id,
         ...serverApprover,
-        capabilities: [...serverApprover.capabilities],
+        capabilities: validClipboardCapabilities(serverApprover.capabilities),
         trustState: "trusted",
       });
     if (localApprover.trustState !== "unverified") {
@@ -2439,7 +4211,7 @@ export class CopyytServiceWorkerRuntime {
       await this.dependencies.trustStore.upsertServerReportedDevice({
         userId: session.user.id,
         ...serverDevice,
-        capabilities: [...serverDevice.capabilities],
+        capabilities: validClipboardCapabilities(serverDevice.capabilities),
         trustState: serverDevice.trustState,
       });
     }
@@ -2555,7 +4327,7 @@ export class CopyytServiceWorkerRuntime {
       await this.dependencies.trustStore.upsertServerReportedDevice({
         userId: session.user.id,
         ...device,
-        capabilities: [...device.capabilities],
+        capabilities: validClipboardCapabilities(device.capabilities),
         trustState: device.trustState,
       });
     }
@@ -2651,6 +4423,7 @@ export class CopyytServiceWorkerRuntime {
       this.serverDeviceState = "revoked";
       this.destroySocket(this.socket);
       this.setAccountAuthenticatedWithoutSocket();
+      await this.updateDeviceStatus(identity);
       this.setOnboarding({ state: "unknown", bootstrapEligible: false });
       return;
     }
@@ -2695,6 +4468,9 @@ export class CopyytServiceWorkerRuntime {
           state: "pairing-required",
           bootstrapEligible: false,
           error: { code: error.code, message: error.message },
+          // The root was removed: this trusted device can take over as root
+          // with the offline recovery credential.
+          ...(accountRoot.state === "missing" ? { rootMissing: true } : {}),
         });
         return;
       }
@@ -2703,8 +4479,7 @@ export class CopyytServiceWorkerRuntime {
         return;
       }
       if (
-        localCurrent.trustState !== "root" ||
-        localCurrent.trustOrigin !== "initial-tofu" ||
+        !isApprovingRoot(localCurrent) ||
         accountRoot.device.deviceId !== identity.deviceId
       ) {
         this.setOnboarding({
@@ -2716,7 +4491,7 @@ export class CopyytServiceWorkerRuntime {
       await this.dependencies.trustStore.upsertServerReportedDevice({
         userId: session.user.id,
         ...pending,
-        capabilities: [...pending.capabilities],
+        capabilities: validClipboardCapabilities(pending.capabilities),
         trustState: pending.trustState,
       });
       const fingerprint = await this.pairingFingerprintFor(identity, pending);
@@ -2754,7 +4529,7 @@ export class CopyytServiceWorkerRuntime {
     await this.dependencies.trustStore.upsertServerReportedDevice({
       userId: session.user.id,
       ...approver,
-      capabilities: [...approver.capabilities],
+      capabilities: validClipboardCapabilities(approver.capabilities),
       trustState: approver.trustState,
     });
     const localApprover = await this.dependencies.trustStore.getDevice(
@@ -2858,12 +4633,13 @@ export class CopyytServiceWorkerRuntime {
           {
             userId: session.user.id,
             name: "Copyyt Chrome",
-            capabilities: ["clipboard"],
+            capabilities: [...CLIPBOARD_RECEIVE_CAPABILITIES],
             appVersion: this.dependencies.appVersion,
             trustStore: this.dependencies.trustStore,
           },
         );
         identity = registered.identity;
+        this.recoveryKeyActive = registered.device.recoveryKeyActive === true;
         this.serverDeviceState =
           registered.device.trustState === "trusted"
             ? "trusted"
@@ -2912,6 +4688,19 @@ export class CopyytServiceWorkerRuntime {
         registration:
           identity.keyVersion === null ? "not-registered" : "registered",
         trustState: trust?.trustState ?? "unverified",
+        recoveryAvailable:
+          this.recoveryKeyActive &&
+          typeof identity.recoveryPublicKeyBase64 === "string" &&
+          identity.recoveryPublicKeyBase64.length > 0,
+        ...(this.serverDeviceState === "revoked" ? { removed: true } : {}),
+        // A root whose recovery key the server has not confirmed (e.g. a
+        // recovery whose key rotation failed). Registration retries it.
+        ...(trust?.trustState === "root" && !this.recoveryKeyActive
+          ? { recoveryRotationPending: true }
+          : {}),
+        ...(identity.recoveryExportedAt
+          ? { recoveryExportedAt: identity.recoveryExportedAt }
+          : {}),
       },
       syncReady:
         this.serverDeviceState === "trusted" &&
@@ -3135,6 +4924,10 @@ export class CopyytServiceWorkerRuntime {
       if (this.socket !== socket) return;
       void this.receiveClipboardItem(payload);
     };
+    const onDirectSignal = (payload: unknown): void => {
+      if (this.socket !== socket) return;
+      void this.receiveDirectSignal(payload);
+    };
 
     this.attachSocketListeners(socket, [
       ["connect", onConnect],
@@ -3144,6 +4937,7 @@ export class CopyytServiceWorkerRuntime {
       ["auth:ready", onReady],
       ["auth:failure", onAuthFailure],
       ["clipboard:item", onClipboardItem],
+      ["direct:signal", onDirectSignal],
     ]);
     socket.connect();
   }
@@ -3266,6 +5060,18 @@ export class CopyytServiceWorkerRuntime {
     const isCurrent = this.socket === socket;
     this.detachSocketListeners(socket);
     if (isCurrent) {
+      this.clearAllDirectSignalValidations();
+      const hasActiveDirectTransfer = (this.status.directTransfers ?? []).some(
+        (transfer) =>
+          transfer.state !== "succeeded" &&
+          transfer.state !== "failed" &&
+          transfer.state !== "cancelled",
+      );
+      if (hasActiveDirectTransfer && this.dependencies.directTransport) {
+        void this.dependencies.directTransport
+          .cancelAll("Copyyt socket is unavailable")
+          .catch(() => undefined);
+      }
       this.socket = null;
       this.socketAccountId = null;
       this.socketReady = false;
@@ -3328,6 +5134,8 @@ export class CopyytServiceWorkerRuntime {
   private async refreshServerDevices(
     session: RuntimeSession,
   ): Promise<RegisteredDeviceResponse[]> {
+    // A full trust refresh is an invalidation boundary for signaling bindings.
+    this.clearAllDirectSignalValidations();
     const snapshot = await this.fetchDeviceSnapshot(session);
     const devices = [...snapshot.trustedDevices, ...snapshot.pendingDevices];
     for (const device of devices) {
@@ -3339,13 +5147,24 @@ export class CopyytServiceWorkerRuntime {
         signingPublicKey: device.signingPublicKey,
         name: device.name,
         platform: device.platform,
-        capabilities: [...device.capabilities],
+        capabilities: validClipboardCapabilities(device.capabilities),
         appVersion: device.appVersion,
         trustState: device.trustState,
       });
     }
     const identity = await this.identityLoader(session.user.id);
     if (identity) {
+      this.setStatus({
+        ...this.status,
+        directTargets: snapshot.trustedDevices
+          .filter((device) => device.deviceId !== identity.deviceId)
+          .map((device) => ({
+            deviceId: device.deviceId,
+            name: device.name,
+            platform: device.platform,
+            keyVersion: device.keyVersion,
+          })),
+      });
       const currentPending = snapshot.pendingDevices.find(
         (device) => device.deviceId === identity.deviceId,
       );
@@ -3372,6 +5191,11 @@ export class CopyytServiceWorkerRuntime {
         });
       }
       if (this.serverDeviceState !== "trusted") {
+        await this.pendingAssistedImageStore.clearUser(session.user.id).catch(() => undefined);
+        await this.assistedPngSuppressionStore.clearUser(session.user.id).catch(() => undefined);
+        if ((this.status.pendingAssistedImages?.length ?? 0) > 0) {
+          this.setStatus({ ...this.status, pendingAssistedImages: [] });
+        }
         this.destroySocket(this.socket);
         this.setAccountAuthenticatedWithoutSocket();
       }
@@ -3415,6 +5239,49 @@ export class CopyytServiceWorkerRuntime {
           new RuntimeError(
             "SOCKET_PUBLISH_FAILED",
             "The clipboard publish failed",
+          ),
+        );
+      }
+    });
+  }
+
+  private async emitDirectSignal(signal: DirectSignalRequest): Promise<void> {
+    this.requireSocketReady();
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(
+          new RuntimeError(
+            "DIRECT_TRANSPORT_FAILED",
+            "The direct signalling acknowledgement timed out",
+          ),
+        );
+      }, 10_000);
+      const finish = (ack: unknown): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (isDirectAcknowledgement(ack, signal.transferId)) {
+          resolve();
+        } else {
+          reject(
+            new RuntimeError(
+              "DIRECT_TRANSPORT_FAILED",
+              "The server rejected the direct signal",
+            ),
+          );
+        }
+      };
+      try {
+        this.socket!.emit("direct:signal", signal, finish);
+      } catch {
+        clearTimeout(timer);
+        reject(
+          new RuntimeError(
+            "DIRECT_TRANSPORT_FAILED",
+            "The direct signal could not be sent",
           ),
         );
       }
@@ -3564,6 +5431,8 @@ export class CopyytServiceWorkerRuntime {
     if (
       code === "CLIPBOARD_READ_FAILED" ||
       code === "CLIPBOARD_WRITE_FAILED" ||
+      code === "UNSUPPORTED_CLIPBOARD_CONTENT" ||
+      code === "INVALID_CLIPBOARD_CONTENT" ||
       code === "NO_VERIFIED_RECIPIENTS" ||
       code === "ENCRYPTION_FAILED" ||
       code === "DECRYPTION_FAILED" ||
@@ -3573,6 +5442,7 @@ export class CopyytServiceWorkerRuntime {
       code === "DEVICE_NOT_LOCALLY_TRUSTED" ||
       code === "DEVICE_NOT_REGISTERED" ||
       code === "CLIPBOARD_SEND_DISABLED" ||
+      code === "CLIPBOARD_CONTENT_TOO_LARGE" ||
       code === "SYNC_PREFERENCES_INVALID"
     ) {
       this.recordSyncError(code, message);

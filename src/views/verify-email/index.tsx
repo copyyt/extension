@@ -38,17 +38,18 @@ const VerifyEmail = () => {
   useViewLoader([verifyEmail.isPending, resendEmailOtp.isPending]);
 
   return (
-    <div className="w-full items-center justify-center bg-white">
-      <div className="font-sora flex items-center gap-2 font-bold">
+    <div className="w-full bg-surface">
+      <div className="font-sora flex items-center gap-2 text-lg font-bold text-ink">
         <Logo /> Copyyt
       </div>
 
-      <p className="font-sora mt-6 text-center text-sm font-medium">
-        Check your email for a code
-      </p>
+      <h1 className="font-sora mt-8 text-2xl font-bold text-ink">
+        Check your email
+      </h1>
 
-      <p className="font-work mt-3 text-center text-[#4B5563]">
-        We've sent a 6-digit OTP to {email}. The code expires after 10mins.{" "}
+      <p className="font-work mt-2 text-sm leading-6 text-muted">
+        We sent a 6-digit code to <span className="font-semibold text-ink">{email}</span>.
+        It expires in 10 minutes.
       </p>
 
       <form onSubmit={handleSubmit} className="space-y-3 pt-3">
@@ -69,14 +70,14 @@ const VerifyEmail = () => {
         ) : null}
 
         <Button
-          className="mt-3 mb-0 w-full rounded-xl !py-4 !text-lg !font-medium"
+          className="mt-3 mb-0 w-full rounded-xl !py-3 !text-base !font-semibold"
           disabled={data.code.includes("") || (isNew && !data.name)}
         >
           Continue
         </Button>
 
-        <p className="font-work mt-6 text-center">
-          Didn't get code?{" "}
+        <p className="font-work mt-6 text-center text-sm text-muted">
+          Didn't get the code?{" "}
           <button
             type="button"
             onClick={() => {

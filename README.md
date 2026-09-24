@@ -1,5 +1,7 @@
 # Copyyt Chrome extension
 
+The extension shares the Android [Copyyt color palette](docs/color-palette.md): Warm Paper in light mode and Harbor Dark in dark mode.
+
 ## Product status
 
 - Copyyt Chrome extension: active primary client.
@@ -77,6 +79,7 @@ yarn build
 yarn build:extension
 yarn build:store
 yarn lint
+yarn test:palette
 yarn test:crypto
 yarn test:runtime
 yarn test:chrome

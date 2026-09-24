@@ -8,6 +8,10 @@ import { isAxiosError } from "axios";
 import { APP_TYPE } from "@/utils/constants";
 import { sendRuntimeCommand } from "@/runtime/client";
 import type { AuthenticatedRuntimeResult } from "@/runtime/messages";
+import {
+  clearWebAccessToken,
+  setWebAccessToken,
+} from "./web-session";
 
 function authErrorMessage(error: unknown, fallback: string): string {
   if (isAxiosError(error)) {
@@ -36,6 +40,14 @@ async function runtimeAuth(
   return sendRuntimeCommand<AuthenticatedRuntimeResult>(command);
 }
 
+function saveWebAccessToken(data: unknown): void {
+  if (APP_TYPE === "extension" || !data || typeof data !== "object") return;
+  const accessToken = (data as { accessToken?: unknown }).accessToken;
+  if (typeof accessToken === "string" && accessToken.trim()) {
+    setWebAccessToken(accessToken);
+  }
+}
+
 export function useGoogleSignIn() {
   const Api = useAxios();
   const { setUser } = useUserStore();
@@ -51,9 +63,7 @@ export function useGoogleSignIn() {
       return response.data;
     },
     onSuccess: (data) => {
-      if (APP_TYPE !== "extension" && "accessToken" in data && typeof data.accessToken === "string") {
-        localStorage.setItem("accessToken", data.accessToken);
-      }
+      saveWebAccessToken(data);
       setUser(data.user);
       setCurrentView("home");
     },
@@ -80,9 +90,7 @@ export function useRefreshTokens() {
       return response.data;
     },
     onSuccess: (data) => {
-      if (APP_TYPE !== "extension" && "accessToken" in data && typeof data.accessToken === "string") {
-        localStorage.setItem("accessToken", data.accessToken);
-      }
+      saveWebAccessToken(data);
       setUser(data.user);
     },
     onError: (error) => {
@@ -132,9 +140,7 @@ export function useVerifyEmail() {
       return response.data;
     },
     onSuccess: (data) => {
-      if (APP_TYPE !== "extension" && "accessToken" in data && typeof data.accessToken === "string") {
-        localStorage.setItem("accessToken", data.accessToken);
-      }
+      saveWebAccessToken(data);
       setUser(data.user);
       setCurrentView("home");
     },
@@ -198,6 +204,9 @@ export function useLogout() {
   });
   const logout = () => {
     clearUser();
+    if (APP_TYPE !== "extension") {
+      clearWebAccessToken();
+    }
     mutate();
     setCurrentView("sign-in");
   };

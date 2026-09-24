@@ -2,7 +2,13 @@ import { io, type Socket } from "socket.io-client";
 import { IndexedDBTrustStore } from "./crypto/trust-store.ts";
 import { createRuntimeApi } from "./runtime/api.ts";
 import { OffscreenClipboardAdapter } from "./runtime/clipboard-adapter.ts";
-import { IndexedDBOutboundItemStore, IndexedDBProcessedItemStore } from "./runtime/runtime-db.ts";
+import { OffscreenDirectTransport } from "./runtime/direct-transport.ts";
+import {
+  IndexedDBAssistedPngSuppressionStore,
+  IndexedDBOutboundItemStore,
+  IndexedDBPendingAssistedImageStore,
+  IndexedDBProcessedItemStore,
+} from "./runtime/runtime-db.ts";
 import {
   ChromeSessionStore,
   ChromeStatusStore,
@@ -29,13 +35,16 @@ function socketFactory(url: string, options: SocketOptions): SocketLike {
 
 const runtime = new CopyytServiceWorkerRuntime({
   socketUrl: SOCKET_URL,
-  appVersion: "2.0.1",
+  appVersion: "3.0.0",
   sessionStore: new ChromeSessionStore(),
   statusStore: new ChromeStatusStore(),
   trustStore: new IndexedDBTrustStore(),
   clipboardAdapter: new OffscreenClipboardAdapter(),
+  directTransport: new OffscreenDirectTransport(),
   processedItemStore: new IndexedDBProcessedItemStore(),
   outboundItemStore: new IndexedDBOutboundItemStore(),
+  pendingAssistedImageStore: new IndexedDBPendingAssistedImageStore(),
+  assistedPngSuppressionStore: new IndexedDBAssistedPngSuppressionStore(),
   syncPreferencesStore: new ChromeSyncPreferencesStore(),
   apiFactory: createRuntimeApi,
   socketFactory,

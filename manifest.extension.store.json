@@ -1,7 +1,7 @@
 {
     "name": "Copyyt",
     "description": "Securely sync copied text across your trusted devices with end-to-end encryption.",
-    "version": "2.0.1",
+    "version": "3.0.0",
     "manifest_version": 3,
     "minimum_chrome_version": "137",
     "background": {
@@ -35,6 +35,6 @@
         "alarms"
     ],
     "host_permissions": [
-        "https://api.copyyt.psami.com/*"
+        "https://api.copyyt.com/*"
     ]
 }

@@ -14,6 +14,13 @@ export class DeviceIdentityCorruptError extends Error {
   }
 }
 
+export class RecoveryCredentialSealedError extends Error {
+  constructor() {
+    super("The recovery credential was already exported and removed from this device");
+    this.name = "RecoveryCredentialSealedError";
+  }
+}
+
 export class DeviceIdentityNotFoundError extends Error {
   constructor() {
     super("No local device identity exists");
@@ -37,6 +44,9 @@ export interface DeviceIdentity {
   readonly signingPublicKeyBase64: string;
   readonly encryptionPublicKey: Uint8Array;
   readonly encryptionPublicKeyBase64: string;
+  /** Public half of the one-time offline recovery credential. */
+  readonly recoveryPublicKeyBase64: string;
+  readonly recoveryExportedAt: string | null;
   readonly registration: DeviceRegistrationMetadata | null;
 }
 
@@ -50,17 +60,53 @@ export interface StoredIdentityRecord {
   signingPublicKey: CryptoKey;
   encryptionPrivateKey: CryptoKey;
   encryptionPublicKey: CryptoKey;
+  /**
+   * Recovery signing key is extractable only for explicit user export. Once
+   * the user confirms the offline copy is saved, it is deleted and only the
+   * public half plus `recoveryExportedAt` remain.
+   */
+  recoveryPrivateKey?: CryptoKey;
+  recoveryPublicKey?: CryptoKey;
+  recoveryPublicKeyBase64?: string;
+  recoveryExportedAt?: string;
   registration: DeviceRegistrationMetadata | null;
 }
 
 export interface PrivateKeyHandles {
   signingPrivateKey: CryptoKey;
   encryptionPrivateKey: CryptoKey;
+  /** Absent after the recovery credential has been exported and sealed. */
+  recoveryPrivateKey?: CryptoKey;
+}
+
+export interface RecoveryKeyPair {
+  privateKey: CryptoKey;
+  publicKey: CryptoKey;
+  publicKeyBase64: string;
 }
 
 const privateKeyHandles = new WeakMap<DeviceIdentity, PrivateKeyHandles>();
 const activeIdentities = new Set<DeviceIdentity>();
 const creationPromises = new Map<string, Promise<DeviceIdentity>>();
+
+export async function generateRecoveryKeyPair(): Promise<RecoveryKeyPair> {
+  const pair = (await globalThis.crypto.subtle.generateKey(
+    { name: "Ed25519" },
+    true,
+    ["sign", "verify"],
+  )) as CryptoKeyPair;
+  const publicKey = new Uint8Array(
+    await globalThis.crypto.subtle.exportKey("raw", pair.publicKey),
+  );
+  if (publicKey.length !== 32) {
+    throw new DeviceIdentityCorruptError();
+  }
+  return {
+    privateKey: pair.privateKey,
+    publicKey: pair.publicKey,
+    publicKeyBase64: bytesToBase64(publicKey),
+  };
+}
 
 function assertUserId(userId: string): void {
   if (typeof userId !== "string" || userId.length === 0) {
@@ -111,6 +157,90 @@ async function addRecord(
     transaction.onabort = () => {
       closeDatabase(database);
       reject(transaction.error ?? request.error ?? new Error("Unable to create device identity"));
+    };
+  });
+}
+
+/**
+ * A record is complete when it holds the recovery public key and either the
+ * private key (not yet exported) or an export timestamp (sealed). A sealed
+ * record must never get a fresh pair: the server still holds its public key.
+ */
+function hasCompleteRecoveryMaterial(record: StoredIdentityRecord): boolean {
+  return Boolean(
+    record.recoveryPublicKey &&
+      record.recoveryPublicKeyBase64 &&
+      (record.recoveryPrivateKey || record.recoveryExportedAt),
+  );
+}
+
+async function ensureRecoveryMaterial(
+  userId: string,
+  record: StoredIdentityRecord,
+): Promise<StoredIdentityRecord> {
+  if (hasCompleteRecoveryMaterial(record)) {
+    return record;
+  }
+  const recoveryPair = (await globalThis.crypto.subtle.generateKey(
+    { name: "Ed25519" },
+    true,
+    ["sign", "verify"],
+  )) as CryptoKeyPair;
+  const recoveryPublicKey = new Uint8Array(
+    await globalThis.crypto.subtle.exportKey("raw", recoveryPair.publicKey),
+  );
+  if (recoveryPublicKey.length !== 32) {
+    throw new DeviceIdentityCorruptError();
+  }
+  const database = await openCryptoDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(IDENTITY_STORE, "readwrite");
+    const store = transaction.objectStore(IDENTITY_STORE);
+    const request = store.get(userId);
+    let nextRecord: StoredIdentityRecord | undefined;
+    let failure: unknown;
+    request.onerror = () => {
+      failure = request.error ?? new DeviceIdentityCorruptError();
+      transaction.abort();
+    };
+    request.onsuccess = () => {
+      const current = request.result as StoredIdentityRecord | undefined;
+      if (
+        !current ||
+        !isValidStoredIdentityRecord(current) ||
+        current.userId !== userId
+      ) {
+        failure = new DeviceIdentityCorruptError();
+        transaction.abort();
+        return;
+      }
+      if (hasCompleteRecoveryMaterial(current)) {
+        nextRecord = current;
+        return;
+      }
+      nextRecord = {
+        ...current,
+        recoveryPrivateKey: recoveryPair.privateKey,
+        recoveryPublicKey: recoveryPair.publicKey,
+        recoveryPublicKeyBase64: bytesToBase64(recoveryPublicKey),
+      };
+      store.put(nextRecord, userId);
+    };
+    transaction.oncomplete = () => {
+      closeDatabase(database);
+      if (failure || !nextRecord) {
+        reject(failure ?? new DeviceIdentityCorruptError());
+      } else {
+        resolve(nextRecord);
+      }
+    };
+    transaction.onerror = () => {
+      closeDatabase(database);
+      reject(failure ?? transaction.error ?? new DeviceIdentityCorruptError());
+    };
+    transaction.onabort = () => {
+      closeDatabase(database);
+      reject(failure ?? transaction.error ?? new DeviceIdentityCorruptError());
     };
   });
 }
@@ -175,12 +305,40 @@ function isPublicKey(
   );
 }
 
+function isRecoveryPrivateKey(key: unknown): key is CryptoKey {
+  if (!key || typeof key !== "object") return false;
+  const candidate = key as CryptoKey;
+  return (
+    candidate.type === "private" &&
+    candidate.algorithm.name === "Ed25519" &&
+    candidate.extractable &&
+    hasUsage(candidate, "sign")
+  );
+}
+
 export function isValidStoredIdentityRecord(record: unknown): record is StoredIdentityRecord {
   if (!record || typeof record !== "object") {
     return false;
   }
   const candidate = record as Partial<StoredIdentityRecord>;
   const registration = candidate.registration;
+  const hasNoRecoveryMaterial =
+    candidate.recoveryPrivateKey === undefined &&
+    candidate.recoveryPublicKey === undefined &&
+    candidate.recoveryPublicKeyBase64 === undefined &&
+    candidate.recoveryExportedAt === undefined;
+  const hasRecoveryPublicMaterial =
+    isPublicKey(candidate.recoveryPublicKey, "Ed25519", "verify") &&
+    isCanonicalBase64Bytes(candidate.recoveryPublicKeyBase64, 32);
+  const hasRecoveryMaterial =
+    hasRecoveryPublicMaterial &&
+    isRecoveryPrivateKey(candidate.recoveryPrivateKey) &&
+    (candidate.recoveryExportedAt === undefined ||
+      typeof candidate.recoveryExportedAt === "string");
+  const hasSealedRecoveryMaterial =
+    hasRecoveryPublicMaterial &&
+    candidate.recoveryPrivateKey === undefined &&
+    typeof candidate.recoveryExportedAt === "string";
   const validRegistration =
     registration === null ||
     (typeof registration === "object" &&
@@ -203,18 +361,39 @@ export function isValidStoredIdentityRecord(record: unknown): record is StoredId
     isPublicKey(candidate.signingPublicKey, "Ed25519", "verify") &&
     isKey(candidate.encryptionPrivateKey, "private", "X25519", "deriveBits") &&
     isPublicKey(candidate.encryptionPublicKey, "X25519") &&
+    (hasNoRecoveryMaterial || hasRecoveryMaterial || hasSealedRecoveryMaterial) &&
     validRegistration
   );
 }
 
 async function identityFromRecord(record: StoredIdentityRecord): Promise<DeviceIdentity> {
+  if (
+    !record.recoveryPublicKey ||
+    !record.recoveryPublicKeyBase64 ||
+    (record.recoveryPrivateKey === undefined
+      ? typeof record.recoveryExportedAt !== "string"
+      : !isRecoveryPrivateKey(record.recoveryPrivateKey)) ||
+    !isPublicKey(record.recoveryPublicKey, "Ed25519", "verify") ||
+    !isCanonicalBase64Bytes(record.recoveryPublicKeyBase64, 32)
+  ) {
+    throw new DeviceIdentityCorruptError();
+  }
   const signingPublicKey = new Uint8Array(
     await globalThis.crypto.subtle.exportKey("raw", record.signingPublicKey),
   );
   const encryptionPublicKey = new Uint8Array(
     await globalThis.crypto.subtle.exportKey("raw", record.encryptionPublicKey),
   );
+  const recoveryPublicKey = new Uint8Array(
+    await globalThis.crypto.subtle.exportKey("raw", record.recoveryPublicKey),
+  );
   if (signingPublicKey.length !== 32 || encryptionPublicKey.length !== 32) {
+    throw new DeviceIdentityCorruptError();
+  }
+  if (
+    recoveryPublicKey.length !== 32 ||
+    record.recoveryPublicKeyBase64 !== bytesToBase64(recoveryPublicKey)
+  ) {
     throw new DeviceIdentityCorruptError();
   }
   if (
@@ -232,6 +411,8 @@ async function identityFromRecord(record: StoredIdentityRecord): Promise<DeviceI
     signingPublicKeyBase64: bytesToBase64(signingPublicKey),
     encryptionPublicKey,
     encryptionPublicKeyBase64: bytesToBase64(encryptionPublicKey),
+    recoveryPublicKeyBase64: bytesToBase64(recoveryPublicKey),
+    recoveryExportedAt: record.recoveryExportedAt ?? null,
     registration: record.registration
       ? { ...record.registration, capabilities: [...record.registration.capabilities] }
       : null,
@@ -239,6 +420,9 @@ async function identityFromRecord(record: StoredIdentityRecord): Promise<DeviceI
   privateKeyHandles.set(identity, {
     signingPrivateKey: record.signingPrivateKey,
     encryptionPrivateKey: record.encryptionPrivateKey,
+    ...(record.recoveryPrivateKey
+      ? { recoveryPrivateKey: record.recoveryPrivateKey }
+      : {}),
   });
   activeIdentities.add(identity);
   return identity;
@@ -255,13 +439,25 @@ async function createRecord(userId: string): Promise<StoredIdentityRecord> {
     false,
     ["deriveBits"],
   )) as CryptoKeyPair;
+  const recoveryPair = (await globalThis.crypto.subtle.generateKey(
+    { name: "Ed25519" },
+    true,
+    ["sign", "verify"],
+  )) as CryptoKeyPair;
   const signingPublicKey = new Uint8Array(
     await globalThis.crypto.subtle.exportKey("raw", signingPair.publicKey),
   );
   const encryptionPublicKey = new Uint8Array(
     await globalThis.crypto.subtle.exportKey("raw", encryptionPair.publicKey),
   );
-  if (signingPublicKey.length !== 32 || encryptionPublicKey.length !== 32) {
+  const recoveryPublicKey = new Uint8Array(
+    await globalThis.crypto.subtle.exportKey("raw", recoveryPair.publicKey),
+  );
+  if (
+    signingPublicKey.length !== 32 ||
+    encryptionPublicKey.length !== 32 ||
+    recoveryPublicKey.length !== 32
+  ) {
     throw new Error("WebCrypto returned an unexpected public-key length");
   }
 
@@ -275,6 +471,9 @@ async function createRecord(userId: string): Promise<StoredIdentityRecord> {
     signingPublicKey: signingPair.publicKey,
     encryptionPrivateKey: encryptionPair.privateKey,
     encryptionPublicKey: encryptionPair.publicKey,
+    recoveryPrivateKey: recoveryPair.privateKey,
+    recoveryPublicKey: recoveryPair.publicKey,
+    recoveryPublicKeyBase64: bytesToBase64(recoveryPublicKey),
     registration: null,
   };
 }
@@ -288,9 +487,10 @@ export async function getDeviceIdentity(userId: string): Promise<DeviceIdentity 
     throw new DeviceIdentityCorruptError();
   }
   try {
-    return await identityFromRecord(record);
-  } catch {
-    throw new DeviceIdentityCorruptError();
+    return await identityFromRecord(await ensureRecoveryMaterial(userId, record));
+  } catch (error) {
+    if (error instanceof DeviceIdentityCorruptError) throw error;
+    throw error;
   }
 }
 
@@ -382,6 +582,10 @@ export async function persistDeviceRegistrationMetadata(
         signingPublicKey: current.signingPublicKey,
         encryptionPrivateKey: current.encryptionPrivateKey,
         encryptionPublicKey: current.encryptionPublicKey,
+        recoveryPrivateKey: current.recoveryPrivateKey,
+        recoveryPublicKey: current.recoveryPublicKey,
+        recoveryPublicKeyBase64: current.recoveryPublicKeyBase64,
+        recoveryExportedAt: current.recoveryExportedAt,
         registration: {
           ...registration,
           capabilities: [...registration.capabilities],
@@ -420,6 +624,133 @@ export async function clearDeviceIdentity(userId: string): Promise<void> {
   await deleteRecord(userId);
 }
 
+/** Export only through an explicit trusted-context user action. */
+export async function exportRecoveryPrivateKey(identity: DeviceIdentity): Promise<string> {
+  const handles = getPrivateKeyHandles(identity);
+  if (!handles.recoveryPrivateKey) {
+    throw new RecoveryCredentialSealedError();
+  }
+  const bytes = new Uint8Array(
+    await globalThis.crypto.subtle.exportKey("pkcs8", handles.recoveryPrivateKey),
+  );
+  return bytesToBase64(bytes);
+}
+
+/**
+ * Records that the user saved the offline credential and deletes the local
+ * private key, so the device no longer holds a way to re-export it.
+ */
+export async function sealRecoveryCredential(
+  identity: DeviceIdentity,
+  exportedAt = new Date().toISOString(),
+): Promise<DeviceIdentity> {
+  if (Number.isNaN(Date.parse(exportedAt))) {
+    throw new TypeError("The recovery export timestamp must be valid");
+  }
+  const database = await openCryptoDatabase();
+  const updated = await new Promise<StoredIdentityRecord>((resolve, reject) => {
+    const transaction = database.transaction(IDENTITY_STORE, "readwrite");
+    const store = transaction.objectStore(IDENTITY_STORE);
+    const request = store.get(identity.userId);
+    let nextRecord: StoredIdentityRecord | undefined;
+    let failure: unknown;
+    request.onerror = () => {
+      failure = request.error ?? new DeviceIdentityCorruptError();
+      transaction.abort();
+    };
+    request.onsuccess = () => {
+      const current = request.result as StoredIdentityRecord | undefined;
+      if (
+        !current ||
+        !isValidStoredIdentityRecord(current) ||
+        current.userId !== identity.userId ||
+        current.deviceId !== identity.deviceId ||
+        !current.recoveryPrivateKey ||
+        !current.recoveryPublicKey ||
+        !current.recoveryPublicKeyBase64
+      ) {
+        failure = new DeviceIdentityCorruptError();
+        transaction.abort();
+        return;
+      }
+      const { recoveryPrivateKey: _deleted, ...rest } = current;
+      void _deleted;
+      nextRecord = { ...rest, recoveryExportedAt: exportedAt };
+      store.put(nextRecord, identity.userId);
+    };
+    transaction.oncomplete = () => {
+      closeDatabase(database);
+      if (failure || !nextRecord) reject(failure ?? new DeviceIdentityCorruptError());
+      else resolve(nextRecord);
+    };
+    transaction.onerror = () => {
+      closeDatabase(database);
+      reject(failure ?? transaction.error ?? new DeviceIdentityCorruptError());
+    };
+    transaction.onabort = () => {
+      closeDatabase(database);
+      reject(failure ?? transaction.error ?? new DeviceIdentityCorruptError());
+    };
+  });
+  return identityFromRecord(updated);
+}
+
+export async function persistRecoveryKeyPair(
+  identity: DeviceIdentity,
+  recovery: RecoveryKeyPair,
+): Promise<DeviceIdentity> {
+  if (!isCanonicalBase64Bytes(recovery.publicKeyBase64, 32)) {
+    throw new DeviceIdentityCorruptError();
+  }
+  const database = await openCryptoDatabase();
+  const updated = await new Promise<StoredIdentityRecord>((resolve, reject) => {
+    const transaction = database.transaction(IDENTITY_STORE, "readwrite");
+    const store = transaction.objectStore(IDENTITY_STORE);
+    const request = store.get(identity.userId);
+    let nextRecord: StoredIdentityRecord | undefined;
+    let failure: unknown;
+    request.onerror = () => {
+      failure = request.error ?? new DeviceIdentityCorruptError();
+      transaction.abort();
+    };
+    request.onsuccess = () => {
+      const current = request.result as StoredIdentityRecord | undefined;
+      if (
+        !current ||
+        !isValidStoredIdentityRecord(current) ||
+        current.userId !== identity.userId ||
+        current.deviceId !== identity.deviceId
+      ) {
+        failure = new DeviceIdentityCorruptError();
+        transaction.abort();
+        return;
+      }
+      nextRecord = {
+        ...current,
+        recoveryPrivateKey: recovery.privateKey,
+        recoveryPublicKey: recovery.publicKey,
+        recoveryPublicKeyBase64: recovery.publicKeyBase64,
+        recoveryExportedAt: undefined,
+      };
+      store.put(nextRecord, identity.userId);
+    };
+    transaction.oncomplete = () => {
+      closeDatabase(database);
+      if (failure || !nextRecord) reject(failure ?? new DeviceIdentityCorruptError());
+      else resolve(nextRecord);
+    };
+    transaction.onerror = () => {
+      closeDatabase(database);
+      reject(failure ?? transaction.error ?? new DeviceIdentityCorruptError());
+    };
+    transaction.onabort = () => {
+      closeDatabase(database);
+      reject(failure ?? transaction.error ?? new DeviceIdentityCorruptError());
+    };
+  });
+  return identityFromRecord(updated);
+}
+
 /** @internal Used by the framework-independent crypto core, not UI code. */
 export function getPrivateKeyHandles(identity: DeviceIdentity): PrivateKeyHandles {
   const handles = privateKeyHandles.get(identity);
@@ -445,6 +776,14 @@ export async function createDeviceIdentityForTesting(input: {
   const encryptionPublicKey = new Uint8Array(
     await globalThis.crypto.subtle.exportKey("raw", input.encryptionPublicKey),
   );
+  const recoveryPair = (await globalThis.crypto.subtle.generateKey(
+    { name: "Ed25519" },
+    true,
+    ["sign", "verify"],
+  )) as CryptoKeyPair;
+  const recoveryPublicKey = new Uint8Array(
+    await globalThis.crypto.subtle.exportKey("raw", recoveryPair.publicKey),
+  );
   if (
     !isCanonicalBase64Bytes(bytesToBase64(signingPublicKey), 32) ||
     !isCanonicalBase64Bytes(bytesToBase64(encryptionPublicKey), 32)
@@ -459,11 +798,14 @@ export async function createDeviceIdentityForTesting(input: {
     signingPublicKeyBase64: bytesToBase64(signingPublicKey),
     encryptionPublicKey,
     encryptionPublicKeyBase64: bytesToBase64(encryptionPublicKey),
+    recoveryPublicKeyBase64: bytesToBase64(recoveryPublicKey),
+    recoveryExportedAt: null,
     registration: null,
   };
   privateKeyHandles.set(identity, {
     signingPrivateKey: input.signingPrivateKey,
     encryptionPrivateKey: input.encryptionPrivateKey,
+    recoveryPrivateKey: recoveryPair.privateKey,
   });
   activeIdentities.add(identity);
   return identity;

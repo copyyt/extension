@@ -7,6 +7,8 @@ import {
 
 export const CRYPTO_PROTOCOL_VERSION = 1 as const;
 export const DEVICE_APPROVAL_MESSAGE_VERSION = "copyyt-device-approval-v1";
+export const DEVICE_MANAGEMENT_MESSAGE_VERSION = "copyyt-device-management-v1";
+export const DEVICE_RECOVERY_MESSAGE_VERSION = "copyyt-device-recovery-v1";
 export const CLIPBOARD_ENVELOPE_SIGNATURE_MESSAGE_VERSION =
   "copyyt-clipboard-envelope-v1";
 export const SOCKET_AUTH_MESSAGE_VERSION = "copyyt-socket-auth-v1";
@@ -15,6 +17,12 @@ export const KEY_WRAP_HKDF_SALT = "copyyt-key-wrap-hkdf-salt-v1";
 export const PAYLOAD_AAD_VERSION = "copyyt-payload-v1";
 export const PAIRING_FINGERPRINT_CONTEXT_VERSION =
   "copyyt-pairing-fingerprint-v1";
+export const DIRECT_CLIPBOARD_WRAP_CONTEXT_VERSION =
+  "copyyt-direct-clipboard-wrap-v1";
+export const DIRECT_CLIPBOARD_MANIFEST_SIGNATURE_VERSION =
+  "copyyt-direct-clipboard-manifest-v1";
+export const DIRECT_CLIPBOARD_CHUNK_AAD_VERSION =
+  "copyyt-direct-clipboard-chunk-v1";
 
 function canonicalLines(lines: string[]): Uint8Array {
   return utf8Encode(`${lines.join("\n")}\n`);
@@ -28,6 +36,109 @@ function canonicalExpiry(value: Date | string): string {
   return date.toISOString();
 }
 
+export function canonicalIsoExpiry(value: Date | string): string {
+  return canonicalExpiry(value);
+}
+
+export interface DirectClipboardManifestMessageInput {
+  protocol: string;
+  userId: string;
+  transferId: string;
+  sourceDeviceId: string;
+  sourceKeyVersion: number;
+  recipientDeviceId: string;
+  recipientKeyVersion: number;
+  contentType: string;
+  expiresAt: Date | string;
+  plaintextByteLength: number;
+  chunkPlaintextSize: number;
+  chunkCount: number;
+  noncePrefix: Uint8Array | string;
+  wrapNonce: Uint8Array | string;
+  wrappedKey: Uint8Array | string;
+}
+
+function canonicalBytes(value: Uint8Array | string): Uint8Array {
+  return typeof value === "string" ? base64ToBytes(value) : new Uint8Array(value);
+}
+
+export function buildDirectClipboardManifestMessage(
+  input: DirectClipboardManifestMessageInput,
+): Uint8Array {
+  return canonicalLines([
+    DIRECT_CLIPBOARD_MANIFEST_SIGNATURE_VERSION,
+    `protocol=${input.protocol}`,
+    `userId=${input.userId}`,
+    `transferId=${input.transferId}`,
+    `sourceDeviceId=${input.sourceDeviceId}`,
+    `sourceKeyVersion=${input.sourceKeyVersion}`,
+    `recipientDeviceId=${input.recipientDeviceId}`,
+    `recipientKeyVersion=${input.recipientKeyVersion}`,
+    `contentType=${input.contentType}`,
+    `expiresAt=${canonicalExpiry(input.expiresAt)}`,
+    `plaintextByteLength=${input.plaintextByteLength}`,
+    `chunkPlaintextSize=${input.chunkPlaintextSize}`,
+    `chunkCount=${input.chunkCount}`,
+    `noncePrefix=${bytesToBase64(canonicalBytes(input.noncePrefix))}`,
+    `wrapNonce=${bytesToBase64(canonicalBytes(input.wrapNonce))}`,
+    `wrappedKey=${bytesToBase64(canonicalBytes(input.wrappedKey))}`,
+  ]);
+}
+
+export interface DirectClipboardChunkAadInput
+  extends Omit<
+    DirectClipboardManifestMessageInput,
+    "noncePrefix" | "wrapNonce" | "wrappedKey"
+  > {
+  chunkIndex: number;
+  expectedPlaintextLength: number;
+}
+
+export function buildDirectClipboardChunkAad(
+  input: DirectClipboardChunkAadInput,
+): Uint8Array {
+  return canonicalLines([
+    DIRECT_CLIPBOARD_CHUNK_AAD_VERSION,
+    `protocol=${input.protocol}`,
+    `userId=${input.userId}`,
+    `transferId=${input.transferId}`,
+    `sourceDeviceId=${input.sourceDeviceId}`,
+    `sourceKeyVersion=${input.sourceKeyVersion}`,
+    `recipientDeviceId=${input.recipientDeviceId}`,
+    `recipientKeyVersion=${input.recipientKeyVersion}`,
+    `contentType=${input.contentType}`,
+    `expiresAt=${canonicalExpiry(input.expiresAt)}`,
+    `plaintextByteLength=${input.plaintextByteLength}`,
+    `chunkPlaintextSize=${input.chunkPlaintextSize}`,
+    `chunkCount=${input.chunkCount}`,
+    `chunkIndex=${input.chunkIndex}`,
+    `expectedPlaintextLength=${input.expectedPlaintextLength}`,
+  ]);
+}
+
+export interface DirectClipboardWrapContextInput {
+  userId: string;
+  transferId: string;
+  sourceDeviceId: string;
+  sourceKeyVersion: number;
+  recipientDeviceId: string;
+  recipientKeyVersion: number;
+}
+
+export function buildDirectClipboardWrapContext(
+  input: DirectClipboardWrapContextInput,
+): Uint8Array {
+  return canonicalLines([
+    DIRECT_CLIPBOARD_WRAP_CONTEXT_VERSION,
+    `userId=${input.userId}`,
+    `transferId=${input.transferId}`,
+    `sourceDeviceId=${input.sourceDeviceId}`,
+    `sourceKeyVersion=${input.sourceKeyVersion}`,
+    `recipientDeviceId=${input.recipientDeviceId}`,
+    `recipientKeyVersion=${input.recipientKeyVersion}`,
+  ]);
+}
+
 export interface DeviceApprovalMessageInput {
   userId: string;
   approvingDeviceId: string;
@@ -36,6 +147,88 @@ export interface DeviceApprovalMessageInput {
   pendingKeyVersion: number;
   pendingEncryptionPublicKey: string;
   pendingSigningPublicKey: string;
+}
+
+export interface DeviceManagementMessageInput {
+  action: "update" | "revoke";
+  userId: string;
+  requestingDeviceId: string;
+  requestingKeyVersion: number;
+  targetDeviceId: string;
+  targetKeyVersion: number;
+  timestamp: number;
+  nonce: string;
+  name?: string;
+  platform?: string;
+  capabilities?: string[];
+  appVersion?: string;
+  recoveryPublicKey?: string;
+}
+
+function buildLengthPrefixedMessage(
+  version: string,
+  fields: Array<[string, string | number]>,
+): Uint8Array {
+  return utf8Encode(
+    [version, ...fields.map(([key, value]) => `${key}=${String(value)}`)]
+      .map((value) => `${utf8Encode(value).byteLength}:${value}`)
+      .join(""),
+  );
+}
+
+/** Exact canonical bytes required by the backend device-management DTO. */
+export function buildDeviceManagementMessage(
+  input: DeviceManagementMessageInput,
+): Uint8Array {
+  return buildLengthPrefixedMessage(DEVICE_MANAGEMENT_MESSAGE_VERSION, [
+    ["action", input.action],
+    ["userId", input.userId],
+    ["requestingDeviceId", input.requestingDeviceId],
+    ["requestingKeyVersion", input.requestingKeyVersion],
+    ["targetDeviceId", input.targetDeviceId],
+    ["targetKeyVersion", input.targetKeyVersion],
+    ["timestamp", input.timestamp],
+    ["nonce", input.nonce],
+    ["name", input.name ?? ""],
+    ["platform", input.platform ?? ""],
+    ["capabilities", JSON.stringify(input.capabilities ?? [])],
+    ["appVersion", input.appVersion ?? ""],
+    ["recoveryPublicKey", input.recoveryPublicKey ?? ""],
+  ]);
+}
+
+export interface DeviceRecoveryMessageInput {
+  userId: string;
+  rootDeviceId: string;
+  deviceId: string;
+  name: string;
+  platform: string;
+  encryptionPublicKey: string;
+  signingPublicKey: string;
+  capabilities: string[];
+  appVersion?: string;
+  timestamp: number;
+  nonce: string;
+  newRecoveryPublicKey: string;
+}
+
+export function buildDeviceRecoveryMessage(
+  input: DeviceRecoveryMessageInput,
+): Uint8Array {
+  return buildLengthPrefixedMessage(DEVICE_RECOVERY_MESSAGE_VERSION, [
+    ["userId", input.userId],
+    ["rootDeviceId", input.rootDeviceId],
+    ["deviceId", input.deviceId],
+    ["name", input.name],
+    ["platform", input.platform],
+    ["encryptionPublicKey", input.encryptionPublicKey],
+    ["signingPublicKey", input.signingPublicKey],
+    ["capabilities", JSON.stringify(input.capabilities)],
+    ["appVersion", input.appVersion ?? ""],
+    ["timestamp", input.timestamp],
+    ["nonce", input.nonce],
+    ["newRecoveryPublicKey", input.newRecoveryPublicKey],
+  ]);
 }
 
 export function buildDeviceApprovalMessage(

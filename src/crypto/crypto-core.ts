@@ -11,6 +11,10 @@ import {
 import {
   buildClipboardEnvelopeSignatureMessage,
   buildDeviceApprovalMessage,
+  buildDeviceManagementMessage,
+  buildDeviceRecoveryMessage,
+  buildDirectClipboardManifestMessage,
+  buildDirectClipboardWrapContext,
   buildKeyWrapContext,
   buildPairingFingerprintContext,
   buildPayloadAad,
@@ -27,10 +31,14 @@ import type {
   ClientVerifiedDevice,
   LocalDeviceRecord,
 } from "./trust-store.ts";
+import {
+  AES_GCM_TAG_BYTES,
+  MAX_CLIPBOARD_PLAINTEXT_BYTES,
+} from "../clipboard/limits.ts";
 
 const ED25519 = { name: "Ed25519" } as Algorithm;
 const X25519 = { name: "X25519" } as Algorithm;
-const AES_GCM_TAG_LENGTH = 128;
+const AES_GCM_TAG_LENGTH = AES_GCM_TAG_BYTES * 8;
 const KEY_LENGTH_BYTES = 32;
 const NONCE_LENGTH_BYTES = 12;
 
@@ -331,6 +339,141 @@ export async function unwrapContentKeyForRecipient(input: {
   }
 }
 
+/** The direct clipboard protocol uses the same X25519/HKDF/AES-GCM primitive
+ * as relay envelopes, with a separately domain-separated context. */
+export async function wrapDirectClipboardKeyForRecipient(input: {
+  userId: string;
+  transferId: string;
+  sourceDeviceId: string;
+  sourceKeyVersion: number;
+  senderIdentity: DeviceIdentity;
+  recipient: VerifiedRecipient;
+  contentKey: Uint8Array;
+  wrapNonce: Uint8Array;
+}): Promise<{ wrapNonce: string; wrappedKey: string }> {
+  if (input.senderIdentity.userId !== input.userId || input.recipient.userId !== input.userId) {
+    throw new CryptoProtocolError("The direct clipboard identity belongs to another account");
+  }
+  assertLength(input.contentKey, KEY_LENGTH_BYTES, "Direct clipboard CEK");
+  assertLength(input.wrapNonce, NONCE_LENGTH_BYTES, "Direct clipboard wrap nonce");
+  assertPositiveInteger(input.sourceKeyVersion, "sourceKeyVersion");
+  const recipientKeyVersionValue = recipientKeyVersion(input.recipient);
+  assertPositiveInteger(recipientKeyVersionValue, "recipientKeyVersion");
+  if (input.recipient.trustState !== "root" && input.recipient.trustState !== "verified") {
+    throw new CryptoProtocolError("Only locally verified devices may receive direct clipboard keys");
+  }
+  const context = buildDirectClipboardWrapContext({
+    userId: input.userId,
+    transferId: input.transferId,
+    sourceDeviceId: input.sourceDeviceId,
+    sourceKeyVersion: input.sourceKeyVersion,
+    recipientDeviceId: input.recipient.deviceId,
+    recipientKeyVersion: recipientKeyVersionValue,
+  });
+  const wrappingKey = await deriveWrappingKey(
+    getPrivateKeyHandles(input.senderIdentity).encryptionPrivateKey,
+    publicKeyBytes(input.recipient.encryptionPublicKey),
+    context,
+  );
+  const wrapped = new Uint8Array(
+    await globalThis.crypto.subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv: asBufferSource(input.wrapNonce),
+        additionalData: asBufferSource(context),
+        tagLength: AES_GCM_TAG_LENGTH,
+      },
+      wrappingKey,
+      asBufferSource(input.contentKey),
+    ),
+  );
+  assertLength(wrapped, 48, "Wrapped direct clipboard CEK");
+  return {
+    wrapNonce: bytesToBase64(input.wrapNonce),
+    wrappedKey: bytesToBase64(wrapped),
+  };
+}
+
+export async function unwrapDirectClipboardKeyForRecipient(input: {
+  userId: string;
+  transferId: string;
+  sourceDeviceId: string;
+  sourceKeyVersion: number;
+  recipientIdentity: DeviceIdentity;
+  recipientDeviceId: string;
+  recipientKeyVersion: number;
+  sourceEncryptionPublicKey: Uint8Array | string;
+  wrapNonce: string;
+  wrappedKey: string;
+}): Promise<Uint8Array> {
+  assertPositiveInteger(input.sourceKeyVersion, "sourceKeyVersion");
+  assertPositiveInteger(input.recipientKeyVersion, "recipientKeyVersion");
+  const wrapNonce = base64ToBytes(input.wrapNonce);
+  const wrappedKey = base64ToBytes(input.wrappedKey);
+  assertLength(wrapNonce, NONCE_LENGTH_BYTES, "Direct clipboard wrap nonce");
+  assertLength(wrappedKey, 48, "Wrapped direct clipboard CEK");
+  const context = buildDirectClipboardWrapContext({
+    userId: input.userId,
+    transferId: input.transferId,
+    sourceDeviceId: input.sourceDeviceId,
+    sourceKeyVersion: input.sourceKeyVersion,
+    recipientDeviceId: input.recipientDeviceId,
+    recipientKeyVersion: input.recipientKeyVersion,
+  });
+  const wrappingKey = await deriveWrappingKey(
+    getPrivateKeyHandles(input.recipientIdentity).encryptionPrivateKey,
+    publicKeyBytes(input.sourceEncryptionPublicKey),
+    context,
+  );
+  try {
+    const contentKey = new Uint8Array(
+      await globalThis.crypto.subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv: asBufferSource(wrapNonce),
+          additionalData: asBufferSource(context),
+          tagLength: AES_GCM_TAG_LENGTH,
+        },
+        wrappingKey,
+        asBufferSource(wrappedKey),
+      ),
+    );
+    assertLength(contentKey, KEY_LENGTH_BYTES, "Unwrapped direct clipboard CEK");
+    return contentKey;
+  } catch {
+    throw new CryptoProtocolError("Direct clipboard CEK unwrap failed");
+  }
+}
+
+export async function signDirectClipboardManifest(input: {
+  identity: DeviceIdentity;
+  manifest: Parameters<typeof buildDirectClipboardManifestMessage>[0];
+}): Promise<string> {
+  return bytesToBase64(
+    await signWithIdentity(
+      input.identity,
+      buildDirectClipboardManifestMessage(input.manifest),
+    ),
+  );
+}
+
+export async function verifyDirectClipboardManifestSignature(input: {
+  manifest: Parameters<typeof buildDirectClipboardManifestMessage>[0];
+  sourceSignature: string;
+  sourceSigningPublicKey: Uint8Array | string;
+}): Promise<boolean> {
+  if (!isCanonicalBase64Bytes(input.sourceSignature, 64)) return false;
+  try {
+    return verifyWithPublicKey(
+      publicKeyBytes(input.sourceSigningPublicKey),
+      buildDirectClipboardManifestMessage(input.manifest),
+      base64ToBytes(input.sourceSignature),
+    );
+  } catch {
+    return false;
+  }
+}
+
 export async function signDeviceApproval(input: {
   userId: string;
   approvingIdentity: DeviceIdentity;
@@ -353,6 +496,71 @@ export async function signDeviceApproval(input: {
     ...input.pendingDevice,
   });
   return bytesToBase64(await signWithIdentity(input.approvingIdentity, message));
+}
+
+export async function signDeviceManagement(input: {
+  userId: string;
+  identity: DeviceIdentity;
+  action: "update" | "revoke";
+  targetDeviceId: string;
+  targetKeyVersion: number;
+  timestamp: number;
+  nonce: string;
+  name?: string;
+  platform?: string;
+  capabilities?: string[];
+  appVersion?: string;
+  recoveryPublicKey?: string;
+}): Promise<string> {
+  if (input.identity.userId !== input.userId) {
+    throw new CryptoProtocolError("The management identity belongs to another account");
+  }
+  const requestingKeyVersion = input.identity.keyVersion;
+  if (requestingKeyVersion === null) {
+    throw new CryptoProtocolError("The device must be registered before signing management");
+  }
+  return bytesToBase64(
+    await signWithIdentity(
+      input.identity,
+      buildDeviceManagementMessage({
+        action: input.action,
+        userId: input.userId,
+        requestingDeviceId: input.identity.deviceId,
+        requestingKeyVersion,
+        targetDeviceId: input.targetDeviceId,
+        targetKeyVersion: input.targetKeyVersion,
+        timestamp: input.timestamp,
+        nonce: input.nonce,
+        name: input.name,
+        platform: input.platform,
+        capabilities: input.capabilities,
+        appVersion: input.appVersion,
+        recoveryPublicKey: input.recoveryPublicKey,
+      }),
+    ),
+  );
+}
+
+export async function signDeviceRecovery(input: {
+  recoveryPrivateKey: CryptoKey;
+  message: Parameters<typeof buildDeviceRecoveryMessage>[0];
+}): Promise<string> {
+  if (
+    input.recoveryPrivateKey.type !== "private" ||
+    input.recoveryPrivateKey.algorithm.name !== "Ed25519" ||
+    !input.recoveryPrivateKey.usages.includes("sign")
+  ) {
+    throw new CryptoProtocolError("The recovery credential is not an Ed25519 signing key");
+  }
+  const signature = new Uint8Array(
+    await globalThis.crypto.subtle.sign(
+      ED25519,
+      input.recoveryPrivateKey,
+      asBufferSource(buildDeviceRecoveryMessage(input.message)),
+    ),
+  );
+  assertLength(signature, 64, "Ed25519 recovery signature");
+  return bytesToBase64(signature);
 }
 
 export async function verifyDeviceApproval(input: {
@@ -502,6 +710,9 @@ export async function encryptClipboardItem(
   assertLength(contentKey, KEY_LENGTH_BYTES, "Clipboard content key");
   assertLength(payloadNonce, NONCE_LENGTH_BYTES, "Payload nonce");
   const plaintext = typeof input.plaintext === "string" ? utf8Encode(input.plaintext) : new Uint8Array(input.plaintext);
+  if (plaintext.byteLength > MAX_CLIPBOARD_PLAINTEXT_BYTES) {
+    throw new CryptoProtocolError("Clipboard plaintext exceeds the encrypted payload size limit");
+  }
   const aesKey = await importAesKey(contentKey, ["encrypt", "decrypt"]);
   const ciphertext = new Uint8Array(
     await globalThis.crypto.subtle.encrypt(
@@ -562,6 +773,15 @@ export async function encryptClipboardItem(
 
 export async function decryptClipboardItem(input: DecryptClipboardItemInput): Promise<{
   plaintext: string;
+  plaintextBytes: Uint8Array;
+}> {
+  const { plaintextBytes } = await decryptClipboardItemBytes(input);
+  return { plaintext: utf8Decode(plaintextBytes), plaintextBytes };
+}
+
+// Authenticate first; callers that dispatch by content type decode these bytes
+// separately so malformed content is not reported as a cryptographic failure.
+export async function decryptClipboardItemBytes(input: DecryptClipboardItemInput): Promise<{
   plaintextBytes: Uint8Array;
 }> {
   const { envelope, identity } = input;
@@ -648,7 +868,7 @@ export async function decryptClipboardItem(input: DecryptClipboardItemInput): Pr
   } catch {
     throw new CryptoProtocolError("Clipboard payload authentication failed");
   }
-  return { plaintext: utf8Decode(plaintextBytes), plaintextBytes };
+  return { plaintextBytes };
 }
 
 export async function pairingFingerprint(

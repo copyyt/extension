@@ -1,5 +1,11 @@
 import { RuntimeError } from "./errors.ts";
 import {
+  clipboardPayloadFromPlainText,
+  getPlainTextRepresentation,
+  validateClipboardPayloadV1,
+  type ClipboardPayloadV1,
+} from "../clipboard/payload.ts";
+import {
   isClipboardText,
   isOffscreenRequest,
   OFFSCREEN_SOURCE,
@@ -12,6 +18,9 @@ import { ensureOffscreenDocument } from "./offscreen-lifecycle.ts";
 export interface ClipboardAdapter {
   readText(): Promise<string>;
   writeText(text: string): Promise<void>;
+  readPayload?(): Promise<ClipboardPayloadV1>;
+  writePayload?(payload: ClipboardPayloadV1): Promise<void>;
+  rebaselineFromClipboard?(): Promise<void>;
   ping?(): Promise<void>;
   startWatching?(options?: { resetBaseline?: boolean }): Promise<void>;
   stopWatching?(): Promise<void>;
@@ -28,30 +37,64 @@ function requestId(): string {
 function isResponse(value: unknown): value is OffscreenResponse {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<OffscreenResponse>;
-  return (
+  const base = (
     candidate.source === OFFSCREEN_SOURCE &&
     candidate.target === RUNTIME_SOURCE &&
     typeof candidate.requestId === "string" &&
+    candidate.requestId.length > 0 &&
     (candidate.type === "READ_TEXT_RESULT" ||
       candidate.type === "WRITE_TEXT_RESULT" ||
+      candidate.type === "READ_PAYLOAD_RESULT" ||
+      candidate.type === "WRITE_PAYLOAD_RESULT" ||
+      candidate.type === "REBASELINE_FROM_CLIPBOARD_RESULT" ||
       candidate.type === "WATCH_START_RESULT" ||
       candidate.type === "WATCH_STOP_RESULT" ||
       candidate.type === "PONG" ||
       candidate.type === "ERROR")
   );
+  if (!base) return false;
+  if (
+    candidate.type === "READ_PAYLOAD_RESULT" ||
+    candidate.type === "WRITE_PAYLOAD_RESULT"
+  ) {
+    try {
+      validateClipboardPayloadV1(candidate.payload);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 export class OffscreenClipboardAdapter implements ClipboardAdapter {
+  private readonly api: RuntimeMessagingApi;
+  private readonly ensureDocument: () => Promise<void>;
+
   constructor(
-    private readonly api: RuntimeMessagingApi = chrome,
-    private readonly ensureDocument: () => Promise<void> = () =>
-      ensureOffscreenDocument(),
-  ) {}
+    api: RuntimeMessagingApi = chrome,
+    ensureDocument: () => Promise<void> = () => ensureOffscreenDocument(),
+  ) {
+    this.api = api;
+    this.ensureDocument = ensureDocument;
+  }
 
   async readText(): Promise<string> {
+    try {
+      return getPlainTextRepresentation(await this.readPayload()).data;
+    } catch (error) {
+      if (error instanceof RuntimeError) throw error;
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The operating-system clipboard could not be read",
+      );
+    }
+  }
+
+  async readPayload(): Promise<ClipboardPayloadV1> {
     let response: OffscreenResponse;
     try {
-      response = await this.send({ type: "READ_TEXT" });
+      response = await this.send({ type: "READ_PAYLOAD" });
     } catch {
       throw new RuntimeError(
         "CLIPBOARD_READ_FAILED",
@@ -65,16 +108,21 @@ export class OffscreenClipboardAdapter implements ClipboardAdapter {
           "The operating-system clipboard could not be read",
       );
     }
-    if (
-      response.type !== "READ_TEXT_RESULT" ||
-      !isClipboardText(response.text)
-    ) {
+    if (response.type !== "READ_PAYLOAD_RESULT") {
       throw new RuntimeError(
         "CLIPBOARD_READ_FAILED",
         "The clipboard adapter returned an invalid response",
       );
     }
-    return response.text;
+    try {
+      validateClipboardPayloadV1(response.payload);
+      return response.payload;
+    } catch {
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The clipboard adapter returned an invalid payload",
+      );
+    }
   }
 
   async writeText(text: string): Promise<void> {
@@ -84,9 +132,21 @@ export class OffscreenClipboardAdapter implements ClipboardAdapter {
         "Clipboard text must be a string",
       );
     }
+    await this.writePayload(clipboardPayloadFromPlainText(text));
+  }
+
+  async writePayload(payload: ClipboardPayloadV1): Promise<void> {
+    try {
+      validateClipboardPayloadV1(payload);
+    } catch {
+      throw new RuntimeError(
+        "CLIPBOARD_WRITE_FAILED",
+        "Clipboard payload is invalid",
+      );
+    }
     let response: OffscreenResponse;
     try {
-      response = await this.send({ type: "WRITE_TEXT", text });
+      response = await this.send({ type: "WRITE_PAYLOAD", payload });
     } catch {
       throw new RuntimeError(
         "CLIPBOARD_WRITE_FAILED",
@@ -100,10 +160,43 @@ export class OffscreenClipboardAdapter implements ClipboardAdapter {
           "The operating-system clipboard could not be written",
       );
     }
-    if (response.type !== "WRITE_TEXT_RESULT") {
+    if (response.type !== "WRITE_PAYLOAD_RESULT") {
       throw new RuntimeError(
         "CLIPBOARD_WRITE_FAILED",
         "The clipboard adapter returned an invalid response",
+      );
+    }
+    try {
+      validateClipboardPayloadV1(response.payload);
+    } catch {
+      throw new RuntimeError(
+        "CLIPBOARD_WRITE_FAILED",
+        "The clipboard adapter returned an invalid payload",
+      );
+    }
+  }
+
+  async rebaselineFromClipboard(): Promise<void> {
+    let response: OffscreenResponse;
+    try {
+      response = await this.send({ type: "REBASELINE_FROM_CLIPBOARD" });
+    } catch {
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The operating-system clipboard could not be re-baselined",
+      );
+    }
+    if (response.type === "ERROR") {
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        response.error?.message ??
+          "The operating-system clipboard could not be re-baselined",
+      );
+    }
+    if (response.type !== "REBASELINE_FROM_CLIPBOARD_RESULT") {
+      throw new RuntimeError(
+        "CLIPBOARD_READ_FAILED",
+        "The clipboard adapter returned an invalid re-baseline response",
       );
     }
   }
@@ -165,7 +258,10 @@ export class OffscreenClipboardAdapter implements ClipboardAdapter {
   }
 
   private async send(
-    input: Pick<OffscreenRequest, "type" | "text" | "resetBaseline">,
+    input: Pick<
+      OffscreenRequest,
+      "type" | "text" | "payload" | "resetBaseline"
+    >,
     ensureDocument = true,
   ): Promise<OffscreenResponse> {
     if (ensureDocument) await this.ensureDocument();

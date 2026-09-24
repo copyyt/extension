@@ -15,7 +15,9 @@ import {
 } from "./key-store.ts";
 import {
   decryptClipboardItem,
+  decryptClipboardItemBytes,
   encryptClipboardItem,
+  CryptoProtocolError,
   pairingFingerprint,
   signDeviceApproval,
   signSocketChallenge,
@@ -34,6 +36,17 @@ import {
 } from "./protocol.ts";
 import type { ClientVerifiedDevice } from "./trust-store.ts";
 import { InMemoryTrustStore } from "./trust-store.ts";
+import {
+  AES_GCM_TAG_BYTES,
+  MAX_CLIPBOARD_CIPHERTEXT_BYTES,
+  MAX_CLIPBOARD_PLAINTEXT_BYTES,
+} from "../clipboard/limits.ts";
+import {
+  CLIPBOARD_BUNDLE_V1_MIME,
+  decodeClipboardBundleV1,
+  encodeClipboardBundleV1,
+  type ClipboardPayloadV1,
+} from "../clipboard/payload.ts";
 
 const userId = "11111111-1111-4111-8111-111111111111";
 const deviceAId = "00000000-0000-4000-8000-000000000001";
@@ -348,6 +361,151 @@ test("fixed identities encrypt, wrap, sign, verify, unwrap, and decrypt", async 
   });
   assert.equal(decrypted.plaintext, "hello from Copyyt");
   assert.equal(bytesToHex(decrypted.plaintextBytes), bytesToHex(utf8Encode("hello from Copyyt")));
+});
+
+test("rich clipboard bundles complete a real authenticated crypto round trip", async () => {
+  const identityA = await makeFixedIdentity(deviceAId, 1);
+  const identityB = await makeFixedIdentity(deviceBId, 1, true);
+  const richPayload: ClipboardPayloadV1 = {
+    version: 1,
+    representations: [
+      { mime: "text/plain", encoding: "utf-8", data: "Copyyt" },
+      { mime: "text/html", encoding: "utf-8", data: "<strong>Copyyt</strong>" },
+    ],
+  };
+  const plaintext = encodeClipboardBundleV1(richPayload);
+  const envelope = await encryptClipboardItem({
+    userId,
+    identity: identityA,
+    plaintext,
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+    expiresAt,
+    itemId,
+    recipients: [verifiedDevice(identityB)],
+  });
+
+  assert.equal(envelope.contentType, CLIPBOARD_BUNDLE_V1_MIME);
+  assert.equal(
+    await verifyClipboardEnvelopeSignature({
+      userId,
+      envelope,
+      sourceSigningPublicKey: identityA.signingPublicKey,
+    }),
+    true,
+  );
+  const decrypted = await decryptClipboardItemBytes({
+    userId,
+    identity: identityB,
+    sourceDevice: verifiedDevice(identityA),
+    envelope,
+  });
+  assert.ok(decrypted.plaintextBytes instanceof Uint8Array);
+  assert.deepEqual(decodeClipboardBundleV1(decrypted.plaintextBytes), richPayload);
+});
+
+test("safe plaintext maximum encrypts to exactly the backend ciphertext maximum", async () => {
+  const identityA = await makeFixedIdentity(deviceAId, 1);
+  const identityB = await makeFixedIdentity(deviceBId, 1, true);
+  const plaintext = "a".repeat(MAX_CLIPBOARD_PLAINTEXT_BYTES);
+  const envelope = await encryptClipboardItem({
+    userId,
+    identity: identityA,
+    plaintext,
+    contentType: "text/plain",
+    expiresAt,
+    recipients: [verifiedDevice(identityB)],
+  });
+  const ciphertextBytes = base64ToBytes(envelope.ciphertext).byteLength;
+  assert.equal(ciphertextBytes, MAX_CLIPBOARD_CIPHERTEXT_BYTES);
+  assert.equal(ciphertextBytes - utf8Encode(plaintext).byteLength, AES_GCM_TAG_BYTES);
+  assert.equal(AES_GCM_TAG_BYTES, 16);
+  assert.equal(base64ToBytes(envelope.nonce).byteLength, 12);
+  const decrypted = await decryptClipboardItem({
+    userId,
+    identity: identityB,
+    sourceDevice: verifiedDevice(identityA),
+    envelope,
+  });
+  assert.equal(decrypted.plaintext, plaintext);
+});
+
+test("crypto encryption rejects oversized and multibyte string plaintext", async () => {
+  const identityA = await makeFixedIdentity(deviceAId, 1);
+  const identityB = await makeFixedIdentity(deviceBId, 1, true);
+  const baseInput = {
+    userId,
+    identity: identityA,
+    contentType: "text/plain",
+    expiresAt,
+    recipients: [verifiedDevice(identityB)],
+  };
+  const oversized = "a".repeat(MAX_CLIPBOARD_PLAINTEXT_BYTES + 1);
+  await assert.rejects(
+    encryptClipboardItem({ ...baseInput, plaintext: oversized }),
+    (error: unknown) => {
+      assert.ok(error instanceof CryptoProtocolError);
+      assert.equal(
+        error.message,
+        "Clipboard plaintext exceeds the encrypted payload size limit",
+      );
+      return true;
+    },
+  );
+
+  const multibyte = "a".repeat(MAX_CLIPBOARD_PLAINTEXT_BYTES - 1) + "é";
+  assert.equal(multibyte.length, MAX_CLIPBOARD_PLAINTEXT_BYTES);
+  assert.equal(utf8Encode(multibyte).byteLength, MAX_CLIPBOARD_PLAINTEXT_BYTES + 1);
+  await assert.rejects(
+    encryptClipboardItem({ ...baseInput, plaintext: multibyte }),
+    CryptoProtocolError,
+  );
+});
+
+test("crypto encryption enforces the plaintext byte limit for Uint8Array input", async () => {
+  const identityA = await makeFixedIdentity(deviceAId, 1);
+  const identityB = await makeFixedIdentity(deviceBId, 1, true);
+  const baseInput = {
+    userId,
+    identity: identityA,
+    contentType: "text/plain",
+    expiresAt,
+    recipients: [verifiedDevice(identityB)],
+  };
+  const exact = new Uint8Array(MAX_CLIPBOARD_PLAINTEXT_BYTES);
+  const exactEnvelope = await encryptClipboardItem({ ...baseInput, plaintext: exact });
+  assert.equal(base64ToBytes(exactEnvelope.ciphertext).byteLength, MAX_CLIPBOARD_CIPHERTEXT_BYTES);
+
+  const oversized = new Uint8Array(MAX_CLIPBOARD_PLAINTEXT_BYTES + 1);
+  await assert.rejects(
+    encryptClipboardItem({ ...baseInput, plaintext: oversized }),
+    CryptoProtocolError,
+  );
+});
+
+test("authenticated byte decryption leaves malformed UTF-8 to content dispatch", async () => {
+  const identityA = await makeFixedIdentity(deviceAId, 1);
+  const identityB = await makeFixedIdentity(deviceBId, 1, true);
+  const plaintextBytes = new Uint8Array([0xc3, 0x28]);
+  const envelope = await encryptClipboardItem({
+    userId,
+    identity: identityA,
+    plaintext: plaintextBytes,
+    contentType: CLIPBOARD_BUNDLE_V1_MIME,
+    expiresAt,
+    recipients: [verifiedDevice(identityB)],
+  });
+  const input = {
+    userId,
+    identity: identityB,
+    sourceDevice: verifiedDevice(identityA),
+    envelope,
+  };
+  assert.deepEqual(await decryptClipboardItemBytes(input), { plaintextBytes });
+  await assert.rejects(decryptClipboardItem(input), TypeError);
+  await assert.rejects(decryptClipboardItemBytes({
+    ...input,
+    envelope: { ...envelope, contentType: "text/plain" },
+  }), /signature is invalid/);
 });
 
 test("negative cases reject before plaintext is returned", async () => {
@@ -717,6 +875,101 @@ test("revocation is monotonic across later server observations", async () => {
     store.upsertServerReportedDevice({ ...verifiedDevice(identity), trustState: "revoked" }).trustState,
     "revoked",
   );
+});
+
+test("verified device metadata refresh preserves trust and rejects identity changes", async () => {
+  const identityA = await makeFixedIdentity(deviceAId, 1);
+  const identityB = await makeFixedIdentity(deviceBId, 1, true);
+  const store = new InMemoryTrustStore();
+  const richCapabilities = ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1"];
+  const root = store.pinInitialDevice(userId, identityA, {
+    name: "Old root",
+    platform: "chrome",
+    capabilities: ["clipboard"],
+    appVersion: "2.0.1",
+  });
+  const refreshedRoot = store.upsertServerReportedDevice({
+    ...root,
+    name: "New root",
+    platform: "chrome",
+    capabilities: richCapabilities,
+    appVersion: "2.0.2",
+    trustState: "trusted",
+  });
+  assert.equal(refreshedRoot.trustState, "root");
+  assert.equal(refreshedRoot.trustOrigin, "initial-tofu");
+  assert.deepEqual(refreshedRoot.capabilities, richCapabilities);
+  assert.equal(refreshedRoot.name, "New root");
+  const conservative = store.upsertServerReportedDevice({
+    ...refreshedRoot,
+    capabilities: { malformed: true } as never,
+    trustState: "trusted",
+  });
+  assert.equal(conservative.capabilities, undefined);
+
+  store.upsertServerReportedDevice({
+    ...verifiedDevice(identityB),
+    capabilities: ["clipboard"],
+    trustState: "trusted",
+  });
+  const pendingFields = {
+    pendingDeviceId: deviceBId,
+    pendingKeyVersion: 1,
+    pendingEncryptionPublicKey: identityB.encryptionPublicKeyBase64,
+    pendingSigningPublicKey: identityB.signingPublicKeyBase64,
+  };
+  const certificate = {
+    approvingDeviceId: deviceAId,
+    approvingKeyVersion: 1,
+    ...pendingFields,
+    approvalSignature: await signDeviceApproval({
+      userId,
+      approvingIdentity: identityA,
+      pendingDevice: pendingFields,
+    }),
+  };
+  const verified = await store.applyApproval(userId, certificate);
+  const refreshedVerified = store.upsertServerReportedDevice({
+    ...verified,
+    name: "Verified upgraded",
+    capabilities: richCapabilities,
+    trustState: "trusted",
+  });
+  assert.equal(refreshedVerified.trustState, "verified");
+  assert.deepEqual(refreshedVerified.approvalCertificate, verified.approvalCertificate);
+  assert.equal(refreshedVerified.capabilities?.includes("clipboard-html-v1"), true);
+
+  for (const changed of [
+    { signingPublicKey: bytesToBase64(new Uint8Array(32).fill(9)) },
+    { encryptionPublicKey: bytesToBase64(new Uint8Array(32).fill(9)) },
+    { keyVersion: 2 },
+  ]) {
+    assert.throws(() =>
+      store.upsertServerReportedDevice({
+        ...refreshedRoot,
+        ...changed,
+        capabilities: richCapabilities,
+        trustState: "trusted",
+      }),
+    );
+  }
+
+  const identityC = await makeFixedIdentity("00000000-0000-4000-8000-000000000003", 1);
+  const unverified = store.upsertServerReportedDevice({
+    ...verifiedDevice(identityC),
+    capabilities: ["clipboard"],
+    trustState: "trusted",
+  });
+  assert.equal(unverified.trustState, "unverified");
+
+  await store.revokeDevice(userId, identityC.deviceId);
+  const revoked = store.upsertServerReportedDevice({
+    ...verifiedDevice(identityC),
+    capabilities: richCapabilities,
+    trustState: "trusted",
+  });
+  assert.equal(revoked.trustState, "revoked");
+  assert.deepEqual(revoked.capabilities, ["clipboard"]);
 });
 
 function hex(value: string): Uint8Array {
