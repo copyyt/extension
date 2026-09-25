@@ -65,6 +65,7 @@ test("semantic text and status pairs meet 4.5:1 contrast in both modes", () => {
     ["on-success-soft", "success-soft"],
     ["on-danger-soft", "danger-soft"],
     ["on-warning-soft", "warning-soft"],
+    ["on-selection", "selection"],
   ] as const;
 
   for (const [mode, palette] of [["light", light], ["dark", dark]] as const) {
@@ -85,5 +86,16 @@ test("all semantic utilities used by the extension have a dark-mode value", () =
   ]) {
     assert.ok(light.has(name), `light ${name}`);
     assert.ok(darkOverrides.has(name), `dark ${name}`);
+  }
+});
+
+test("text selection stands out on surfaces and soft panels in both modes", () => {
+  for (const [mode, palette] of [["light", light], ["dark", dark]] as const) {
+    const selection = palette.get("selection");
+    assert.ok(selection, `${mode}: selection must exist`);
+    for (const background of ["surface", "soft", "page"]) {
+      const bg = palette.get(background)!;
+      assert.ok(contrast(selection, bg) >= 1.3, `${mode}: selection must be visible on ${background}`);
+    }
   }
 });

@@ -1,20 +1,17 @@
 import Button from "@/components/button";
-import { InputField } from "@/components/input";
 import OTPInput from "@/components/otp-input";
 import { useResendEmaiOtp, useVerifyEmail } from "@/hooks/auth.hook";
 import { useViewLoader } from "@/hooks/loader.hook";
-import { useEmailStore, useIsNewStore } from "@/hooks/user-store.hook";
+import { useEmailStore } from "@/hooks/user-store.hook";
 import { useViewStore } from "@/hooks/view-store.hook";
 import Logo from "@/vectors/logo";
 import { useState } from "react";
 
 const VerifyEmail = () => {
   const { email } = useEmailStore();
-  const { isNew, clearState } = useIsNewStore();
   const { setCurrentView } = useViewStore();
   const [data, setData] = useState({
     code: new Array(6).fill(""),
-    name: "",
   });
 
   const verifyEmail = useVerifyEmail();
@@ -25,11 +22,10 @@ const VerifyEmail = () => {
     e.preventDefault();
     if (data.code.includes("")) return;
     verifyEmail.mutate(
-      { email, code: Number(data.code.join("")), name: data.name },
+      { email, code: Number(data.code.join("")) },
       {
         onSuccess: () => {
           setCurrentView("home");
-          clearState();
         },
       },
     );
@@ -57,21 +53,9 @@ const VerifyEmail = () => {
           otp={data.code}
           setOtp={(code: string[]) => setData((prev) => ({ ...prev, code }))}
         />
-        {isNew ? (
-          <InputField
-            label="Name"
-            placeholder="Joe Xpress"
-            name="name"
-            value={data.name}
-            onChange={(e) =>
-              setData((prev) => ({ ...prev, name: e.target.value }))
-            }
-          />
-        ) : null}
-
         <Button
           className="mt-3 mb-0 w-full rounded-xl !py-3 !text-base !font-semibold"
-          disabled={data.code.includes("") || (isNew && !data.name)}
+          disabled={data.code.includes("")}
         >
           Continue
         </Button>

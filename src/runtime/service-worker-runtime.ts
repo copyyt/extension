@@ -91,6 +91,7 @@ import {
   isRuntimeRequest,
   POPUP_SOURCE,
   RUNTIME_SOURCE,
+  type AccountPlan,
   type AuthenticatedRuntimeResult,
   type ManagedDevice,
   type RecoveryCredentialResult,
@@ -137,6 +138,14 @@ export interface RuntimeApi {
     resendEmailOtp(email: string): Promise<AxiosResponse<unknown>>;
     requestAccountResetCode(): Promise<AxiosResponse<unknown>>;
     resetAccount(code: number): Promise<AxiosResponse<unknown>>;
+    requestAccountDeletionCode(): Promise<AxiosResponse<unknown>>;
+    deleteAccount(code: number): Promise<AxiosResponse<unknown>>;
+    updateProfile(
+      name: string,
+    ): Promise<AxiosResponse<{ message: string; user: IUser }>>;
+    getPlan?(): Promise<AxiosResponse<AccountPlan>>;
+    joinWaitlist?(platform: "ios"): Promise<AxiosResponse<{ joined: boolean }>>;
+    waitlistStatus?(platform: "ios"): Promise<AxiosResponse<{ joined: boolean }>>;
   };
   devices: DeviceRegistrationApi & {
     listDevices(): Promise<AxiosResponse<RegisteredDeviceListResponse>>;
@@ -561,6 +570,22 @@ function isFatalLocalInitializationFailure(error: unknown): boolean {
   return error instanceof DeviceIdentityCorruptError || error instanceof TrustStoreError;
 }
 
+function isAccountPlan(value: unknown): value is AccountPlan {
+  if (!value || typeof value !== "object") return false;
+  const plan = value as Partial<AccountPlan>;
+  return (
+    (plan.plan === "free" || plan.plan === "pro") &&
+    typeof plan.limits === "object" &&
+    plan.limits !== null &&
+    typeof plan.limits.images === "boolean" &&
+    typeof plan.limits.directTransfer === "boolean" &&
+    (plan.limits.maxDevices === null || typeof plan.limits.maxDevices === "number") &&
+    typeof plan.beta === "object" &&
+    plan.beta !== null &&
+    typeof plan.beta.active === "boolean"
+  );
+}
+
 function authResult(response: SignInResponse): AuthenticatedRuntimeResult {
   return { message: response.message, user: response.user };
 }
@@ -728,6 +753,8 @@ function commandFallbackErrorCode(command: RuntimeCommand): RuntimeErrorCode {
     case "runtime:reset-device":
     case "runtime:request-account-reset-code":
     case "runtime:reset-account":
+    case "runtime:request-account-deletion-code":
+    case "runtime:delete-account":
     case "runtime:revoke-device":
     case "runtime:refresh-onboarding":
     case "runtime:approve-pending-device":
@@ -2458,6 +2485,7 @@ export class CopyytServiceWorkerRuntime {
         "The clipboard payload is invalid",
       );
     }
+    payload = this.applyPlanToPayload(payload);
     const session = this.requireSession();
     this.requireSocketReady();
     await this.ensureAccountInitialized();
@@ -2542,6 +2570,10 @@ export class CopyytServiceWorkerRuntime {
         const recipientIndex = wireRecipients.indexOf(direct.recipient);
         return recipients[recipientIndex]?.deviceId !== identity.deviceId;
       });
+      // Direct transfer is a Pro feature; the server refuses its signalling too.
+      if (this.status.plan && !this.status.plan.limits.directTransfer) {
+        routes.direct = [];
+      }
     } catch (error) {
       if (error instanceof ClipboardWirePayloadTooLargeError) {
         throw new RuntimeError(
@@ -3192,6 +3224,23 @@ export class CopyytServiceWorkerRuntime {
         return this.getStatus();
       case "runtime:reset-account":
         return this.resetAccount(command.code);
+      case "runtime:request-account-deletion-code":
+        await this.dependencies
+          .apiFactory(this.requireSession().accessToken)
+          .auth.requestAccountDeletionCode();
+        return this.getStatus();
+      case "runtime:delete-account":
+        return this.deleteAccount(command.code);
+      case "runtime:update-profile":
+        return this.updateProfileName(command.name);
+      case "runtime:waitlist-status":
+      case "runtime:join-waitlist": {
+        const auth = this.dependencies.apiFactory(this.requireSession().accessToken).auth;
+        const call = command.type === "runtime:join-waitlist" ? auth.joinWaitlist : auth.waitlistStatus;
+        if (!call) return { joined: false };
+        const { data } = await call("ios");
+        return { joined: data?.joined === true };
+      }
       case "runtime:revoke-device":
         return this.revokeAccountDevice(command.deviceId);
       case "runtime:refresh-onboarding":
@@ -3790,6 +3839,51 @@ export class CopyytServiceWorkerRuntime {
     return this.startWithFreshIdentity(session);
   }
 
+  /**
+   * Permanent account deletion, confirmed with an emailed code. The server
+   * removes the account and all its data; this device then forgets its
+   * identity, trust and session and returns to sign-in.
+   */
+  private async deleteAccount(code: number): Promise<RuntimeStatus> {
+    const session = this.requireSession();
+    if (!Number.isSafeInteger(code) || code < 100000 || code > 999999) {
+      throw new RuntimeError("PAIRING_FAILED", "Enter the 6-digit code from the email");
+    }
+    await this.dependencies.apiFactory(session.accessToken).auth.deleteAccount(code);
+    this.destroySocket(this.socket);
+    await this.dependencies.trustStore.clearAccount?.(session.user.id);
+    await this.clearIdentity(session.user.id);
+    await this.clearSession();
+    return this.getStatus();
+  }
+
+  /** Saves the account's display name and keeps the stored session in step. */
+  private async updateProfileName(
+    name: string,
+  ): Promise<AuthenticatedRuntimeResult> {
+    const trimmed = typeof name === "string" ? name.trim() : "";
+    if (!trimmed || trimmed.length > 100) {
+      throw new RuntimeError("AUTH_REQUIRED", "Enter a name up to 100 characters");
+    }
+    const session = this.requireSession();
+    const { data } = await this.dependencies
+      .apiFactory(session.accessToken)
+      .auth.updateProfile(trimmed);
+    const savedName = data?.user?.name ?? trimmed;
+    let user = session.user;
+    await this.enqueueSessionMutation(async () => {
+      // A sign-out or account switch while the request was in flight wins.
+      const current = this.session;
+      if (!current || current.user.id !== session.user.id) return;
+      const updated = { ...current, user: { ...current.user, name: savedName } };
+      await this.dependencies.sessionStore.set(updated);
+      this.session = updated;
+      user = updated.user;
+      this.setStatus({ ...this.status, user: userFromSession(updated) });
+    });
+    return { message: "Profile updated", user };
+  }
+
   /** Discards the local identity and trust for the account and registers anew. */
   private async startWithFreshIdentity(session: RuntimeSession): Promise<RuntimeStatus> {
     this.destroySocket(this.socket);
@@ -4085,9 +4179,16 @@ export class CopyytServiceWorkerRuntime {
       );
     }
     const snapshot = await this.fetchDeviceSnapshot(session);
-    const current = snapshot.pendingDevices.find(
-      (device) => device.deviceId === identity.deviceId,
-    );
+    // The root may approve before this device confirms the codes, in which
+    // case the server already lists it as trusted. Server trust is not local
+    // trust: this device still pins the approver and verifies the approval.
+    const current =
+      snapshot.pendingDevices.find(
+        (device) => device.deviceId === identity.deviceId,
+      ) ??
+      snapshot.trustedDevices.find(
+        (device) => device.deviceId === identity.deviceId,
+      );
     if (snapshot.accountRoot.state !== "available") {
       const error = accountRootError(snapshot.accountRoot);
       this.setOnboarding({
@@ -4098,7 +4199,16 @@ export class CopyytServiceWorkerRuntime {
       throw error;
     }
     const serverApprover = snapshot.accountRoot.device;
-    if (!current || !identityMatchesServerDevice(identity, current)) {
+    if (!current) {
+      // Removed while pairing (e.g. from the root's device list): show the
+      // removed state instead of a misleading identity error.
+      await this.refreshOnboarding().catch(() => undefined);
+      throw new RuntimeError(
+        "PAIRING_FAILED",
+        "This device is no longer on your account. Set it up again to pair it.",
+      );
+    }
+    if (!identityMatchesServerDevice(identity, current)) {
       throw new RuntimeError(
         "PAIRING_FAILED",
         "The current device identity changed on the server",
@@ -4314,8 +4424,44 @@ export class CopyytServiceWorkerRuntime {
     });
   }
 
+  /** Best effort: an older backend without plans simply leaves it unknown. */
+  private async refreshPlan(session: RuntimeSession): Promise<void> {
+    const getPlan = this.dependencies.apiFactory(session.accessToken).auth.getPlan;
+    if (!getPlan) return;
+    try {
+      const { data } = await getPlan();
+      if (this.session?.user.id !== session.user.id || !isAccountPlan(data)) return;
+      this.setStatus({ ...this.status, plan: data });
+    } catch {
+      // Keep the last known plan.
+    }
+  }
+
+  /**
+   * Free accounts don't send images. The server can't see content, so this is
+   * enforced here: the image is dropped and any text alongside it still syncs.
+   */
+  private applyPlanToPayload(payload: ClipboardPayloadV1): ClipboardPayloadV1 {
+    const plan = this.status.plan;
+    if (!plan || plan.limits.images || !getPngRepresentation(payload)) return payload;
+    const representations = payload.representations.filter(
+      (representation) => representation.mime !== "image/png",
+    );
+    const withoutImage: ClipboardPayloadV1 = { ...payload, representations };
+    try {
+      validateClipboardPayloadV1(withoutImage);
+    } catch {
+      throw new RuntimeError(
+        "UNSUPPORTED_CLIPBOARD_CONTENT",
+        "Copying images between devices is part of Copyyt Pro",
+      );
+    }
+    return withoutImage;
+  }
+
   private async refreshOnboarding(): Promise<void> {
     const session = this.requireSession();
+    void this.refreshPlan(session);
     const identity = await this.identityLoader(session.user.id);
     if (!identity || identity.keyVersion === null) {
       this.setOnboarding({ state: "unknown", bootstrapEligible: false });
@@ -5119,14 +5265,18 @@ export class CopyytServiceWorkerRuntime {
     session: RuntimeSession,
   ): Promise<DeviceSnapshot> {
     const api = this.dependencies.apiFactory(session.accessToken).devices;
-    const [trustedResponse, pendingResponse] = await Promise.all([
-      api.listDevices(),
-      api.listPendingDevices(),
-    ]);
+    // Devices only move pending -> trusted, so read pending first. Reading
+    // both at once (or trusted first) can miss a device approved between the
+    // two reads, which then looks as if it had vanished from the account.
+    const pendingResponse = await api.listPendingDevices();
+    const trustedResponse = await api.listDevices();
     const trustedDevices = trustedServerDevices(trustedResponse.data);
+    const trustedIds = new Set(trustedDevices.map((device) => device.deviceId));
     return {
       trustedDevices,
-      pendingDevices: pendingServerDevices(pendingResponse.data),
+      pendingDevices: pendingServerDevices(pendingResponse.data).filter(
+        (device) => !trustedIds.has(device.deviceId),
+      ),
       accountRoot: resolveAccountRoot(trustedDevices),
     };
   }
