@@ -11,6 +11,7 @@ import { useRuntimeStatus } from "@/hooks/runtime-status.hook";
 import { useLogout } from "@/hooks/auth.hook";
 import { writePngToFocusedClipboard } from "@/clipboard/focused-page-writer";
 import { useUserStore } from "@/hooks/user-store.hook";
+import { useViewStore } from "@/hooks/view-store.hook";
 import Logo from "@/vectors/logo";
 import { useEffect, useState } from "react";
 import {
@@ -90,11 +91,26 @@ function Home() {
   if (!status) {
     body = <Muted className="mt-6 text-center">Loading…</Muted>;
   } else if (status.device.removed) {
-    body = <RemovedScreen run={run} />;
+    body = (
+      <>
+        <RemovedScreen run={run} />
+        <SetupSignOut email={account?.email} onSignOut={logout} />
+      </>
+    );
   } else if (status.onboarding?.bootstrapEligible === true) {
-    body = <FirstSetupScreen run={run} />;
+    body = (
+      <>
+        <FirstSetupScreen run={run} />
+        <SetupSignOut email={account?.email} onSignOut={logout} />
+      </>
+    );
   } else if (!trusted) {
-    body = <PairingScreen status={status} run={run} reload={reload} />;
+    body = (
+      <>
+        <PairingScreen status={status} run={run} reload={reload} />
+        <SetupSignOut email={account?.email} onSignOut={logout} />
+      </>
+    );
   } else {
     body = (
       <>
@@ -168,6 +184,32 @@ function Tabs({ tab, setTab, devicesBadge }: { tab: Tab; setTab: (tab: Tab) => v
       ))}
     </nav>
   );
+}
+
+/** Beta or Free-plan note; nothing for Pro subscribers or an unknown plan. */
+function PlanNotice({ status }: { status: RuntimeStatus }) {
+  const plan = status.plan;
+  if (!plan) return null;
+  if (plan.source === "beta") {
+    const until = plan.beta.endsAt
+      ? ` until ${new Date(plan.beta.endsAt).toLocaleDateString(undefined, { day: "numeric", month: "long", year: "numeric" })}`
+      : "";
+    return (
+      <Alert tone="info">
+        Copyyt is in beta: every Pro feature is free{until}.
+        {plan.beta.endsAt ? " Beta members get a founder discount on Pro." : ""}
+      </Alert>
+    );
+  }
+  if (plan.plan === "free") {
+    return (
+      <Muted className="text-center">
+        Free plan: text and rich text on {plan.limits.maxDevices} devices. Copyyt Pro adds images, direct transfer and
+        unlimited devices.
+      </Muted>
+    );
+  }
+  return null;
 }
 
 // ---- Tabs --------------------------------------------------------------
@@ -271,6 +313,8 @@ function HomeTab({
           <UiButton tone="secondary" className="mt-3 w-full" onClick={() => goTo("settings")}>Save it now</UiButton>
         </Card>
       ) : null}
+
+      <PlanNotice status={status} />
 
       {(status.pendingAssistedImages ?? []).map((image) => (
         <Card key={image.itemId} tone="accent">
@@ -387,6 +431,12 @@ function DevicesTab({ status, run, reload }: { status: RuntimeStatus; run: Run; 
         </Card>
       ) : null}
       <DeviceManager key={listVersion} />
+      {status.plan?.limits.maxDevices != null ? (
+        <Muted className="text-center">
+          {status.plan.devicesInUse} of {status.plan.limits.maxDevices} devices on the Free plan. Copyyt Pro adds
+          unlimited devices.
+        </Muted>
+      ) : null}
       <Muted className="text-center">
         To add a device, install Copyyt on it and sign in with the same account, then check for new devices here.
       </Muted>
@@ -428,15 +478,29 @@ function SettingsTab({
         />
       ) : null}
       <RecoveryExport status={status} run={run} />
+      <IosWaitlist />
       <AccountReset onReset={onReset} />
       <UiButton tone="danger-outline" className="w-full" onClick={onSignOut}>
         Sign out
       </UiButton>
+      <AccountDeletion />
     </>
   );
 }
 
 // ---- Setup screens -----------------------------------------------------
+
+/** Setup screens have no Settings tab, so sign-out lives here. */
+function SetupSignOut({ email, onSignOut }: { email?: string; onSignOut: () => void }) {
+  return (
+    <div className="pt-1 text-center">
+      {email ? <Muted>Signed in as {email}</Muted> : null}
+      <UiButton tone="ghost" className="w-full" onClick={onSignOut}>
+        Sign out
+      </UiButton>
+    </div>
+  );
+}
 
 function FirstSetupScreen({ run }: { run: Run }) {
   const [busy, setBusy] = useState(false);
@@ -788,6 +852,139 @@ function AccountReset({ onReset }: { onReset: () => Promise<unknown> }) {
           setNote(null);
         }}
       >
+        Cancel
+      </UiButton>
+    </Card>
+  );
+}
+
+/** One-tap iPhone waitlist sign-up using the account's email. */
+function IosWaitlist() {
+  const [joined, setJoined] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    sendRuntimeCommand<{ joined: boolean }>({ type: "runtime:waitlist-status" })
+      .then((result) => setJoined(result.joined))
+      .catch(() => setJoined(false));
+  }, []);
+
+  const join = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await sendRuntimeCommand<{ joined: boolean }>({ type: "runtime:join-waitlist" });
+      setJoined(result.joined);
+    } catch (joinError) {
+      setError(errorText(joinError, "Unable to join the waitlist"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (joined === null) return null;
+  return (
+    <Card>
+      <CardTitle>Copyyt for iPhone</CardTitle>
+      {joined ? (
+        <Muted className="mt-1">You&apos;re on the waitlist. We&apos;ll email you when it&apos;s ready.</Muted>
+      ) : (
+        <>
+          <Muted className="mt-1">Want Copyyt on your iPhone? We&apos;ll email your account address once when it&apos;s ready.</Muted>
+          <UiButton tone="secondary" className="mt-3 w-full" disabled={busy} onClick={() => void join()}>
+            {busy ? "Adding you…" : "Notify me"}
+          </UiButton>
+        </>
+      )}
+      {error ? <div className="mt-2"><Alert tone="error">{error}</Alert></div> : null}
+    </Card>
+  );
+}
+
+/**
+ * Permanently deletes the account on the server, confirmed with an emailed
+ * code, then returns this device to sign-in.
+ */
+function AccountDeletion() {
+  const { clearUser } = useUserStore();
+  const { setCurrentView } = useViewStore();
+  const [open, setOpen] = useState(false);
+  const [codeSent, setCodeSent] = useState(false);
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<Feedback>(null);
+
+  const close = () => {
+    setOpen(false);
+    setCodeSent(false);
+    setCode("");
+    setNote(null);
+  };
+
+  const requestCode = async () => {
+    setBusy(true);
+    setNote(null);
+    try {
+      await sendRuntimeCommand({ type: "runtime:request-account-deletion-code" });
+      setCodeSent(true);
+      setNote({ tone: "info", text: "Check your email for the 6-digit deletion code." });
+    } catch (error) {
+      setNote({ tone: "error", text: errorText(error, "Unable to send the deletion code") });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async () => {
+    setBusy(true);
+    setNote(null);
+    try {
+      await sendRuntimeCommand({ type: "runtime:delete-account", code: Number(code) });
+      clearUser();
+      setCurrentView("sign-in");
+    } catch (error) {
+      setNote({ tone: "error", text: errorText(error, "Unable to delete the account") });
+      setBusy(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <UiButton tone="ghost" className="w-full text-xs" onClick={() => setOpen(true)}>
+        Delete account
+      </UiButton>
+    );
+  }
+  return (
+    <Card tone="danger">
+      <CardTitle>Delete your account</CardTitle>
+      <Muted className="mt-1">
+        This permanently deletes your Copyyt account, every device on it and all associated data. It can&apos;t be
+        undone. Copyyt will stop syncing on all your devices.
+      </Muted>
+      {codeSent ? (
+        <>
+          <TextInput
+            className="mt-3 font-mono text-base tracking-[0.4em]"
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            placeholder="6-digit code"
+            value={code}
+            onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+            aria-label="Account deletion code"
+          />
+          <UiButton tone="danger" className="mt-3 w-full" disabled={busy || code.length !== 6} onClick={() => void remove()}>
+            {busy ? "Deleting…" : "Permanently delete account"}
+          </UiButton>
+        </>
+      ) : (
+        <UiButton tone="danger-outline" className="mt-3 w-full" disabled={busy} onClick={() => void requestCode()}>
+          {busy ? "Sending code…" : "Email me a deletion code"}
+        </UiButton>
+      )}
+      {note ? <div className="mt-2"><Alert tone={note.tone}>{note.text}</Alert></div> : null}
+      <UiButton tone="ghost" className="mt-1 w-full" disabled={busy} onClick={close}>
         Cancel
       </UiButton>
     </Card>

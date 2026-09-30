@@ -3451,12 +3451,14 @@ test("concurrent initial direct signals share one authoritative source snapshot"
   ];
   for (const signal of signals) setup.socket.trigger("direct:signal", signal);
 
+  // The snapshot reads pending then trusted devices in sequence, so only its
+  // first read is in flight while gated. Later signals must not start another.
   await waitForRuntimeCondition(
-    () => snapshotCalls >= baselineSnapshotCalls + 2,
+    () => snapshotCalls >= baselineSnapshotCalls + 1,
     "the first direct signal did not start authoritative validation",
   );
   await flushRuntimeWork();
-  assert.equal(snapshotCalls, baselineSnapshotCalls + 2);
+  assert.equal(snapshotCalls, baselineSnapshotCalls + 1);
 
   releaseSnapshot();
   await waitForRuntimeCondition(
@@ -4562,6 +4564,144 @@ test("three devices converge on the original account root regardless of refresh 
       [registeredDevice.deviceId, pendingDevice.deviceId, cDevice.deviceId].sort(),
     );
   }
+});
+
+test("a new device can confirm the codes after the root has already approved it", async () => {
+  const bIdentity = {
+    ...identity,
+    deviceId: pendingDevice.deviceId,
+    signingPublicKey: new Uint8Array(32).fill(2),
+    signingPublicKeyBase64: pendingDevice.signingPublicKey,
+    encryptionPublicKey: new Uint8Array(32).fill(1),
+    encryptionPublicKeyBase64: pendingDevice.encryptionPublicKey,
+    registration: { keyVersion: 1, name: pendingDevice.name, platform: "chrome", capabilities: [] },
+  } as unknown as DeviceIdentity;
+  const devices = new Map<string, RegisteredDeviceResponse>([
+    [registeredDevice.deviceId, registeredDevice],
+    [pendingDevice.deviceId, pendingDevice],
+  ]);
+  const apiOverrides = {
+    listDevices: async () => response([...devices.values()].filter((device) => device.trustState === "trusted")),
+    listPendingDevices: async () => response([...devices.values()].filter((device) => device.trustState === "pending")),
+    approveDevice: async (request: unknown) => {
+      const dto = request as { approvingDeviceId: string; pendingDeviceId: string; approvalSignature: string };
+      const approved = {
+        ...devices.get(dto.pendingDeviceId)!,
+        trustState: "trusted" as const,
+        approvedByDeviceId: dto.approvingDeviceId,
+        approvalSignature: dto.approvalSignature,
+      };
+      devices.set(dto.pendingDeviceId, approved);
+      return response(approved);
+    },
+  };
+  const aStore = makePairingTrustStore();
+  const a = makeRuntime({
+    trustStore: aStore.trustStore,
+    localTrustState: "root",
+    ...apiOverrides,
+    signApproval: async () => "a-to-b",
+  });
+  const bStore = makePairingTrustStore(bIdentity, pendingDevice, {
+    identity: bIdentity,
+    device: pendingDevice,
+  });
+  const b = makeRuntime({
+    identity: bIdentity,
+    registeredDevice: {
+      ...pendingDevice,
+      trustState: "trusted",
+      approvedByDeviceId: registeredDevice.deviceId,
+      approvalSignature: "a-to-b",
+    },
+    trustStore: bStore.trustStore,
+    ...apiOverrides,
+  });
+
+  await a.runtime.start();
+  await b.runtime.start();
+  const bPairing = b.runtime.getStatus().onboarding.pairing!;
+
+  // The root approves first, so the server already lists B as trusted.
+  const aPairing = a.runtime.getStatus().onboarding.pairing!;
+  const approved = await a.runtime.handleMessage(runtimeMessage({
+    type: "runtime:approve-pending-device",
+    pendingDeviceId: pendingDevice.deviceId,
+    confirmedFingerprint: aPairing.fingerprint,
+  }));
+  assert.equal(approved.ok, true);
+  await b.runtime.handleMessage(runtimeMessage({ type: "runtime:refresh-onboarding" }));
+  assert.equal(b.runtime.getStatus().onboarding.pairing?.fingerprint, bPairing.fingerprint);
+
+  const confirmed = await b.runtime.handleMessage(runtimeMessage({
+    type: "runtime:confirm-paired-approver",
+    approverDeviceId: bPairing.approverDeviceId,
+    confirmedFingerprint: bPairing.fingerprint,
+  }));
+
+  assert.equal(confirmed.ok, true, confirmed.error?.message);
+  assert.equal(b.runtime.getStatus().onboarding.state, "complete");
+  assert.equal(bStore.records.get(`${user.id}:${pendingDevice.deviceId}`)?.trustState, "verified");
+});
+
+test("confirming the codes survives the root approving between the device list reads", async () => {
+  const bIdentity = {
+    ...identity,
+    deviceId: pendingDevice.deviceId,
+    signingPublicKey: new Uint8Array(32).fill(2),
+    signingPublicKeyBase64: pendingDevice.signingPublicKey,
+    encryptionPublicKey: new Uint8Array(32).fill(1),
+    encryptionPublicKeyBase64: pendingDevice.encryptionPublicKey,
+    registration: { keyVersion: 1, name: pendingDevice.name, platform: "chrome", capabilities: [] },
+  } as unknown as DeviceIdentity;
+  const devices = new Map<string, RegisteredDeviceResponse>([
+    [registeredDevice.deviceId, registeredDevice],
+    [pendingDevice.deviceId, pendingDevice],
+  ]);
+  // Armed, the root approves B right after whichever list is read first, so
+  // the two reads straddle the approval.
+  let approveAfterNextRead = false;
+  const afterRead = () => {
+    if (!approveAfterNextRead) return;
+    approveAfterNextRead = false;
+    devices.set(pendingDevice.deviceId, {
+      ...pendingDevice,
+      trustState: "trusted",
+      approvedByDeviceId: registeredDevice.deviceId,
+      approvalSignature: "a-to-b",
+    });
+  };
+  const bStore = makePairingTrustStore(bIdentity, pendingDevice, {
+    identity: bIdentity,
+    device: pendingDevice,
+  });
+  const b = makeRuntime({
+    identity: bIdentity,
+    registeredDevice: pendingDevice,
+    trustStore: bStore.trustStore,
+    listDevices: async () => {
+      const trusted = [...devices.values()].filter((device) => device.trustState === "trusted");
+      afterRead();
+      return response(trusted);
+    },
+    listPendingDevices: async () => {
+      const pending = [...devices.values()].filter((device) => device.trustState === "pending");
+      afterRead();
+      return response(pending);
+    },
+  });
+
+  await b.runtime.start();
+  const bPairing = b.runtime.getStatus().onboarding.pairing!;
+  approveAfterNextRead = true;
+  const confirmed = await b.runtime.handleMessage(runtimeMessage({
+    type: "runtime:confirm-paired-approver",
+    approverDeviceId: bPairing.approverDeviceId,
+    confirmedFingerprint: bPairing.fingerprint,
+  }));
+
+  assert.equal(confirmed.ok, true, confirmed.error?.message);
+  assert.equal(b.runtime.getStatus().onboarding.state, "complete");
 });
 
 test("root revocation preserves verified B/C sync while blocking new trust", async () => {
@@ -6902,4 +7042,189 @@ test("an account reset with a malformed code never reaches the server or local s
   assert.equal(reset.ok, false);
   assert.equal(serverCalls, 0);
   assert.equal(cleared, false);
+});
+
+test("account deletion confirms the emailed code, then forgets the identity and session", async () => {
+  const calls: string[] = [];
+  const setup = await startReady({
+    clearIdentity: async () => { calls.push("clear-identity"); },
+    apiFactory: (_token, api) => ({
+      ...api,
+      auth: {
+        ...api.auth,
+        requestAccountDeletionCode: async () => { calls.push("request-code"); return response({ message: "Email Sent" }); },
+        deleteAccount: async (code: number) => { calls.push(`delete:${code}`); return response({ message: "Account deleted" }); },
+      },
+    }),
+  });
+  setup.trustStore.clearAccount = async () => { calls.push("clear-trust"); };
+
+  const requested = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:request-account-deletion-code" }));
+  assert.equal(requested.ok, true);
+  const deleted = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:delete-account", code: 123456 }));
+
+  assert.equal(deleted.ok, true);
+  assert.deepEqual(calls, ["request-code", "delete:123456", "clear-trust", "clear-identity"]);
+  assert.equal(setup.runtime.getStatus().signedIn, false);
+  assert.equal(setup.runtime.getStatus().connectionState, "signed-out");
+});
+
+test("account deletion with a malformed code never reaches the server or local state", async () => {
+  let serverCalls = 0;
+  let cleared = false;
+  const setup = await startReady({
+    clearIdentity: async () => { cleared = true; },
+    apiFactory: (_token, api) => ({
+      ...api,
+      auth: { ...api.auth, deleteAccount: async () => { serverCalls += 1; return response({}); } },
+    }),
+  });
+  const deleted = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:delete-account", code: 12 }));
+  assert.equal(deleted.ok, false);
+  assert.equal(serverCalls, 0);
+  assert.equal(cleared, false);
+  assert.equal(setup.runtime.getStatus().signedIn, true);
+});
+
+test("a failed server deletion keeps the device signed in and its identity intact", async () => {
+  let cleared = false;
+  const setup = await startReady({
+    clearIdentity: async () => { cleared = true; },
+    apiFactory: (_token, api) => ({
+      ...api,
+      auth: { ...api.auth, deleteAccount: async () => { throw new Error("The deletion code is invalid or has expired"); } },
+    }),
+  });
+  const deleted = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:delete-account", code: 123456 }));
+  assert.equal(deleted.ok, false);
+  assert.equal(cleared, false);
+  assert.equal(setup.runtime.getStatus().signedIn, true);
+});
+
+test("saving a profile name updates the stored session and the status", async () => {
+  const sent: string[] = [];
+  const setup = await startReady({
+    apiFactory: (_token, api) => ({
+      ...api,
+      auth: {
+        ...api.auth,
+        updateProfile: async (name: string) => {
+          sent.push(name);
+          return response({ message: "Profile updated", user: { ...user, name } });
+        },
+      },
+    }),
+  });
+  const result = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:update-profile", name: "  Ada Obi " }));
+  assert.equal(result.ok, true);
+  assert.deepEqual(sent, ["Ada Obi"]);
+  assert.equal(setup.runtime.getStatus().user?.name, "Ada Obi");
+});
+
+test("an empty profile name never reaches the server", async () => {
+  let calls = 0;
+  const setup = await startReady({
+    apiFactory: (_token, api) => ({
+      ...api,
+      auth: { ...api.auth, updateProfile: async () => { calls += 1; return response({ message: "", user }); } },
+    }),
+  });
+  const result = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:update-profile", name: "   " }));
+  assert.equal(result.ok, false);
+  assert.equal(calls, 0);
+});
+
+const FREE_PLAN = {
+  plan: "free" as const,
+  source: "free",
+  founder: false,
+  beta: { active: false, endsAt: "2026-09-30T00:00:00.000Z" },
+  limits: { maxDevices: 2, images: false, directTransfer: false },
+  devicesInUse: 2,
+};
+
+const flushPlanRefresh = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+test("the account plan is fetched into the runtime status", async () => {
+  const setup = await startReady({
+    apiFactory: (_token, api) => ({
+      ...api,
+      auth: { ...api.auth, getPlan: async () => response(FREE_PLAN) },
+    }),
+  });
+  await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:refresh-onboarding" }));
+  await flushPlanRefresh();
+  assert.deepEqual(setup.runtime.getStatus().plan, FREE_PLAN);
+});
+
+test("on the Free plan an image is dropped and the text with it still syncs", async () => {
+  const image = clipboardPayloadFromPngBytes(
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7]),
+  );
+  const mixed = {
+    version: 1 as const,
+    representations: [
+      { mime: "text/plain" as const, encoding: "utf-8" as const, data: "caption" },
+      { mime: "text/html" as const, encoding: "utf-8" as const, data: "<b>caption</b>" },
+      ...image.representations,
+    ],
+  } satisfies ClipboardPayloadV1;
+  const capable = ["clipboard", "clipboard-bundle-v1", "clipboard-html-v1", "clipboard-image-png-assisted-write-v1"];
+  const richCurrent = { ...registeredDevice, capabilities: capable };
+  const richRecipient = { ...pendingDevice, trustState: "trusted", capabilities: capable };
+  const pairing = makePairingTrustStore(identity, richCurrent);
+  putLocalRecord(pairing.records, richRecipient, "verified", { capabilities: capable });
+  const encryptInputs: Parameters<NonNullable<RuntimeDependencies["encrypt"]>>[0][] = [];
+  const setup = await startReady({
+    registeredDevice: richCurrent,
+    trustStore: pairing.trustStore,
+    listDevices: async () => response([richCurrent, richRecipient]),
+    apiFactory: (_token, api) => ({
+      ...api,
+      auth: { ...api.auth, getPlan: async () => response(FREE_PLAN) },
+    }),
+    encrypt: async (input) => {
+      encryptInputs.push(input);
+      return { ...inboundEnvelope("free-plan-publish"), contentType: input.contentType, expiresAt: input.expiresAt };
+    },
+  });
+  await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:refresh-onboarding" }));
+  await flushPlanRefresh();
+
+  await setup.runtime.publishClipboardPayload(mixed);
+
+  assert.ok(encryptInputs.length >= 1);
+  for (const input of encryptInputs) {
+    const sent = input.plaintext instanceof Uint8Array
+      ? decodeClipboardBundleV1(input.plaintext).representations.map((representation) => representation.mime)
+      : ["text/plain"];
+    assert.equal(sent.includes("image/png"), false);
+  }
+
+  const imageOnly = await setup.runtime.publishClipboardPayload(image).then(
+    () => null,
+    (error: unknown) => error as RuntimeError,
+  );
+  assert.equal(imageOnly?.code, "UNSUPPORTED_CLIPBOARD_CONTENT");
+  assert.match(imageOnly?.message ?? "", /Pro/);
+});
+
+test("the iPhone waitlist can be checked and joined with the account email", async () => {
+  const calls: string[] = [];
+  let joined = false;
+  const setup = await startReady({
+    apiFactory: (_token, api) => ({
+      ...api,
+      auth: {
+        ...api.auth,
+        waitlistStatus: async (platform: "ios") => { calls.push(`status:${platform}`); return response({ joined }); },
+        joinWaitlist: async (platform: "ios") => { calls.push(`join:${platform}`); joined = true; return response({ joined: true }); },
+      },
+    }),
+  });
+  const before = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:waitlist-status" }));
+  assert.deepEqual(before.data, { joined: false });
+  const after = await setup.runtime.handleMessage(runtimeMessage({ type: "runtime:join-waitlist" }));
+  assert.deepEqual(after.data, { joined: true });
+  assert.deepEqual(calls, ["status:ios", "join:ios"]);
 });

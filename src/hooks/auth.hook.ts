@@ -156,6 +156,27 @@ export function useVerifyEmail() {
   });
 }
 
+export function useUpdateProfileName() {
+  const Api = useAxios();
+  const { setUser } = useUserStore();
+
+  return useMutation({
+    mutationFn: async (name: string) => {
+      if (APP_TYPE === "extension") {
+        return sendRuntimeCommand<AuthenticatedRuntimeResult>({
+          type: "runtime:update-profile",
+          name,
+        });
+      }
+      const response = await Api.auth.updateProfile(name);
+      return response.data;
+    },
+    onSuccess: (data) => {
+      setUser(data.user);
+    },
+  });
+}
+
 export function useResendEmaiOtp() {
   const Api = useAxios();
   const { setToast } = useToastStore();

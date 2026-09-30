@@ -63,6 +63,16 @@ export interface PairingStatus {
   pendingPlatform?: string;
 }
 
+/** The account's plan, as reported by GET /account/plan. */
+export interface AccountPlan {
+  plan: "free" | "pro";
+  source: string;
+  founder: boolean;
+  beta: { active: boolean; endsAt: string | null };
+  limits: { maxDevices: number | null; images: boolean; directTransfer: boolean };
+  devicesInUse: number;
+}
+
 export interface RuntimeStatus {
   connectionState: RuntimeConnectionState;
   signedIn: boolean;
@@ -100,6 +110,8 @@ export interface RuntimeStatus {
   };
   /** Encrypted-envelope metadata only; no decrypted image bytes are exposed. */
   pendingAssistedImages?: PendingAssistedImageSummary[];
+  /** Unknown until fetched; the server enforces limits either way. */
+  plan?: AccountPlan;
   onboarding: {
     state: OnboardingState;
     bootstrapEligible: boolean;
@@ -194,6 +206,11 @@ export type RuntimeCommand =
   | { type: "runtime:reset-device" }
   | { type: "runtime:request-account-reset-code" }
   | { type: "runtime:reset-account"; code: number }
+  | { type: "runtime:request-account-deletion-code" }
+  | { type: "runtime:delete-account"; code: number }
+  | { type: "runtime:update-profile"; name: string }
+  | { type: "runtime:waitlist-status" }
+  | { type: "runtime:join-waitlist" }
   | { type: "runtime:revoke-device"; deviceId: string }
   | { type: "runtime:refresh-onboarding" }
   | {

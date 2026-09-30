@@ -10,6 +10,7 @@ Copyyt uses the same color direction on Android and in the Chrome extension: **W
 | Page | `#F7F5F1` | `#08141C` | Popup surround and page background |
 | Surface | `#FFFFFF` | `#0F2230` | Popup, cards, form fields |
 | Soft surface | `#E3F3FB` | `#16303F` | Selected tabs, fingerprints, quiet highlights |
+| Text selection | `#A9D8F2` on `#0F3449` | `#1E6892` on `#FFFFFF` | Highlighted (selected) text, including on soft panels |
 | Main text | `#0F3449` | `#E2EEF5` | Headings and body text |
 | Muted text | `#4B5F6C` | `#A9BCC8` | Supporting copy and placeholders |
 | Border | `#D5E3E9` | `#2B4A5C` | Card and form outlines |

@@ -3,7 +3,7 @@ import { InputField } from "@/components/input";
 import { useGoogleSignIn, useSignInPasswordless } from "@/hooks/auth.hook";
 import useGoogleAuthWeb from "@/hooks/google-auth-web.hook";
 import { useViewLoader } from "@/hooks/loader.hook";
-import { useEmailStore, useIsNewStore } from "@/hooks/user-store.hook";
+import { useEmailStore } from "@/hooks/user-store.hook";
 import { useViewStore } from "@/hooks/view-store.hook";
 import { APP_TYPE } from "@/utils/constants";
 import GoogleIcon from "@/vectors/google";
@@ -15,7 +15,6 @@ const SignIn = () => {
   const signInGoogle = useGoogleSignIn();
   const [loading, setLoading] = useState(false);
   const { email, setEmail } = useEmailStore();
-  const { setIsNew } = useIsNewStore();
   const { setCurrentView } = useViewStore();
   const { setToast } = useToastStore();
 
@@ -61,8 +60,7 @@ const SignIn = () => {
     signIn.mutate(
       { email },
       {
-        onSuccess: (data) => {
-          setIsNew(data.data.isNew);
+        onSuccess: () => {
           setCurrentView("verify-email");
         },
       },

@@ -5,6 +5,8 @@ import {
   IVerifyEmail,
   ILoginResponse,
 } from "../interfaces/auth.interface";
+import type { IUser } from "../interfaces/user.interface";
+import type { AccountPlan } from "../runtime/messages";
 import type {
   DeviceRegistrationRequest,
   DeviceRecoveryRequest,
@@ -23,6 +25,24 @@ export const getApis = (axiosInstance: AxiosInstance) => ({
         "/auth/account-reset",
         { code },
       ),
+    joinWaitlist: async (platform: "ios") =>
+      axiosInstance.post<{ joined: boolean }>("/waitlist/me", { platform }),
+    waitlistStatus: async (platform: "ios") =>
+      axiosInstance.get<{ joined: boolean }>("/waitlist/me", {
+        params: { platform },
+      }),
+    getPlan: async () =>
+      axiosInstance.get<AccountPlan>(
+        "/account/plan",
+      ),
+    updateProfile: async (name: string) =>
+      axiosInstance.patch<{ message: string; user: IUser }>("/auth/profile", {
+        name,
+      }),
+    requestAccountDeletionCode: async () =>
+      axiosInstance.post<{ message: string }>("/auth/account-delete/code", {}),
+    deleteAccount: async (code: number) =>
+      axiosInstance.post<{ message: string }>("/auth/account-delete", { code }),
     signInPasswordless: async (data: ILoginIn) =>
       axiosInstance.post<ILoginResponse>("/auth/sign-in-passwordless", data),
     googleSign: async (token: string) =>
