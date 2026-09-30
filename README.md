@@ -1,156 +1,107 @@
 # Copyyt Chrome extension
 
-The extension shares the Android [Copyyt color palette](docs/color-palette.md): Warm Paper in light mode and Harbor Dark in dark mode.
+> **Project status:** Copyyt is transitioning to open source and maintenance-only development. It was built as an end-to-end encrypted cross-device clipboard solution and remains available to use, study, and contribute to. Critical and security fixes may still be considered; new feature development is not currently planned.
 
-## Product status
+Copyyt is a Chrome/Chromium Manifest V3 extension that syncs clipboard content between devices signed in to the same Copyyt account and paired as trusted devices. It supports plain text, formatted text with a plain-text fallback, and PNG images. It does not sync arbitrary files or keep a clipboard history. The extension uses the Android [Copyyt color palette](docs/color-palette.md): Warm Paper in light mode and Harbor Dark in dark mode.
 
-- Copyyt Chrome extension: active primary client.
-- Copyyt Web/PWA: paused. Its source is retained for possible future
-  dashboard/manual-client work.
-- Copyyt marketing/privacy website: active.
+## What it does
 
-The retained web client is selected with `VITE_APP_TYPE=web`. Production and
-manual PWA deployments explicitly set `VITE_WEB_APP_PAUSED=true`, which serves
-an inert paused page instead of mounting the legacy clipboard/account client.
-For intentional local work on that retained client, use
-`VITE_APP_TYPE=web VITE_WEB_APP_PAUSED=false`.
+- Watches for clipboard changes when sending is enabled, or sends the current clipboard on request. Each device can use **Send & receive**, **Send only**, **Receive only**, or **Paused** mode.
+- Encrypts clipboard items for trusted recipient devices. Text and supported formatted text arrive on the receiving clipboard automatically. Received images are kept encrypted locally until the user opens the popup and clicks **Copy image** to write one to the clipboard.
+- Sends short-lived encrypted items through the Copyyt Socket.IO relay. For eligible recipients, an oversized PNG may use an encrypted WebRTC data channel on a reachable local network. The Copyyt socket still carries connection signalling, and a compatible text fallback can use the relay if direct delivery fails.
+- Supports passwordless email-code and Google sign-in, first-device trust setup, fingerprint-confirmed pairing of later devices, and device management.
 
-The PWA build keeps VitePWA's normal `autoUpdate` service-worker behavior.
-After the paused build is manually deployed once, existing installations can
-receive the paused shell through the normal service-worker update flow. Future
-Chrome extension releases do not deploy the PWA because the server workflow is
-manual-only.
+Image and direct-transfer availability also depend on the account plan and the receiving device's advertised capabilities.
 
-The extension’s Phase 1D crypto core is framework-independent and uses Chrome
-137+ WebCrypto primitives: Ed25519 device signatures, X25519 key agreement,
-HKDF-SHA-256, and AES-256-GCM. Plaintext clipboard contents and private keys
-are not sent to the backend.
+## Architecture
 
-Device private keys are generated once per Copyyt account and persisted as
-non-extractable `CryptoKey` objects in account-scoped IndexedDB records. Use
-`getDeviceIdentity(userId)`, `getOrCreateDeviceIdentity(userId)`, and
-`clearDeviceIdentity(userId)`; identities are never shared across accounts.
-Only raw 32-byte public keys, encoded as canonical padded standard Base64, are
-used in device registration and protocol messages. Production trust state is
-persisted by `IndexedDBTrustStore`; call `bootstrapInitialTrustAnchor(...)`
-explicitly for the first-device ceremony. Server registration labels never
-establish local cryptographic trust.
+```text
+Device A: OS clipboard
+    -> offscreen clipboard adapter
+    -> MV3 service worker: select recipients, encrypt, sign
+    -> Socket.IO relay: encrypted envelope
+       or WebRTC data channel: encrypted chunks (when eligible and reachable)
+    -> Device B service worker: verify, decrypt
+    -> offscreen adapter: text/HTML clipboard write
+       or popup: user clicks Copy image for PNG
+```
 
-Phase 2A adds the MV3 runtime around that core. The service worker owns the
-session, device registration, durable trust reads, Socket.IO connection,
-challenge signing, encryption/decryption, deduplication, and popup status.
-The offscreen document is only a `CLIPBOARD`-reason adapter for
-`READ_TEXT`, `WRITE_TEXT`, and `PING` messages. The popup does not own a socket
-or return clipboard text through runtime messages.
+The popup manages sign-in, pairing, preferences, status, and the assisted image-copy action. The service worker owns the session, device registration, trust checks, Socket.IO connection, cryptography, deduplication, and delivery policy. The offscreen document provides clipboard access and the WebRTC peer connection because the service worker cannot use those DOM APIs directly. The retained web/PWA client is separate from this extension workflow; production and manual PWA builds use a paused shell (see [Development](#development)).
 
-The extension build emits `assets/service-worker.js` and
-`assets/offscreen.js`; the explicit `manifest.extension.dev.json` and
-`manifest.extension.store.json` variants register the former as a module
-service worker. Runtime session/status records live in
-`chrome.storage.local`. Processed and outbound item metadata live in the
-`copyyt-runtime-v1` IndexedDB database and contain no plaintext. Processed
-items are retained for at most 24 hours and 500 records.
+## Privacy and security
 
-For the first device, the popup offers **Trust this device (first setup)**
-only after a fresh backend eligibility check proves that this is the account's
-only trusted device, its full identity matches, and no local root exists. The
-runtime repeats that check when the command is invoked, so a later registered
-device cannot take the self-root path. A server-reported `trusted` label
-remains locally `unverified`; it never establishes local cryptographic trust.
-This is still a TOFU bootstrap: a malicious backend could lie during the very
-first bootstrap, which is an accepted limitation of this phase.
+- Clipboard payloads are encrypted in the sending extension before relay publication or direct transfer and decrypted in the receiving extension after source-trust, signature, and expiry checks. The service worker uses Ed25519 device signatures, X25519 key agreement, HKDF-SHA-256, and AES-256-GCM. Direct-transfer chunks have their own encrypted, authenticated package.
+- Device private signing and encryption keys are generated as non-extractable WebCrypto keys and stored in account-scoped IndexedDB records. Only their raw 32-byte public keys, encoded as canonical padded Base64, are used for registration and protocol messages. Access and refresh tokens for the signed-in extension session are stored in `chrome.storage.local`; the runtime requests trusted-context-only access where Chrome supports it.
+- First-device setup explicitly establishes a local trust root after checking backend eligibility. This is trust on first use: a malicious backend could misrepresent the account's device state during that initial ceremony. Later devices require a matching displayed fingerprint and a signed approval from a locally trusted device. A backend `trusted` label alone does not establish local cryptographic trust.
+- Relay messages contain ciphertext plus routing and protocol metadata. The backend necessarily sees account/device identifiers, public keys, item IDs, content type, ciphertext size, timestamps/expiry, connection status, and WebRTC signalling (including ICE candidates for direct connections). It does not receive clipboard plaintext or device private keys from this client. The extension assigns live clipboard items a 60-second expiry and rejects stale items; **the backend source is not in this repository**, so its actual queueing, storage, deletion, and logging behavior cannot be verified here.
+- Locally, `copyyt-runtime-v1` IndexedDB keeps processed/outbound item metadata for deduplication, pruned to at most 24 hours and 500 records. Pending received images are stored as encrypted envelopes or direct-transfer packages until copied or expired. The implementation has no user-facing clipboard history. The OS clipboard, sending/receiving extension contexts, and the receiving device after decryption can access plaintext.
 
-Later devices use the manual pairing ceremony. Both devices display the same
-full-key `copyyt-pairing-fingerprint-v1`; the existing locally trusted device
-signs the pending device's `copyyt-device-approval-v1` certificate, and the
-new device pins the approver only after the user confirms the matching
-fingerprint. Server trust labels alone never complete pairing. Access-token
-renewal is owned by the service worker and uses a single-flight refresh before
-recreating an authenticated socket when needed.
+These protections depend on the integrity of the paired devices and their browser environments. The direct path uses WebRTC with no configured STUN/TURN servers (`iceServers: []`), so it requires a reachable peer connection; it is not a general cross-network direct-transfer guarantee.
 
-Clipboard Sync supports automatic text detection when sending is enabled, as
-well as manual **Send current clipboard**. It does not synchronize images or
-files and does not provide clipboard history.
+The reusable crypto core exposes `getDeviceIdentity(userId)`, `getOrCreateDeviceIdentity(userId)`, and `clearDeviceIdentity(userId)` for account-scoped identities. `IndexedDBTrustStore` persists local trust, and `bootstrapInitialTrustAnchor(...)` starts the explicit first-device ceremony. Runtime session and status records live in `chrome.storage.local`; the extension build emits module `assets/service-worker.js` and `assets/offscreen.js` entries.
+
+## Getting started
+
+1. Use Chrome/Chromium **137 or newer**. Build the extension as described below.
+2. Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select `build-extension/`.
+3. Open the Copyyt popup and sign in with an email code or Google. Set up trust on the first device. On another installation, sign in to the same account and confirm the matching pairing fingerprint on both devices.
+4. Choose a sync mode on each device. Copy text or an image on one device. Text can be pasted normally on a receiving device; for an incoming image, open the popup and click **Copy image** before pasting.
+
+The extension requires a compatible Copyyt backend for authentication, device registration, relay delivery, and WebRTC signalling. This repository contains the browser client, not that backend. A local build alone cannot provide cross-device sync.
 
 ## Development
 
+Prerequisites: Node.js with the `--experimental-strip-types` flag for the test scripts (Node 22.6+), Yarn 4.1.1 via Corepack, and Chrome/Chromium 137+ for loading and browser tests. Install dependencies with `corepack yarn install`.
+
+For a development extension, create a local `.env` with endpoints for a **compatible** backend, for example:
+
+```dotenv
+VITE_APP_TYPE=extension
+VITE_API_URL=http://localhost:8000
+VITE_SOCKET_URL=http://localhost:8000
+```
+
+`VITE_API_URL` is the REST base URL (the client appends `/api/v1`); `VITE_SOCKET_URL` is the Socket.IO origin. The dev manifest permits `localhost` and `127.0.0.1` on ports 8000 and 8001, plus the configured production host. If your backend uses another origin, adjust the dev manifest's host permissions for local use. This repository does not include backend setup or backend environment variables. Do not place real credentials in `.env` or documentation.
+
 ```bash
-yarn build
-yarn build:extension
-yarn build:store
-yarn lint
-yarn test:palette
-yarn test:crypto
-yarn test:runtime
-yarn test:chrome
+corepack yarn build:extension  # development extension -> build-extension/
+corepack yarn build:store      # Chrome Web Store artifact -> build-extension-store/
+corepack yarn lint
+corepack yarn test:crypto
+corepack yarn test:clipboard
+corepack yarn test:runtime
+corepack yarn test:direct
 ```
 
-`yarn build:extension` keeps the development host permissions and writes to
-`build-extension/`. `yarn build:store` uses only the production API host,
-validates the Store manifest as version 2.0.1, audits the source and artifact
-for MV3 remote-code violations, and writes the uploadable directory to
-`build-extension-store/`.
+`build:store` pins REST and Socket.IO to `https://api.copyyt.com`, validates the Store manifest, and audits the bundle for MV3 remote-code restrictions. Its host permissions contain only that production API origin. `yarn build` is the underlying TypeScript/Vite/worker build; `yarn dev` starts Vite for UI development and is not the unpacked extension build.
 
-`yarn test:chrome` first runs the existing local Vite harness for cross-realm
-identity creation and real IndexedDB `CryptoKey` persistence, then builds the
-extension and launches a separate Chrome instance against
-`runtime-harness.html`. The second harness asks the service worker to create
-the offscreen document and exercises the real OS clipboard adapter without
-returning clipboard contents in its result.
-Set `CHROME_BIN` when Chrome is not installed in a standard location.
+Other scripts include `test:auth`, `test:palette`, and `test:chrome`. The Chrome script first runs a local browser harness for cross-realm identity creation and IndexedDB `CryptoKey` persistence, then builds and loads an unpacked extension to exercise the real offscreen clipboard adapter without returning clipboard contents in its result. Set `CHROME_BIN` if Chrome is in a nonstandard location, or `COPYYT_CHROME_HEADLESS=0` to see its UI. Some managed or already-running Chrome installations refuse command-line unpacked-extension loading.
 
-To test Chrome with its UI enabled, set `COPYYT_CHROME_HEADLESS=0`. Some
-managed or already-running Chrome installations refuse command-line unpacked
-extension loading; the harness reports that browser limitation instead of
-adding a runtime workaround.
+The retained web client is selected with `VITE_APP_TYPE=web`. Its production/manual PWA deployment sets `VITE_WEB_APP_PAUSED=true` to show an inert paused page; intentional local work on the legacy client can use `VITE_APP_TYPE=web VITE_WEB_APP_PAUSED=false`. `VITE_GOOGLE_CLIENT_ID_WEB` applies to that web Google sign-in flow. The PWA build keeps VitePWA's `autoUpdate` service-worker behavior; extension builds do not deploy the PWA.
 
-## Template notes
+## Repository layout
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+| Path | Purpose |
+| --- | --- |
+| `src/crypto/` | Device identity, trust, pairing, envelope, and direct-transfer cryptography |
+| `src/runtime/`, `src/service-worker.ts` | MV3 session, socket, delivery, status, and persistence |
+| `src/clipboard/`, `src/offscreen.ts`, `src/direct/` | Clipboard formats, offscreen adapter, and WebRTC transport |
+| `src/views/` | Extension popup and retained web views |
+| `manifest.extension.*.json`, `vite.config.ts`, `scripts/` | Build targets, manifests, and validation |
+| `docs/` | Palette and Chrome Web Store release notes |
 
-Currently, two official plugins are available:
+## Looking for an actively developed alternative?
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react/README.md) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+[UniClipboard](https://github.com/UniClipboard/UniClipboard) is an actively developed open-source cross-device clipboard project with native cross-platform apps and a broader feature set. I intend to explore contributing there instead of continuing a parallel implementation of the same core idea.
 
-## Expanding the ESLint configuration
+## Project history
 
-If you are developing a production application, we recommend updating the configuration to enable type aware lint rules:
+Copyyt began as an attempt to make cross-device clipboard use secure and convenient. As projects such as UniClipboard have matured, development effort is shifting toward contributing to the wider open-source ecosystem while Copyyt remains available for maintenance, learning, and reuse.
 
-- Configure the top-level `parserOptions` property like this:
+## Contributing
 
-```js
-export default tseslint.config({
-  languageOptions: {
-    // other options...
-    parserOptions: {
-      project: ['./tsconfig.node.json', './tsconfig.app.json'],
-      tsconfigRootDir: import.meta.dirname,
-    },
-  },
-})
-```
+Bug fixes, security fixes, and documentation improvements are welcome. Please discuss major new features in an issue first; this project is maintenance-focused. When reporting a security issue, avoid posting exploit details or secrets in a public issue.
 
-- Replace `tseslint.configs.recommended` to `tseslint.configs.recommendedTypeChecked` or `tseslint.configs.strictTypeChecked`
-- Optionally add `...tseslint.configs.stylisticTypeChecked`
-- Install [eslint-plugin-react](https://github.com/jsx-eslint/eslint-plugin-react) and update the config:
+## License
 
-```js
-// eslint.config.js
-import react from 'eslint-plugin-react'
-
-export default tseslint.config({
-  // Set the react version
-  settings: { react: { version: '18.3' } },
-  plugins: {
-    // Add the react plugin
-    react,
-  },
-  rules: {
-    // other rules...
-    // Enable its recommended rules
-    ...react.configs.recommended.rules,
-    ...react.configs['jsx-runtime'].rules,
-  },
-})
-```
+Copyyt is available under the [MIT License](LICENSE).
